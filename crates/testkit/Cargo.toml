@@ -1,0 +1,13 @@
+[package]
+name = "agent-remote-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+agent-client-protocol.workspace = true

@@ -1,0 +1,16 @@
+/target/
+/dist/
+/android/.gradle/
+/android/.idea/
+/android/.kotlin/
+/android/local.properties
+/android/app/build/
+/.agent-remote/
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.db
+*.db-shm
+*.db-wal
+.env

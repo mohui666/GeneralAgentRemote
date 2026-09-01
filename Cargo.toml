@@ -1,0 +1,71 @@
+[package]
+name = "agent-remote-web-entry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/protocol",
+    "crates/host",
+    "crates/relay",
+    "crates/web",
+    "crates/testkit",
+    "crates/xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+agent-client-protocol = "=2.0.0"
+anyhow = "1.0"
+async-trait = "0.1"
+axum = { version = "0.8.9", features = ["ws"] }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+base64 = "0.22"
+ciborium = "0.2"
+clap = { version = "4.5", features = ["derive", "env"] }
+futures-util = "0.3"
+hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+js-sys = "0.3"
+qrcode = { version = "0.14", default-features = false }
+rand = "0.9"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.20"
+thiserror = "2.0"
+time = { version = "0.3", features = ["formatting", "serde"] }
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tower-http = { version = "0.7.1", features = ["fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+uuid = { version = "1.18", features = ["js", "serde", "v4"] }
+wasm-bindgen = "=0.2.127"
+wasm-bindgen-cli-support = "=0.2.127"
+web-sys = "0.3"
+yew = { version = "0.23.0", features = ["csr"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+agent-remote-web = { path = "crates/web" }
+
+[[bin]]
+name = "agent-remote-web"
+path = "src/main.rs"

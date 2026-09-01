@@ -1,0 +1,2477 @@
+//! Grok Build ACP v1 adapter.
+
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::{
+        Arc, Mutex as StdMutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+use agent_client_protocol::{
+    AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo, JsonRpcMessage, JsonRpcNotification,
+    JsonRpcRequest, Responder, UntypedMessage,
+    schema::{
+        ProtocolVersion,
+        v1::{
+            CancelNotification, ClientCapabilities, CloseSessionRequest, ContentBlock,
+            CreateTerminalRequest, CreateTerminalResponse, FileSystemCapabilities, Implementation,
+            InitializeRequest, InitializeResponse, KillTerminalRequest, KillTerminalResponse,
+            ListSessionsRequest, LoadSessionRequest, Meta, NewSessionRequest, PermissionOptionId,
+            PlanEntryStatus, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
+            ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
+            RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+            SelectedPermissionOutcome, SessionId, SessionUpdate, StopReason, TerminalExitStatus,
+            TerminalOutputRequest, TerminalOutputResponse, TextContent, ToolCall, ToolCallContent,
+            ToolCallStatus, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+            WriteTextFileRequest, WriteTextFileResponse,
+        },
+    },
+};
+use agent_remote_protocol::{
+    AgentMessagePhase, ApprovalOption, ConversationId, EffortOption, ItemStatus, ModelOption,
+    PlanStep, ProjectId, ProviderHealth, ProviderId, ProviderState, SessionOption,
+    SessionOptionValue, SessionSummary,
+};
+use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::{
+    io::AsyncReadExt,
+    process::Command,
+    sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot, watch},
+};
+use uuid::Uuid;
+
+use super::{
+    AgentProvider, CommandAck, CreateSession, InterruptSession, NativeSession,
+    ProviderCapabilities, ProviderEvent, ProviderEventKind, ResolveApproval, ResumeSession,
+    SendMessage, SetSessionOption, SteerMessage,
+};
+use crate::storage::Project;
+
+const GROK_EXTENSION_VERSION: &str = "1.0.13";
+
+#[derive(Clone)]
+pub struct GrokProvider {
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    executable: PathBuf,
+    events: broadcast::Sender<ProviderEvent>,
+    connections: AsyncMutex<HashMap<ProjectId, Arc<ProjectConnection>>>,
+    sessions: RwLock<HashMap<(ProjectId, String), SessionBinding>>,
+    negotiated: RwLock<Option<Negotiated>>,
+    health: RwLock<Option<ProviderHealth>>,
+    permissions: StdMutex<HashMap<String, PendingPermission>>,
+    terminals: AsyncMutex<HashMap<String, Arc<TerminalProcess>>>,
+    tool_calls: StdMutex<HashMap<(ProjectId, String, String), ToolCall>>,
+}
+
+struct ProjectConnection {
+    connection: ConnectionTo<Agent>,
+    negotiated: Negotiated,
+    shutdown: StdMutex<Option<oneshot::Sender<()>>>,
+}
+
+impl Drop for ProjectConnection {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self
+            .shutdown
+            .lock()
+            .expect("Grok shutdown mutex poisoned")
+            .take()
+        {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Negotiated {
+    version: Option<String>,
+    grok_shell: bool,
+    supports_list: bool,
+    supports_load: bool,
+    supports_resume: bool,
+    supports_close: bool,
+    models: Vec<GrokModel>,
+    current_model: Option<String>,
+}
+
+impl Negotiated {
+    fn supports_extensions(&self) -> bool {
+        self.grok_shell && self.version.as_deref() == Some(GROK_EXTENSION_VERSION)
+    }
+
+    fn provider_capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_session_list: self.supports_list,
+            supports_resume: self.supports_resume || self.supports_load,
+            supports_steer: self.supports_extensions(),
+        }
+    }
+
+    fn public_models(&self) -> Vec<ModelOption> {
+        self.models.iter().map(GrokModel::public).collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrokModel {
+    id: String,
+    name: String,
+    efforts: Vec<GrokEffort>,
+    default_effort: Option<String>,
+}
+
+impl GrokModel {
+    fn public(&self) -> ModelOption {
+        ModelOption {
+            id: self.id.clone(),
+            display_name: self.name.clone(),
+            effort_options: self
+                .efforts
+                .iter()
+                .map(|effort| EffortOption {
+                    id: effort.id.clone(),
+                    display_name: effort.label.clone(),
+                })
+                .collect(),
+            default_effort: self.default_effort.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrokEffort {
+    id: String,
+    label: String,
+}
+
+#[derive(Debug, Clone)]
+struct SessionBinding {
+    conversation_id: ConversationId,
+    model: Option<String>,
+    effort: Option<String>,
+    agent_item_id: String,
+    thought_item_id: String,
+}
+
+struct PendingPermission {
+    conversation_id: ConversationId,
+    session_id: String,
+    allowed_options: Vec<String>,
+    responder: Responder<RequestPermissionResponse>,
+}
+
+struct TerminalProcess {
+    project_id: ProjectId,
+    session_id: String,
+    output: Arc<StdMutex<TerminalOutputBuffer>>,
+    kill: mpsc::UnboundedSender<()>,
+    exit: watch::Receiver<Option<std::result::Result<ProcessExit, String>>>,
+}
+
+#[derive(Debug, Default)]
+struct TerminalOutputBuffer {
+    text: String,
+    limit: Option<usize>,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessExit {
+    exit_code: Option<u32>,
+    signal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSessionNotification {
+    session_id: SessionId,
+    update: Value,
+    #[serde(default, rename = "_meta")]
+    meta: Option<Meta>,
+}
+
+impl JsonRpcMessage for RawSessionNotification {
+    fn matches_method(method: &str) -> bool {
+        method == "session/update"
+    }
+
+    fn method(&self) -> &str {
+        "session/update"
+    }
+
+    fn to_untyped_message(
+        &self,
+    ) -> std::result::Result<UntypedMessage, agent_client_protocol::Error> {
+        UntypedMessage::new(self.method(), self)
+    }
+
+    fn parse_message(
+        method: &str,
+        params: &impl Serialize,
+    ) -> std::result::Result<Self, agent_client_protocol::Error> {
+        if !Self::matches_method(method) {
+            return Err(agent_client_protocol::Error::method_not_found());
+        }
+        let value = serde_json::to_value(params)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        serde_json::from_value(value)
+            .map_err(|error| agent_client_protocol::Error::invalid_params().data(error.to_string()))
+    }
+}
+
+impl JsonRpcNotification for RawSessionNotification {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetModelRequest {
+    session_id: SessionId,
+    model_id: String,
+    #[serde(rename = "_meta")]
+    meta: Meta,
+}
+
+impl JsonRpcMessage for SetModelRequest {
+    fn matches_method(method: &str) -> bool {
+        method == "session/set_model"
+    }
+
+    fn method(&self) -> &str {
+        "session/set_model"
+    }
+
+    fn to_untyped_message(
+        &self,
+    ) -> std::result::Result<UntypedMessage, agent_client_protocol::Error> {
+        UntypedMessage::new(self.method(), self)
+    }
+
+    fn parse_message(
+        method: &str,
+        params: &impl Serialize,
+    ) -> std::result::Result<Self, agent_client_protocol::Error> {
+        parse_custom_message(Self::matches_method, method, params)
+    }
+}
+
+impl JsonRpcRequest for SetModelRequest {
+    type Response = Value;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InterjectRequest {
+    session_id: SessionId,
+    text: String,
+    interjection_id: String,
+}
+
+impl JsonRpcMessage for InterjectRequest {
+    fn matches_method(method: &str) -> bool {
+        method == "_x.ai/interject"
+    }
+
+    fn method(&self) -> &str {
+        "_x.ai/interject"
+    }
+
+    fn to_untyped_message(
+        &self,
+    ) -> std::result::Result<UntypedMessage, agent_client_protocol::Error> {
+        UntypedMessage::new(self.method(), self)
+    }
+
+    fn parse_message(
+        method: &str,
+        params: &impl Serialize,
+    ) -> std::result::Result<Self, agent_client_protocol::Error> {
+        parse_custom_message(Self::matches_method, method, params)
+    }
+}
+
+impl JsonRpcRequest for InterjectRequest {
+    type Response = Value;
+}
+
+fn parse_custom_message<T: serde::de::DeserializeOwned>(
+    matches: impl FnOnce(&str) -> bool,
+    method: &str,
+    params: &impl Serialize,
+) -> std::result::Result<T, agent_client_protocol::Error> {
+    if !matches(method) {
+        return Err(agent_client_protocol::Error::method_not_found());
+    }
+    let value =
+        serde_json::to_value(params).map_err(agent_client_protocol::Error::into_internal_error)?;
+    serde_json::from_value(value)
+        .map_err(|error| agent_client_protocol::Error::invalid_params().data(error.to_string()))
+}
+
+impl Default for GrokProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GrokProvider {
+    pub fn new() -> Self {
+        Self::with_executable("grok")
+    }
+
+    pub fn with_executable(executable: impl Into<PathBuf>) -> Self {
+        let (events, _) = broadcast::channel(256);
+        Self {
+            shared: Arc::new(Shared {
+                executable: executable.into(),
+                events,
+                connections: AsyncMutex::new(HashMap::new()),
+                sessions: RwLock::new(HashMap::new()),
+                negotiated: RwLock::new(None),
+                health: RwLock::new(None),
+                permissions: StdMutex::new(HashMap::new()),
+                terminals: AsyncMutex::new(HashMap::new()),
+                tool_calls: StdMutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// Loads an existing session and replays its history. The shared provider trait uses
+    /// `session/resume` when available; this explicit entry point preserves ACP's load semantics.
+    pub async fn load_session(&self, request: ResumeSession) -> Result<NativeSession> {
+        self.open_existing_session(request, true).await
+    }
+
+    /// Closes a live ACP session when Grok advertised `session/close`.
+    pub async fn close_session(
+        &self,
+        conversation_id: ConversationId,
+        native_session_id: &str,
+    ) -> Result<()> {
+        let (project_id, connection, _) = self
+            .connection_for_bound_session(native_session_id, conversation_id)
+            .await?;
+        if !connection.negotiated.supports_close {
+            bail!("Grok did not advertise session/close");
+        }
+        self.shared.cancel_permissions(native_session_id)?;
+        connection
+            .connection
+            .send_request(CloseSessionRequest::new(SessionId::new(
+                native_session_id.to_owned(),
+            )))
+            .block_task()
+            .await?;
+        self.shared
+            .sessions
+            .write()
+            .expect("Grok session map poisoned")
+            .remove(&(project_id, native_session_id.to_owned()));
+        self.shared
+            .release_session_terminals(native_session_id)
+            .await;
+        Ok(())
+    }
+
+    async fn connection_for_project(&self, project: &Project) -> Result<Arc<ProjectConnection>> {
+        self.shared.connection_for_project(project).await
+    }
+
+    async fn connection_for_bound_session(
+        &self,
+        native_session_id: &str,
+        conversation_id: ConversationId,
+    ) -> Result<(ProjectId, Arc<ProjectConnection>, SessionBinding)> {
+        let (project_id, binding) = self
+            .shared
+            .sessions
+            .read()
+            .expect("Grok session map poisoned")
+            .iter()
+            .find_map(|((project_id, session_id), binding)| {
+                (session_id == native_session_id && binding.conversation_id == conversation_id)
+                    .then(|| (*project_id, binding.clone()))
+            })
+            .ok_or_else(|| anyhow!("Grok session {native_session_id} is not active"))?;
+        let connection = self
+            .shared
+            .connections
+            .lock()
+            .await
+            .get(&project_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Grok connection for session {native_session_id} is closed"))?;
+        if connection.connection.is_incoming_closed() {
+            bail!("Grok connection for session {native_session_id} is closed");
+        }
+        Ok((project_id, connection, binding))
+    }
+
+    async fn open_existing_session(
+        &self,
+        request: ResumeSession,
+        replay: bool,
+    ) -> Result<NativeSession> {
+        let connection = self.connection_for_project(&request.project).await?;
+        let (model, effort) = select_model_and_effort(
+            &connection.negotiated,
+            request.model.as_deref(),
+            request.effort.as_deref(),
+        )?;
+        let session_id = SessionId::new(request.native_session_id.clone());
+        self.shared.bind_session(
+            request.project.id,
+            &request.native_session_id,
+            request.conversation_id,
+            model.clone(),
+            effort.clone(),
+        );
+
+        let meta = selection_meta(model.as_deref(), effort.as_deref());
+        let result = if replay {
+            if !connection.negotiated.supports_load {
+                bail!("Grok did not advertise session/load");
+            }
+            connection
+                .connection
+                .send_request(
+                    LoadSessionRequest::new(session_id, request.project.canonical_path.clone())
+                        .meta(meta),
+                )
+                .block_task()
+                .await
+                .map(|_| ())
+        } else if connection.negotiated.supports_resume {
+            connection
+                .connection
+                .send_request(
+                    ResumeSessionRequest::new(session_id, request.project.canonical_path.clone())
+                        .meta(meta),
+                )
+                .block_task()
+                .await
+                .map(|_| ())
+        } else if connection.negotiated.supports_load {
+            connection
+                .connection
+                .send_request(
+                    LoadSessionRequest::new(session_id, request.project.canonical_path.clone())
+                        .meta(meta),
+                )
+                .block_task()
+                .await
+                .map(|_| ())
+        } else {
+            bail!("Grok advertised neither session/resume nor session/load");
+        };
+
+        if let Err(error) = result {
+            self.shared
+                .sessions
+                .write()
+                .expect("Grok session map poisoned")
+                .remove(&(request.project.id, request.native_session_id.clone()));
+            return Err(anyhow!(error));
+        }
+
+        Ok(native_session(
+            request.native_session_id,
+            request.project.display_name,
+            model,
+            effort,
+            &connection.negotiated.models,
+        ))
+    }
+}
+
+#[async_trait]
+impl AgentProvider for GrokProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId::Grok
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.shared
+            .negotiated
+            .read()
+            .expect("Grok capabilities poisoned")
+            .as_ref()
+            .map(Negotiated::provider_capabilities)
+            .unwrap_or(ProviderCapabilities {
+                supports_session_list: false,
+                supports_resume: false,
+                supports_steer: false,
+            })
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<ProviderEvent> {
+        self.shared.events.subscribe()
+    }
+
+    async fn health(&self) -> ProviderHealth {
+        if let Some(health) = self
+            .shared
+            .health
+            .read()
+            .expect("Grok health poisoned")
+            .clone()
+            && matches!(
+                health.state,
+                ProviderState::Ready | ProviderState::ProtocolIncompatible
+            )
+        {
+            return health;
+        }
+
+        let output = Command::new(&self.shared.executable)
+            .args(["--no-auto-update", "--version"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+        let health = match output {
+            Ok(output) if output.status.success() => ProviderHealth {
+                provider: ProviderId::Grok,
+                state: ProviderState::Ready,
+                version: parse_cli_version(&String::from_utf8_lossy(&output.stdout)),
+                detail: Some("Grok Build ACP will start when a project is opened".to_owned()),
+            },
+            Ok(output) => ProviderHealth {
+                provider: ProviderId::Grok,
+                state: ProviderState::Crashed,
+                version: None,
+                detail: Some(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProviderHealth {
+                provider: ProviderId::Grok,
+                state: ProviderState::NotInstalled,
+                version: None,
+                detail: Some(format!(
+                    "{} was not found",
+                    self.shared.executable.display()
+                )),
+            },
+            Err(error) => ProviderHealth {
+                provider: ProviderId::Grok,
+                state: ProviderState::Crashed,
+                version: None,
+                detail: Some(error.to_string()),
+            },
+        };
+        *self.shared.health.write().expect("Grok health poisoned") = Some(health.clone());
+        health
+    }
+
+    async fn list_models(&self, project: &Project) -> Result<Vec<ModelOption>> {
+        let connection = self.connection_for_project(project).await?;
+        Ok(connection.negotiated.public_models())
+    }
+
+    async fn list_sessions(&self, project: &Project) -> Result<Vec<SessionSummary>> {
+        let connection = self.connection_for_project(project).await?;
+        if !connection.negotiated.supports_list {
+            bail!("Grok did not advertise session/list");
+        }
+        let mut sessions = Vec::new();
+        let mut cursor = None;
+        loop {
+            let response = connection
+                .connection
+                .send_request(
+                    ListSessionsRequest::new()
+                        .cwd(project.canonical_path.clone())
+                        .cursor(cursor.clone()),
+                )
+                .block_task()
+                .await?;
+            sessions.extend(response.sessions.into_iter().map(|session| {
+                SessionSummary {
+                    native_session_id: session.session_id.to_string(),
+                    title: session
+                        .title
+                        .unwrap_or_else(|| "Untitled Grok session".to_owned()),
+                    // ACP timestamps are optional strings; zero explicitly means unknown here.
+                    updated_at_ms: 0,
+                }
+            }));
+            cursor = response.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(sessions)
+    }
+
+    async fn create_session(&self, request: CreateSession) -> Result<NativeSession> {
+        let connection = self.connection_for_project(&request.project).await?;
+        let (model, effort) = select_model_and_effort(
+            &connection.negotiated,
+            request.model.as_deref(),
+            request.effort.as_deref(),
+        )?;
+        let response = connection
+            .connection
+            .send_request(
+                NewSessionRequest::new(request.project.canonical_path.clone())
+                    .meta(selection_meta(model.as_deref(), effort.as_deref())),
+            )
+            .block_task()
+            .await?;
+        let native_session_id = response.session_id.to_string();
+        self.shared.bind_session(
+            request.project.id,
+            &native_session_id,
+            request.conversation_id,
+            model.clone(),
+            effort.clone(),
+        );
+        Ok(native_session(
+            native_session_id,
+            request.project.display_name,
+            model,
+            effort,
+            &connection.negotiated.models,
+        ))
+    }
+
+    async fn resume_session(&self, request: ResumeSession) -> Result<NativeSession> {
+        self.open_existing_session(request, false).await
+    }
+
+    async fn send_message(&self, request: SendMessage) -> Result<CommandAck> {
+        let (project_id, connection, binding) = self
+            .connection_for_bound_session(&request.native_session_id, request.conversation_id)
+            .await?;
+        let requested_model = request.model.as_deref().or(binding.model.as_deref());
+        let requested_effort = request.effort.as_deref().or(binding.effort.as_deref());
+        let (model, effort) =
+            select_model_and_effort(&connection.negotiated, requested_model, requested_effort)?;
+        if model != binding.model || effort != binding.effort {
+            set_grok_model(
+                &connection,
+                &request.native_session_id,
+                model.as_deref(),
+                effort.as_deref(),
+            )
+            .await?;
+            self.shared
+                .update_selection(project_id, &request.native_session_id, model, effort);
+        }
+
+        self.shared
+            .start_turn(project_id, &request.native_session_id);
+        let connection_to_agent = connection.connection.clone();
+        let shared = Arc::clone(&self.shared);
+        let session_id = request.native_session_id.clone();
+        let conversation_id = request.conversation_id;
+        tokio::spawn(async move {
+            let result = connection_to_agent
+                .send_request(PromptRequest::new(
+                    SessionId::new(session_id.clone()),
+                    vec![ContentBlock::Text(TextContent::new(request.text))],
+                ))
+                .block_task()
+                .await;
+            shared.finish_turn(project_id, &session_id);
+            let kind = match result {
+                Ok(response) => stop_reason_event(response.stop_reason),
+                Err(error) => ProviderEventKind::Failed {
+                    code: "grok_prompt_failed".to_owned(),
+                    message: error.to_string(),
+                },
+            };
+            shared.emit(project_id, conversation_id, kind);
+        });
+        Ok(CommandAck)
+    }
+
+    async fn steer(&self, request: SteerMessage) -> Result<CommandAck> {
+        let (_, connection, _) = self
+            .connection_for_bound_session(&request.native_session_id, request.conversation_id)
+            .await?;
+        if !connection.negotiated.supports_extensions() {
+            bail!("this Grok version does not safely advertise steering");
+        }
+        connection
+            .connection
+            .send_request(InterjectRequest {
+                session_id: SessionId::new(request.native_session_id),
+                text: request.text,
+                interjection_id: Uuid::new_v4().to_string(),
+            })
+            .block_task()
+            .await?;
+        Ok(CommandAck)
+    }
+
+    async fn interrupt(&self, request: InterruptSession) -> Result<CommandAck> {
+        let (_, connection, _) = self
+            .connection_for_bound_session(&request.native_session_id, request.conversation_id)
+            .await?;
+        self.shared.cancel_permissions(&request.native_session_id)?;
+        connection
+            .connection
+            .send_notification(CancelNotification::new(SessionId::new(
+                request.native_session_id,
+            )))?;
+        Ok(CommandAck)
+    }
+
+    async fn resolve_approval(&self, request: ResolveApproval) -> Result<CommandAck> {
+        let pending = {
+            let mut permissions = self
+                .shared
+                .permissions
+                .lock()
+                .expect("Grok permission map poisoned");
+            let pending = permissions
+                .get(&request.provider_request_id)
+                .ok_or_else(|| anyhow!("Grok permission request is no longer pending"))?;
+            if pending.conversation_id != request.conversation_id {
+                bail!("permission request does not belong to this conversation");
+            }
+            if !pending
+                .allowed_options
+                .iter()
+                .any(|id| id == &request.option_id)
+            {
+                bail!("permission option {} was not offered", request.option_id);
+            }
+            permissions
+                .remove(&request.provider_request_id)
+                .expect("permission was checked while locked")
+        };
+        pending.responder.respond(RequestPermissionResponse::new(
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                PermissionOptionId::new(request.option_id),
+            )),
+        ))?;
+        Ok(CommandAck)
+    }
+
+    async fn set_session_option(&self, request: SetSessionOption) -> Result<CommandAck> {
+        let (project_id, connection, binding) = self
+            .connection_for_bound_session(&request.native_session_id, request.conversation_id)
+            .await?;
+        let (model, effort) = match request.option_id.as_str() {
+            "model" => (Some(request.value), binding.effort),
+            "reasoning_effort" | "thought_level" => (binding.model, Some(request.value)),
+            other => bail!("Grok session option {other} is not supported"),
+        };
+        let (model, effort) =
+            select_model_and_effort(&connection.negotiated, model.as_deref(), effort.as_deref())?;
+        set_grok_model(
+            &connection,
+            &request.native_session_id,
+            model.as_deref(),
+            effort.as_deref(),
+        )
+        .await?;
+        self.shared
+            .update_selection(project_id, &request.native_session_id, model, effort);
+        Ok(CommandAck)
+    }
+}
+
+impl Shared {
+    async fn connection_for_project(
+        self: &Arc<Self>,
+        project: &Project,
+    ) -> Result<Arc<ProjectConnection>> {
+        let mut connections = self.connections.lock().await;
+        if let Some(connection) = connections.get(&project.id)
+            && !connection.connection.is_incoming_closed()
+        {
+            return Ok(Arc::clone(connection));
+        }
+        connections.remove(&project.id);
+        let connection = self.start_connection(project.clone()).await?;
+        connections.insert(project.id, Arc::clone(&connection));
+        Ok(connection)
+    }
+
+    async fn start_connection(
+        self: &Arc<Self>,
+        project: Project,
+    ) -> Result<Arc<ProjectConnection>> {
+        let agent = AcpAgent::new(AcpAgentConfig::new(self.executable.clone()).args([
+            "--no-auto-update",
+            "agent",
+            "stdio",
+        ]));
+        let (ready_tx, ready_rx) =
+            oneshot::channel::<std::result::Result<(ConnectionTo<Agent>, Negotiated), String>>();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let initialized = Arc::new(AtomicBool::new(false));
+
+        let update_state = Arc::clone(self);
+        let update_project_id = project.id;
+        let permission_state = Arc::clone(self);
+        let permission_project_id = project.id;
+        let read_state = Arc::clone(self);
+        let read_project = project.clone();
+        let write_state = Arc::clone(self);
+        let write_project = project.clone();
+        let create_terminal_state = Arc::clone(self);
+        let create_terminal_project = project.clone();
+        let terminal_output_state = Arc::clone(self);
+        let wait_terminal_state = Arc::clone(self);
+        let kill_terminal_state = Arc::clone(self);
+        let release_terminal_state = Arc::clone(self);
+        let task_state = Arc::clone(self);
+        let task_project_id = project.id;
+        let task_initialized = Arc::clone(&initialized);
+        let connection_initialized = Arc::clone(&initialized);
+
+        tokio::spawn(async move {
+            let result = Client
+                .builder()
+                .name("agent-remote-grok")
+                .on_receive_notification(
+                    async move |notification: RawSessionNotification, _connection| {
+                        update_state.handle_session_update(update_project_id, notification);
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .on_receive_request(
+                    async move |request: RequestPermissionRequest, responder, _connection| {
+                        permission_state.handle_permission_request(
+                            permission_project_id,
+                            request,
+                            responder,
+                        )
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: ReadTextFileRequest, responder, connection| {
+                        let state = Arc::clone(&read_state);
+                        let project = read_project.clone();
+                        connection.spawn(async move {
+                            let response = state
+                                .read_text_file(&project, request)
+                                .await
+                                .map_err(acp_handler_error);
+                            responder.respond_with_result(response)?;
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: WriteTextFileRequest, responder, connection| {
+                        let state = Arc::clone(&write_state);
+                        let project = write_project.clone();
+                        connection.spawn(async move {
+                            let response = state
+                                .write_text_file(&project, request)
+                                .await
+                                .map_err(acp_handler_error);
+                            responder.respond_with_result(response)?;
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: CreateTerminalRequest, responder, connection| {
+                        let state = Arc::clone(&create_terminal_state);
+                        let project = create_terminal_project.clone();
+                        connection.spawn(async move {
+                            let response = state
+                                .create_terminal(&project, request)
+                                .await
+                                .map_err(acp_handler_error);
+                            responder.respond_with_result(response)?;
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: TerminalOutputRequest, responder, connection| {
+                        let state = Arc::clone(&terminal_output_state);
+                        connection.spawn(async move {
+                            let response = state
+                                .terminal_output(request)
+                                .await
+                                .map_err(acp_handler_error);
+                            responder.respond_with_result(response)?;
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: WaitForTerminalExitRequest, responder, connection| {
+                        let state = Arc::clone(&wait_terminal_state);
+                        connection.spawn(async move {
+                            let response = state
+                                .wait_for_terminal_exit(request)
+                                .await
+                                .map_err(acp_handler_error);
+                            responder.respond_with_result(response)?;
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: KillTerminalRequest, responder, connection| {
+                        let state = Arc::clone(&kill_terminal_state);
+                        connection.spawn(async move {
+                            let response = state
+                                .kill_terminal(request)
+                                .await
+                                .map_err(acp_handler_error);
+                            responder.respond_with_result(response)?;
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: ReleaseTerminalRequest, responder, connection| {
+                        let state = Arc::clone(&release_terminal_state);
+                        connection.spawn(async move {
+                            let response = state
+                                .release_terminal(request)
+                                .await
+                                .map_err(acp_handler_error);
+                            responder.respond_with_result(response)?;
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_with(agent, async move |connection| {
+                    let initialize = InitializeRequest::new(ProtocolVersion::V1)
+                        .client_capabilities(
+                            ClientCapabilities::new()
+                                .fs(FileSystemCapabilities::new()
+                                    .read_text_file(true)
+                                    .write_text_file(true))
+                                .terminal(true),
+                        )
+                        .client_info(
+                            Implementation::new(
+                                "agent-remote-messenger",
+                                env!("CARGO_PKG_VERSION"),
+                            )
+                            .title("Agent Remote Messenger"),
+                        );
+                    let response = match connection.send_request(initialize).block_task().await {
+                        Ok(response) => response,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error.to_string()));
+                            return Err(error);
+                        }
+                    };
+                    let negotiated = match negotiate(&response) {
+                        Ok(negotiated) => negotiated,
+                        Err(error) => {
+                            let message = error.to_string();
+                            let _ = ready_tx.send(Err(message.clone()));
+                            return Err(
+                                agent_client_protocol::Error::invalid_request().data(message)
+                            );
+                        }
+                    };
+                    connection_initialized.store(true, Ordering::Release);
+                    let _ = ready_tx.send(Ok((connection.clone(), negotiated)));
+                    let _ = shutdown_rx.await;
+                    Ok(())
+                })
+                .await;
+
+            if let Err(error) = result {
+                *task_state.health.write().expect("Grok health poisoned") =
+                    Some(classify_connection_error(&error));
+                if task_initialized.load(Ordering::Acquire) {
+                    task_state.emit_crash_for_project(task_project_id, error.to_string());
+                }
+            }
+            task_state.cleanup_project(task_project_id).await;
+        });
+
+        let (connection, negotiated) = ready_rx
+            .await
+            .map_err(|_| anyhow!("Grok ACP process stopped during initialization"))?
+            .map_err(|message| anyhow!(message))?;
+        *self.negotiated.write().expect("Grok capabilities poisoned") = Some(negotiated.clone());
+        *self.health.write().expect("Grok health poisoned") = Some(ProviderHealth {
+            provider: ProviderId::Grok,
+            state: ProviderState::Ready,
+            version: negotiated.version.clone(),
+            detail: Some("ACP v1 initialized".to_owned()),
+        });
+        Ok(Arc::new(ProjectConnection {
+            connection,
+            negotiated,
+            shutdown: StdMutex::new(Some(shutdown_tx)),
+        }))
+    }
+
+    fn bind_session(
+        &self,
+        project_id: ProjectId,
+        session_id: &str,
+        conversation_id: ConversationId,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
+        self.sessions
+            .write()
+            .expect("Grok session map poisoned")
+            .insert(
+                (project_id, session_id.to_owned()),
+                SessionBinding {
+                    conversation_id,
+                    model,
+                    effort,
+                    agent_item_id: format!("agent:{}", Uuid::new_v4()),
+                    thought_item_id: format!("thought:{}", Uuid::new_v4()),
+                },
+            );
+    }
+
+    fn start_turn(&self, project_id: ProjectId, session_id: &str) {
+        if let Some(binding) = self
+            .sessions
+            .write()
+            .expect("Grok session map poisoned")
+            .get_mut(&(project_id, session_id.to_owned()))
+        {
+            binding.agent_item_id = format!("agent:{}", Uuid::new_v4());
+            binding.thought_item_id = format!("thought:{}", Uuid::new_v4());
+        }
+    }
+
+    fn finish_turn(&self, _project_id: ProjectId, _session_id: &str) {}
+
+    fn update_selection(
+        &self,
+        project_id: ProjectId,
+        session_id: &str,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
+        if let Some(binding) = self
+            .sessions
+            .write()
+            .expect("Grok session map poisoned")
+            .get_mut(&(project_id, session_id.to_owned()))
+        {
+            binding.model = model;
+            binding.effort = effort;
+        }
+    }
+
+    fn emit(
+        &self,
+        project_id: ProjectId,
+        conversation_id: ConversationId,
+        kind: ProviderEventKind,
+    ) {
+        let _ = self.events.send(ProviderEvent {
+            provider: ProviderId::Grok,
+            project_id,
+            conversation_id,
+            kind,
+        });
+    }
+
+    fn emit_crash_for_project(&self, project_id: ProjectId, message: String) {
+        let conversations: Vec<_> = self
+            .sessions
+            .read()
+            .expect("Grok session map poisoned")
+            .iter()
+            .filter_map(|((bound_project, _), binding)| {
+                (*bound_project == project_id).then_some(binding.conversation_id)
+            })
+            .collect();
+        for conversation_id in conversations {
+            self.emit(
+                project_id,
+                conversation_id,
+                ProviderEventKind::Crashed {
+                    message: message.clone(),
+                },
+            );
+        }
+    }
+
+    fn handle_permission_request(
+        &self,
+        project_id: ProjectId,
+        request: RequestPermissionRequest,
+        responder: Responder<RequestPermissionResponse>,
+    ) -> std::result::Result<(), agent_client_protocol::Error> {
+        let session_id = request.session_id.to_string();
+        let Some(binding) = self
+            .sessions
+            .read()
+            .expect("Grok session map poisoned")
+            .get(&(project_id, session_id.clone()))
+            .cloned()
+        else {
+            return responder.respond(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Cancelled,
+            ));
+        };
+        if request.options.is_empty() {
+            return responder.respond(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Cancelled,
+            ));
+        }
+
+        let provider_request_id = Uuid::new_v4().to_string();
+        let options: Vec<_> = request
+            .options
+            .iter()
+            .map(|option| ApprovalOption {
+                id: option.option_id.to_string(),
+                label: option.name.clone(),
+            })
+            .collect();
+        let allowed_options = options.iter().map(|option| option.id.clone()).collect();
+        let prompt = request
+            .tool_call
+            .fields
+            .title
+            .clone()
+            .unwrap_or_else(|| "Grok requests permission to run a tool".to_owned());
+        self.permissions
+            .lock()
+            .expect("Grok permission map poisoned")
+            .insert(
+                provider_request_id.clone(),
+                PendingPermission {
+                    conversation_id: binding.conversation_id,
+                    session_id,
+                    allowed_options,
+                    responder,
+                },
+            );
+        self.emit(
+            project_id,
+            binding.conversation_id,
+            ProviderEventKind::Approval {
+                provider_request_id,
+                prompt,
+                options,
+            },
+        );
+        Ok(())
+    }
+
+    fn cancel_permissions(&self, session_id: &str) -> Result<()> {
+        let pending: Vec<_> = {
+            let mut permissions = self
+                .permissions
+                .lock()
+                .expect("Grok permission map poisoned");
+            let ids: Vec<_> = permissions
+                .iter()
+                .filter_map(|(id, pending)| {
+                    (pending.session_id == session_id).then_some(id.clone())
+                })
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| permissions.remove(&id))
+                .collect()
+        };
+        for pending in pending {
+            pending.responder.respond(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Cancelled,
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn ensure_bound_session(&self, project_id: ProjectId, session_id: &SessionId) -> Result<()> {
+        if self
+            .sessions
+            .read()
+            .expect("Grok session map poisoned")
+            .contains_key(&(project_id, session_id.to_string()))
+        {
+            Ok(())
+        } else {
+            bail!("unknown Grok session {}", session_id)
+        }
+    }
+
+    async fn read_text_file(
+        &self,
+        project: &Project,
+        request: ReadTextFileRequest,
+    ) -> Result<ReadTextFileResponse> {
+        self.ensure_bound_session(project.id, &request.session_id)?;
+        if request.line == Some(0) {
+            bail!("ACP read line numbers are 1-based");
+        }
+        let path = confined_existing_path(project, &request.path)?;
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("read {}", path.display()))?;
+        Ok(ReadTextFileResponse::new(select_lines(
+            &content,
+            request.line,
+            request.limit,
+        )))
+    }
+
+    async fn write_text_file(
+        &self,
+        project: &Project,
+        request: WriteTextFileRequest,
+    ) -> Result<WriteTextFileResponse> {
+        self.ensure_bound_session(project.id, &request.session_id)?;
+        let path = confined_write_path(project, &request.path)?;
+        tokio::fs::write(&path, request.content)
+            .await
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(WriteTextFileResponse::new())
+    }
+
+    async fn create_terminal(
+        &self,
+        project: &Project,
+        request: CreateTerminalRequest,
+    ) -> Result<CreateTerminalResponse> {
+        self.ensure_bound_session(project.id, &request.session_id)?;
+        let cwd = confined_existing_path(
+            project,
+            request.cwd.as_deref().unwrap_or(&project.canonical_path),
+        )?;
+        if !cwd.is_dir() {
+            bail!("terminal working directory is not a directory");
+        }
+
+        let mut command = Command::new(&request.command);
+        command
+            .args(&request.args)
+            .current_dir(&cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for variable in request.env {
+            command.env(variable.name, variable.value);
+        }
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("start terminal command {}", request.command))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("terminal stdout was unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("terminal stderr was unavailable"))?;
+        let limit = request
+            .output_byte_limit
+            .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
+        let output = Arc::new(StdMutex::new(TerminalOutputBuffer {
+            text: String::new(),
+            limit,
+            truncated: false,
+        }));
+        let stdout_reader = tokio::spawn(read_terminal_stream(stdout, Arc::clone(&output)));
+        let stderr_reader = tokio::spawn(read_terminal_stream(stderr, Arc::clone(&output)));
+
+        let (kill_tx, mut kill_rx) = mpsc::unbounded_channel();
+        let (exit_tx, exit_rx) = watch::channel(None);
+        tokio::spawn(async move {
+            let status = tokio::select! {
+                status = child.wait() => status,
+                _ = kill_rx.recv() => {
+                    let _ = child.kill().await;
+                    child.wait().await
+                }
+            };
+            let status = status
+                .map(|status| ProcessExit {
+                    exit_code: status.code().map(|code| code as u32),
+                    signal: None,
+                })
+                .map_err(|error| error.to_string());
+            let _ = stdout_reader.await;
+            let _ = stderr_reader.await;
+            let _ = exit_tx.send(Some(status));
+        });
+
+        let terminal_id = Uuid::new_v4().to_string();
+        self.terminals.lock().await.insert(
+            terminal_id.clone(),
+            Arc::new(TerminalProcess {
+                project_id: project.id,
+                session_id: request.session_id.to_string(),
+                output,
+                kill: kill_tx,
+                exit: exit_rx,
+            }),
+        );
+        Ok(CreateTerminalResponse::new(terminal_id))
+    }
+
+    async fn terminal_for(
+        &self,
+        session_id: &SessionId,
+        terminal_id: &str,
+    ) -> Result<Arc<TerminalProcess>> {
+        let terminal = self
+            .terminals
+            .lock()
+            .await
+            .get(terminal_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown or released terminal {terminal_id}"))?;
+        if terminal.session_id != session_id.to_string() {
+            bail!("terminal does not belong to session {session_id}");
+        }
+        self.ensure_bound_session(terminal.project_id, session_id)?;
+        Ok(terminal)
+    }
+
+    async fn terminal_output(
+        &self,
+        request: TerminalOutputRequest,
+    ) -> Result<TerminalOutputResponse> {
+        let terminal = self
+            .terminal_for(&request.session_id, &request.terminal_id.to_string())
+            .await?;
+        let output = terminal
+            .output
+            .lock()
+            .expect("terminal output mutex poisoned");
+        let mut response = TerminalOutputResponse::new(output.text.clone(), output.truncated);
+        if let Some(status) = terminal.exit.borrow().clone() {
+            response =
+                response.exit_status(process_exit_status(status.map_err(anyhow::Error::msg)?));
+        }
+        Ok(response)
+    }
+
+    async fn wait_for_terminal_exit(
+        &self,
+        request: WaitForTerminalExitRequest,
+    ) -> Result<WaitForTerminalExitResponse> {
+        let terminal = self
+            .terminal_for(&request.session_id, &request.terminal_id.to_string())
+            .await?;
+        let mut exit = terminal.exit.clone();
+        loop {
+            if let Some(status) = exit.borrow().clone() {
+                return Ok(WaitForTerminalExitResponse::new(process_exit_status(
+                    status.map_err(anyhow::Error::msg)?,
+                )));
+            }
+            exit.changed()
+                .await
+                .map_err(|_| anyhow!("terminal exit monitor closed"))?;
+        }
+    }
+
+    async fn kill_terminal(&self, request: KillTerminalRequest) -> Result<KillTerminalResponse> {
+        let terminal = self
+            .terminal_for(&request.session_id, &request.terminal_id.to_string())
+            .await?;
+        let _ = terminal.kill.send(());
+        wait_for_exit(&terminal).await?;
+        Ok(KillTerminalResponse::new())
+    }
+
+    async fn release_terminal(
+        &self,
+        request: ReleaseTerminalRequest,
+    ) -> Result<ReleaseTerminalResponse> {
+        let terminal_id = request.terminal_id.to_string();
+        let terminal = self.terminal_for(&request.session_id, &terminal_id).await?;
+        self.terminals.lock().await.remove(&terminal_id);
+        let _ = terminal.kill.send(());
+        wait_for_exit(&terminal).await?;
+        Ok(ReleaseTerminalResponse::new())
+    }
+
+    async fn release_session_terminals(&self, session_id: &str) {
+        let terminals = {
+            let mut active = self.terminals.lock().await;
+            let ids: Vec<_> = active
+                .iter()
+                .filter_map(|(id, terminal)| {
+                    (terminal.session_id == session_id).then_some(id.clone())
+                })
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| active.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        for terminal in terminals {
+            let _ = terminal.kill.send(());
+        }
+    }
+
+    async fn cleanup_project(&self, project_id: ProjectId) {
+        let session_ids: Vec<_> = self
+            .sessions
+            .read()
+            .expect("Grok session map poisoned")
+            .keys()
+            .filter_map(|(bound_project, session_id)| {
+                (*bound_project == project_id).then_some(session_id.clone())
+            })
+            .collect();
+        for session_id in &session_ids {
+            let _ = self.cancel_permissions(session_id);
+        }
+        self.sessions
+            .write()
+            .expect("Grok session map poisoned")
+            .retain(|(bound_project, _), _| *bound_project != project_id);
+
+        let terminals = {
+            let mut active = self.terminals.lock().await;
+            let ids: Vec<_> = active
+                .iter()
+                .filter_map(|(id, terminal)| {
+                    (terminal.project_id == project_id).then_some(id.clone())
+                })
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| active.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        for terminal in terminals {
+            let _ = terminal.kill.send(());
+        }
+    }
+}
+
+fn negotiate(response: &InitializeResponse) -> Result<Negotiated> {
+    if response.protocol_version != ProtocolVersion::V1 {
+        bail!(
+            "Grok selected unsupported ACP protocol version {:?}",
+            response.protocol_version
+        );
+    }
+    let meta = response.meta.as_ref();
+    let version = meta
+        .and_then(|meta| meta.get("agentVersion"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            response
+                .agent_info
+                .as_ref()
+                .map(|info| info.version.clone())
+        });
+    let grok_shell = meta
+        .and_then(|meta| meta.get("grokShell"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (models, current_model) = meta
+        .and_then(|meta| meta.get("modelState"))
+        .map(parse_model_state)
+        .unwrap_or_default();
+    let capabilities = &response.agent_capabilities;
+    Ok(Negotiated {
+        version,
+        grok_shell,
+        supports_list: capabilities.session_capabilities.list.is_some(),
+        supports_load: capabilities.load_session,
+        supports_resume: capabilities.session_capabilities.resume.is_some(),
+        supports_close: capabilities.session_capabilities.close.is_some(),
+        models,
+        current_model,
+    })
+}
+
+fn parse_model_state(value: &Value) -> (Vec<GrokModel>, Option<String>) {
+    let current_model = value
+        .get("currentModelId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let models = value
+        .get("availableModels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model.get("modelId")?.as_str()?.to_owned();
+            let name = model
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&id)
+                .to_owned();
+            let model_meta = model.get("_meta").and_then(Value::as_object);
+            let configured_effort = model_meta
+                .and_then(|meta| meta.get("reasoningEffort"))
+                .and_then(Value::as_str);
+            let effort_values = model_meta
+                .and_then(|meta| meta.get("reasoningEfforts"))
+                .and_then(Value::as_array);
+            let efforts: Vec<_> = effort_values
+                .into_iter()
+                .flatten()
+                .filter_map(|effort| {
+                    let id = effort
+                        .get("id")
+                        .or_else(|| effort.get("value"))?
+                        .as_str()?
+                        .to_owned();
+                    let label = effort
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&id)
+                        .to_owned();
+                    Some(GrokEffort { id, label })
+                })
+                .collect();
+            let default_effort = effort_values
+                .into_iter()
+                .flatten()
+                .find(|effort| {
+                    effort
+                        .get("default")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .and_then(|effort| {
+                    effort
+                        .get("id")
+                        .or_else(|| effort.get("value"))
+                        .and_then(Value::as_str)
+                })
+                .or(configured_effort)
+                .map(str::to_owned);
+            Some(GrokModel {
+                id,
+                name,
+                efforts,
+                default_effort,
+            })
+        })
+        .collect();
+    (models, current_model)
+}
+
+fn select_model_and_effort(
+    negotiated: &Negotiated,
+    selected_model: Option<&str>,
+    selected_effort: Option<&str>,
+) -> Result<(Option<String>, Option<String>)> {
+    if negotiated.models.is_empty() {
+        if selected_model.is_some() || selected_effort.is_some() {
+            bail!("Grok did not report structured model metadata");
+        }
+        return Ok((None, None));
+    }
+    let model_id = selected_model
+        .map(str::to_owned)
+        .or_else(|| negotiated.current_model.clone())
+        .or_else(|| negotiated.models.first().map(|model| model.id.clone()))
+        .expect("non-empty model list");
+    let model = negotiated
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| anyhow!("model {model_id} was not reported by Grok"))?;
+    let effort = selected_effort
+        .map(str::to_owned)
+        .or_else(|| model.default_effort.clone());
+    if let Some(effort) = effort.as_deref()
+        && !model.efforts.iter().any(|candidate| candidate.id == effort)
+    {
+        bail!("effort {effort} is not supported by model {model_id}");
+    }
+    Ok((Some(model_id), effort))
+}
+
+fn session_options(
+    models: &[GrokModel],
+    selected_model: Option<&str>,
+    selected_effort: Option<&str>,
+) -> Vec<SessionOption> {
+    let mut options = Vec::new();
+    if let Some(selected_model) = selected_model {
+        options.push(SessionOption {
+            id: "model".to_owned(),
+            display_name: "Model".to_owned(),
+            category: Some("model".to_owned()),
+            current_value: selected_model.to_owned(),
+            values: models
+                .iter()
+                .map(|model| SessionOptionValue {
+                    value: model.id.clone(),
+                    display_name: model.name.clone(),
+                })
+                .collect(),
+        });
+    }
+    if let (Some(selected_model), Some(selected_effort)) = (selected_model, selected_effort)
+        && let Some(model) = models.iter().find(|model| model.id == selected_model)
+    {
+        options.push(SessionOption {
+            id: "reasoning_effort".to_owned(),
+            display_name: "Reasoning effort".to_owned(),
+            category: Some("thought_level".to_owned()),
+            current_value: selected_effort.to_owned(),
+            values: model
+                .efforts
+                .iter()
+                .map(|effort| SessionOptionValue {
+                    value: effort.id.clone(),
+                    display_name: effort.label.clone(),
+                })
+                .collect(),
+        });
+    }
+    options
+}
+
+fn native_session(
+    native_session_id: String,
+    title: String,
+    model: Option<String>,
+    effort: Option<String>,
+    models: &[GrokModel],
+) -> NativeSession {
+    NativeSession {
+        native_session_id,
+        title,
+        selected_model: model.clone(),
+        selected_effort: effort.clone(),
+        session_options: session_options(models, model.as_deref(), effort.as_deref()),
+    }
+}
+
+fn selection_meta(model: Option<&str>, effort: Option<&str>) -> Meta {
+    let mut meta = Meta::new();
+    if let Some(model) = model {
+        meta.insert("modelId".to_owned(), Value::String(model.to_owned()));
+    }
+    if let Some(effort) = effort {
+        meta.insert(
+            "reasoningEffort".to_owned(),
+            Value::String(effort.to_owned()),
+        );
+    }
+    meta
+}
+
+async fn set_grok_model(
+    connection: &ProjectConnection,
+    session_id: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<()> {
+    if !connection.negotiated.supports_extensions() {
+        bail!(
+            "live model changes require Grok Build {}",
+            GROK_EXTENSION_VERSION
+        );
+    }
+    let model = model.ok_or_else(|| anyhow!("Grok did not report a selected model"))?;
+    let mut meta = Meta::new();
+    if let Some(effort) = effort {
+        meta.insert(
+            "reasoningEffort".to_owned(),
+            Value::String(effort.to_owned()),
+        );
+    }
+    connection
+        .connection
+        .send_request(SetModelRequest {
+            session_id: SessionId::new(session_id.to_owned()),
+            model_id: model.to_owned(),
+            meta,
+        })
+        .block_task()
+        .await?;
+    Ok(())
+}
+
+fn stop_reason_event(stop_reason: StopReason) -> ProviderEventKind {
+    match stop_reason {
+        StopReason::Cancelled => ProviderEventKind::Interrupted,
+        StopReason::EndTurn
+        | StopReason::MaxTokens
+        | StopReason::MaxTurnRequests
+        | StopReason::Refusal => ProviderEventKind::Completed,
+        _ => ProviderEventKind::Completed,
+    }
+}
+
+fn tool_status(status: ToolCallStatus) -> ItemStatus {
+    match status {
+        ToolCallStatus::Pending => ItemStatus::Pending,
+        ToolCallStatus::InProgress => ItemStatus::Running,
+        ToolCallStatus::Completed => ItemStatus::Completed,
+        ToolCallStatus::Failed => ItemStatus::Failed,
+        _ => ItemStatus::Pending,
+    }
+}
+
+fn json_summary(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn parse_cli_version(stdout: &str) -> Option<String> {
+    stdout
+        .split_whitespace()
+        .find(|token| token.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
+        .map(|token| {
+            token
+                .trim_matches(|ch: char| ch == '(' || ch == ')')
+                .to_owned()
+        })
+}
+
+fn classify_connection_error(error: &agent_client_protocol::Error) -> ProviderHealth {
+    let message = error.to_string();
+    let lower = message.to_ascii_lowercase();
+    let state = if lower.contains("login")
+        || lower.contains("not authenticated")
+        || lower.contains("unauthenticated")
+        || lower.contains("credential")
+    {
+        ProviderState::NotAuthenticated
+    } else if lower.contains("protocol version") {
+        ProviderState::ProtocolIncompatible
+    } else {
+        ProviderState::Crashed
+    };
+    ProviderHealth {
+        provider: ProviderId::Grok,
+        state,
+        version: None,
+        detail: Some(message),
+    }
+}
+
+fn acp_handler_error(error: anyhow::Error) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::invalid_params().data(error.to_string())
+}
+
+fn confined_existing_path(project: &Project, requested: &Path) -> Result<PathBuf> {
+    if !requested.is_absolute() {
+        bail!("ACP file and terminal paths must be absolute");
+    }
+    project.resolve_existing(requested)
+}
+
+fn confined_write_path(project: &Project, requested: &Path) -> Result<PathBuf> {
+    if !requested.is_absolute() {
+        bail!("ACP write paths must be absolute");
+    }
+    if requested.exists() {
+        return project.resolve_existing(requested);
+    }
+    project.resolve_for_write(requested)
+}
+
+fn select_lines(content: &str, line: Option<u32>, limit: Option<u32>) -> String {
+    let start = line.unwrap_or(1).saturating_sub(1) as usize;
+    let limit = limit.map(|value| value as usize).unwrap_or(usize::MAX);
+    content
+        .split_inclusive('\n')
+        .skip(start)
+        .take(limit)
+        .collect()
+}
+
+async fn read_terminal_stream(
+    mut stream: impl tokio::io::AsyncRead + Unpin,
+    output: Arc<StdMutex<TerminalOutputBuffer>>,
+) {
+    let mut bytes = [0_u8; 4096];
+    loop {
+        match stream.read(&mut bytes).await {
+            Ok(0) => break,
+            Ok(read) => output
+                .lock()
+                .expect("terminal output mutex poisoned")
+                .push(&String::from_utf8_lossy(&bytes[..read])),
+            Err(error) => {
+                tracing::debug!(%error, "failed to read Grok terminal output");
+                break;
+            }
+        }
+    }
+}
+
+impl TerminalOutputBuffer {
+    fn push(&mut self, value: &str) {
+        self.text.push_str(value);
+        let Some(limit) = self.limit else {
+            return;
+        };
+        if self.text.len() <= limit {
+            return;
+        }
+        self.truncated = true;
+        let mut cut = self.text.len() - limit;
+        while cut < self.text.len() && !self.text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        self.text.drain(..cut);
+    }
+}
+
+fn process_exit_status(exit: ProcessExit) -> TerminalExitStatus {
+    TerminalExitStatus::new()
+        .exit_code(exit.exit_code)
+        .signal(exit.signal)
+}
+
+async fn wait_for_exit(terminal: &TerminalProcess) -> Result<ProcessExit> {
+    let mut exit = terminal.exit.clone();
+    loop {
+        if let Some(status) = exit.borrow().clone() {
+            return status.map_err(anyhow::Error::msg);
+        }
+        exit.changed()
+            .await
+            .map_err(|_| anyhow!("terminal exit monitor closed"))?;
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use std::{fs, sync::Arc};
+
+    use agent_client_protocol::schema::v1::{
+        AgentCapabilities, InitializeResponse, PermissionOption, PermissionOptionKind,
+        RequestPermissionRequest, SessionListCapabilities, SessionResumeCapabilities,
+        ToolCallUpdate, ToolCallUpdateFields,
+    };
+    use agent_client_protocol::{Agent, Channel, Client};
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    fn model_state() -> Value {
+        serde_json::json!({
+            "currentModelId": "grok-4.6",
+            "availableModels": [
+                {
+                    "modelId": "grok-4.6",
+                    "name": "Grok 4.6",
+                    "_meta": {
+                        "reasoningEffort": "high",
+                        "reasoningEfforts": [
+                            {"id": "xhigh", "label": "Extra High", "default": false},
+                            {"id": "high", "label": "High", "default": true},
+                            {"id": "medium", "label": "Medium", "default": false},
+                            {"id": "low", "label": "Low", "default": false}
+                        ]
+                    }
+                },
+                {
+                    "modelId": "grok-4.5",
+                    "name": "Grok 4.5",
+                    "_meta": {
+                        "reasoningEffort": "high",
+                        "reasoningEfforts": [
+                            {"id": "high", "label": "High", "default": true},
+                            {"id": "medium", "label": "Medium", "default": false},
+                            {"id": "low", "label": "Low", "default": false}
+                        ]
+                    }
+                }
+            ]
+        })
+    }
+
+    fn negotiated() -> Negotiated {
+        let (models, current_model) = parse_model_state(&model_state());
+        Negotiated {
+            version: Some(GROK_EXTENSION_VERSION.to_owned()),
+            grok_shell: true,
+            supports_list: true,
+            supports_load: true,
+            supports_resume: true,
+            supports_close: true,
+            models,
+            current_model,
+        }
+    }
+
+    fn project(path: &Path) -> Project {
+        Project {
+            id: ProjectId::new(),
+            display_name: "test".to_owned(),
+            canonical_path: path.canonicalize().expect("canonical test path"),
+            enabled_providers: vec![ProviderId::Grok],
+        }
+    }
+
+    #[test]
+    fn maps_dynamic_models_and_model_dependent_efforts() {
+        let negotiated = negotiated();
+        let models = negotiated.public_models();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "grok-4.6");
+        assert_eq!(models[0].default_effort.as_deref(), Some("high"));
+        assert!(
+            models[0]
+                .effort_options
+                .iter()
+                .any(|effort| effort.id == "xhigh")
+        );
+        assert!(
+            !models[1]
+                .effort_options
+                .iter()
+                .any(|effort| effort.id == "xhigh")
+        );
+        assert!(select_model_and_effort(&negotiated, Some("grok-4.5"), Some("xhigh")).is_err());
+
+        let options = session_options(&negotiated.models, Some("grok-4.5"), Some("high"));
+        assert_eq!(options[0].id, "model");
+        assert_eq!(options[1].id, "reasoning_effort");
+        assert_eq!(options[1].category.as_deref(), Some("thought_level"));
+        assert_eq!(options[1].values.len(), 3);
+    }
+
+    #[test]
+    fn confines_file_paths_to_the_project() {
+        let project_root = tempfile::tempdir().expect("project tempdir");
+        let outside_root = tempfile::tempdir().expect("outside tempdir");
+        let inside = project_root.path().join("inside.txt");
+        let outside = outside_root.path().join("outside.txt");
+        fs::write(&inside, "inside").expect("write inside fixture");
+        fs::write(&outside, "outside").expect("write outside fixture");
+        let project = project(project_root.path());
+
+        assert_eq!(
+            confined_existing_path(&project, &inside)
+                .expect("inside path")
+                .canonicalize()
+                .expect("canonical inside"),
+            inside.canonicalize().expect("canonical fixture")
+        );
+        assert!(confined_existing_path(&project, &outside).is_err());
+        assert!(confined_write_path(&project, &outside_root.path().join("new.txt")).is_err());
+        assert!(confined_existing_path(&project, Path::new("inside.txt")).is_err());
+    }
+
+    #[test]
+    fn emits_image_bytes_and_ignores_unknown_updates() {
+        let provider = GrokProvider::new();
+        let project_id = ProjectId::new();
+        let conversation_id = ConversationId::new();
+        provider.shared.bind_session(
+            project_id,
+            "s1",
+            conversation_id,
+            Some("grok-4.6".to_owned()),
+            Some("high".to_owned()),
+        );
+        let mut events = provider.subscribe();
+        provider.shared.handle_session_update(
+            project_id,
+            RawSessionNotification {
+                session_id: SessionId::new("s1"),
+                update: serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "image",
+                        "mimeType": "image/png",
+                        "data": BASE64.encode([1_u8, 2, 3])
+                    }
+                }),
+                meta: None,
+            },
+        );
+        let event = events.try_recv().expect("image event");
+        match event.kind {
+            ProviderEventKind::ImageBytes {
+                bytes, mime_type, ..
+            } => {
+                assert_eq!(bytes, vec![1, 2, 3]);
+                assert_eq!(mime_type, "image/png");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        provider.shared.handle_session_update(
+            project_id,
+            RawSessionNotification {
+                session_id: SessionId::new("s1"),
+                update: serde_json::json!({"sessionUpdate": "future_update", "value": 1}),
+                meta: None,
+            },
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            stop_reason_event(StopReason::Cancelled),
+            ProviderEventKind::Interrupted
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplex_permission_resolution_and_cancel_notification() {
+        let provider = GrokProvider::new();
+        let project_id = ProjectId::new();
+        let conversation_id = ConversationId::new();
+        let session_id = "duplex-session";
+        provider.shared.bind_session(
+            project_id,
+            session_id,
+            conversation_id,
+            Some("grok-4.6".to_owned()),
+            Some("high".to_owned()),
+        );
+        let mut events = provider.subscribe();
+
+        let (client_transport, agent_transport) = Channel::duplex();
+        let (client_ready_tx, client_ready_rx) = oneshot::channel();
+        let (client_shutdown_tx, client_shutdown_rx) = oneshot::channel();
+        let client_state = Arc::clone(&provider.shared);
+        let client_task = tokio::spawn(async move {
+            Client
+                .builder()
+                .on_receive_request(
+                    async move |request: RequestPermissionRequest, responder, _connection| {
+                        client_state.handle_permission_request(project_id, request, responder)
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_with(client_transport, async move |connection| {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let _ = client_ready_tx.send(connection.clone());
+                    let _ = client_shutdown_rx.await;
+                    Ok(())
+                })
+                .await
+        });
+
+        let (init_tx, init_rx) = oneshot::channel();
+        let init_tx = Arc::new(StdMutex::new(Some(init_tx)));
+        let init_handler_tx = Arc::clone(&init_tx);
+        let (start_permission_tx, start_permission_rx) = oneshot::channel();
+        let (permission_outcome_tx, permission_outcome_rx) = oneshot::channel();
+        let (set_model_tx, set_model_rx) = oneshot::channel();
+        let set_model_tx = Arc::new(StdMutex::new(Some(set_model_tx)));
+        let set_model_handler_tx = Arc::clone(&set_model_tx);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let cancel_tx = Arc::new(StdMutex::new(Some(cancel_tx)));
+        let cancel_handler_tx = Arc::clone(&cancel_tx);
+        let agent_task = tokio::spawn(async move {
+            Agent
+                .builder()
+                .on_receive_request(
+                    async move |request: InitializeRequest, responder, _connection| {
+                        if let Some(tx) = init_handler_tx.lock().expect("init mutex").take() {
+                            let _ = tx.send(());
+                        }
+                        responder.respond(
+                            InitializeResponse::new(request.protocol_version).agent_capabilities(
+                                AgentCapabilities::new()
+                                    .load_session(true)
+                                    .session_capabilities(
+                                    agent_client_protocol::schema::v1::SessionCapabilities::new()
+                                        .list(SessionListCapabilities::new())
+                                        .resume(SessionResumeCapabilities::new()),
+                                ),
+                            ),
+                        )
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_notification(
+                    async move |_request: CancelNotification, _connection| {
+                        if let Some(tx) = cancel_handler_tx.lock().expect("cancel mutex").take() {
+                            let _ = tx.send(());
+                        }
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .on_receive_request(
+                    async move |request: SetModelRequest, responder, _connection| {
+                        if let Some(tx) =
+                            set_model_handler_tx.lock().expect("set model mutex").take()
+                        {
+                            let _ = tx.send(request);
+                        }
+                        responder.respond(Value::Object(Default::default()))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_with(agent_transport, async move |connection| {
+                    let _ = init_rx.await;
+                    let _ = start_permission_rx.await;
+                    let response = connection
+                        .send_request(RequestPermissionRequest::new(
+                            SessionId::new(session_id),
+                            ToolCallUpdate::new(
+                                "tool-1",
+                                ToolCallUpdateFields::new().title("Run command"),
+                            ),
+                            vec![PermissionOption::new(
+                                "allow-once",
+                                "Allow once",
+                                PermissionOptionKind::AllowOnce,
+                            )],
+                        ))
+                        .block_task()
+                        .await?;
+                    let _ = permission_outcome_tx.send(response.outcome);
+                    std::future::pending::<()>().await;
+                    #[allow(unreachable_code)]
+                    Ok(())
+                })
+                .await
+        });
+
+        let connection = client_ready_rx.await.expect("duplex client initialized");
+        provider.shared.connections.lock().await.insert(
+            project_id,
+            Arc::new(ProjectConnection {
+                connection,
+                negotiated: negotiated(),
+                shutdown: StdMutex::new(Some(client_shutdown_tx)),
+            }),
+        );
+        start_permission_tx.send(()).expect("start permission");
+
+        let approval = events.recv().await.expect("approval event");
+        let provider_request_id = match approval.kind {
+            ProviderEventKind::Approval {
+                provider_request_id,
+                options,
+                ..
+            } => {
+                assert_eq!(options[0].id, "allow-once");
+                provider_request_id
+            }
+            other => panic!("unexpected event: {other:?}"),
+        };
+        provider
+            .resolve_approval(ResolveApproval {
+                conversation_id,
+                provider_request_id,
+                option_id: "allow-once".to_owned(),
+            })
+            .await
+            .expect("resolve permission");
+        assert!(matches!(
+            permission_outcome_rx.await.expect("permission result"),
+            RequestPermissionOutcome::Selected(_)
+        ));
+
+        provider
+            .set_session_option(SetSessionOption {
+                conversation_id,
+                native_session_id: session_id.to_owned(),
+                option_id: "reasoning_effort".to_owned(),
+                value: "medium".to_owned(),
+            })
+            .await
+            .expect("set reasoning effort");
+        let set_model = set_model_rx.await.expect("legacy set_model request");
+        assert_eq!(set_model.model_id, "grok-4.6");
+        assert_eq!(
+            set_model.meta.get("reasoningEffort"),
+            Some(&Value::String("medium".to_owned()))
+        );
+
+        provider
+            .interrupt(InterruptSession {
+                conversation_id,
+                native_session_id: session_id.to_owned(),
+            })
+            .await
+            .expect("send cancel notification");
+        cancel_rx.await.expect("agent received cancel");
+
+        provider.shared.connections.lock().await.remove(&project_id);
+        let _ = client_task.await;
+        agent_task.abort();
+    }
+}
+
+impl Shared {
+    fn handle_session_update(&self, project_id: ProjectId, notification: RawSessionNotification) {
+        let session_id = notification.session_id.to_string();
+        let Some(binding) = self
+            .sessions
+            .read()
+            .expect("Grok session map poisoned")
+            .get(&(project_id, session_id.clone()))
+            .cloned()
+        else {
+            tracing::debug!(%session_id, "ignored update for an unbound Grok session");
+            return;
+        };
+        let Ok(update) = serde_json::from_value::<SessionUpdate>(notification.update) else {
+            // ACP enums are non-exhaustive in Rust but serde rejects a future discriminator.
+            // Keeping the outer notification raw lets this adapter safely ignore it.
+            tracing::debug!(%session_id, "ignored unknown Grok session/update variant");
+            return;
+        };
+
+        match update {
+            SessionUpdate::AgentMessageChunk(chunk) => self.emit_content(
+                project_id,
+                binding.conversation_id,
+                &binding.agent_item_id,
+                AgentMessagePhase::Final,
+                &chunk.content,
+                "Grok image",
+            ),
+            SessionUpdate::AgentThoughtChunk(chunk) => self.emit_content(
+                project_id,
+                binding.conversation_id,
+                &binding.thought_item_id,
+                AgentMessagePhase::ReasoningSummary,
+                &chunk.content,
+                "Grok reasoning image",
+            ),
+            SessionUpdate::ToolCall(tool_call) => {
+                self.record_tool_call(project_id, &session_id, binding.conversation_id, tool_call)
+            }
+            SessionUpdate::ToolCallUpdate(update) => {
+                self.update_tool_call(project_id, &session_id, binding.conversation_id, update)
+            }
+            SessionUpdate::Plan(plan) => self.emit(
+                project_id,
+                binding.conversation_id,
+                ProviderEventKind::Plan {
+                    provider_item_id: format!("plan:{session_id}"),
+                    steps: plan
+                        .entries
+                        .into_iter()
+                        .map(|entry| PlanStep {
+                            text: entry.content,
+                            status: match entry.status {
+                                PlanEntryStatus::Pending => ItemStatus::Pending,
+                                PlanEntryStatus::InProgress => ItemStatus::Running,
+                                PlanEntryStatus::Completed => ItemStatus::Completed,
+                                _ => ItemStatus::Pending,
+                            },
+                        })
+                        .collect(),
+                },
+            ),
+            SessionUpdate::UserMessageChunk(_)
+            | SessionUpdate::AvailableCommandsUpdate(_)
+            | SessionUpdate::CurrentModeUpdate(_)
+            | SessionUpdate::ConfigOptionUpdate(_)
+            | SessionUpdate::SessionInfoUpdate(_)
+            | SessionUpdate::UsageUpdate(_) => {}
+            _ => {}
+        }
+    }
+
+    fn emit_content(
+        &self,
+        project_id: ProjectId,
+        conversation_id: ConversationId,
+        provider_item_id: &str,
+        phase: AgentMessagePhase,
+        content: &ContentBlock,
+        image_alt: &str,
+    ) {
+        match content {
+            ContentBlock::Text(text) => self.emit(
+                project_id,
+                conversation_id,
+                ProviderEventKind::AgentTextDelta {
+                    provider_item_id: provider_item_id.to_owned(),
+                    phase,
+                    delta: text.text.clone(),
+                },
+            ),
+            ContentBlock::Image(image) => match BASE64.decode(&image.data) {
+                Ok(bytes) => self.emit(
+                    project_id,
+                    conversation_id,
+                    ProviderEventKind::ImageBytes {
+                        bytes,
+                        mime_type: image.mime_type.clone(),
+                        alt: image_alt.to_owned(),
+                    },
+                ),
+                Err(error) => self.emit(
+                    project_id,
+                    conversation_id,
+                    ProviderEventKind::Failed {
+                        code: "grok_invalid_image".to_owned(),
+                        message: error.to_string(),
+                    },
+                ),
+            },
+            ContentBlock::Resource(resource) => {
+                if let Ok(value) = serde_json::to_value(resource)
+                    && let (Some(blob), Some(mime_type)) = (
+                        value.pointer("/resource/blob").and_then(Value::as_str),
+                        value.pointer("/resource/mimeType").and_then(Value::as_str),
+                    )
+                    && mime_type.starts_with("image/")
+                {
+                    match BASE64.decode(blob) {
+                        Ok(bytes) => self.emit(
+                            project_id,
+                            conversation_id,
+                            ProviderEventKind::ImageBytes {
+                                bytes,
+                                mime_type: mime_type.to_owned(),
+                                alt: image_alt.to_owned(),
+                            },
+                        ),
+                        Err(error) => self.emit(
+                            project_id,
+                            conversation_id,
+                            ProviderEventKind::Failed {
+                                code: "grok_invalid_image".to_owned(),
+                                message: error.to_string(),
+                            },
+                        ),
+                    }
+                }
+            }
+            ContentBlock::Audio(_) | ContentBlock::ResourceLink(_) => {}
+            _ => {}
+        }
+    }
+
+    fn record_tool_call(
+        &self,
+        project_id: ProjectId,
+        session_id: &str,
+        conversation_id: ConversationId,
+        tool_call: ToolCall,
+    ) {
+        let tool_id = tool_call.tool_call_id.to_string();
+        self.tool_calls
+            .lock()
+            .expect("Grok tool map poisoned")
+            .insert(
+                (project_id, session_id.to_owned(), tool_id),
+                tool_call.clone(),
+            );
+        self.emit_tool_call(project_id, conversation_id, tool_call);
+    }
+
+    fn update_tool_call(
+        &self,
+        project_id: ProjectId,
+        session_id: &str,
+        conversation_id: ConversationId,
+        update: agent_client_protocol::schema::v1::ToolCallUpdate,
+    ) {
+        let tool_id = update.tool_call_id.to_string();
+        let tool_call = {
+            let mut tools = self.tool_calls.lock().expect("Grok tool map poisoned");
+            let tool = tools
+                .entry((project_id, session_id.to_owned(), tool_id.clone()))
+                .or_insert_with(|| ToolCall::new(tool_id, "Grok tool"));
+            tool.update(update.fields);
+            tool.clone()
+        };
+        self.emit_tool_call(project_id, conversation_id, tool_call);
+    }
+
+    fn emit_tool_call(
+        &self,
+        project_id: ProjectId,
+        conversation_id: ConversationId,
+        tool_call: ToolCall,
+    ) {
+        let input_summary = tool_call.raw_input.as_ref().map(json_summary);
+        let mut output_summary = tool_call.raw_output.as_ref().map(json_summary);
+        if output_summary.is_none() {
+            let text: Vec<_> = tool_call
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    ToolCallContent::Content(content) => match &content.content {
+                        ContentBlock::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            if !text.is_empty() {
+                output_summary = Some(text.join("\n"));
+            }
+        }
+        self.emit(
+            project_id,
+            conversation_id,
+            ProviderEventKind::ToolCall {
+                provider_item_id: format!("tool:{}", tool_call.tool_call_id),
+                name: tool_call.title.clone(),
+                status: tool_status(tool_call.status),
+                input_summary,
+                output_summary,
+            },
+        );
+
+        for content in &tool_call.content {
+            match content {
+                ToolCallContent::Content(content) => self.emit_content(
+                    project_id,
+                    conversation_id,
+                    &format!("tool-content:{}", tool_call.tool_call_id),
+                    AgentMessagePhase::Commentary,
+                    &content.content,
+                    &tool_call.title,
+                ),
+                ToolCallContent::Diff(diff) => self.emit(
+                    project_id,
+                    conversation_id,
+                    ProviderEventKind::FileChange {
+                        provider_item_id: format!(
+                            "tool-diff:{}:{}",
+                            tool_call.tool_call_id,
+                            diff.path.display()
+                        ),
+                        relative_path: diff.path.display().to_string(),
+                        change_kind: if diff.old_text.is_some() {
+                            "modified".to_owned()
+                        } else {
+                            "created".to_owned()
+                        },
+                        status: tool_status(tool_call.status),
+                    },
+                ),
+                ToolCallContent::Terminal(_) => {}
+                _ => {}
+            }
+        }
+    }
+}
