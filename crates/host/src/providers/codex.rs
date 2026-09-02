@@ -12,6 +12,7 @@ use std::{
         Arc, Mutex, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use agent_remote_protocol::{
@@ -40,6 +41,7 @@ use crate::storage::Project;
 const CLIENT_NAME: &str = "agent_remote_messenger";
 const CLIENT_TITLE: &str = "Agent Remote Messenger";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const APP_SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 type DynWriter = Box<dyn AsyncWrite + Send + Unpin>;
 
@@ -602,6 +604,7 @@ impl Shared {
         if let Some(wire) = slot.as_ref()
             && !wire.closed.load(Ordering::Acquire)
         {
+            wire.begin_activity();
             return Ok(Arc::clone(wire));
         }
 
@@ -724,6 +727,56 @@ impl Shared {
                     message: message.clone(),
                 },
             );
+        }
+    }
+
+    async fn retire_idle_connection(self: &Arc<Self>, wire: &Arc<RpcWire>, idle_epoch: u64) {
+        let mut slot = self.connection.lock().await;
+        if !slot
+            .as_ref()
+            .is_some_and(|current| current.generation == wire.generation)
+            || wire.closed.load(Ordering::Acquire)
+            || wire.idle_epoch.load(Ordering::Acquire) != idle_epoch
+            || !wire
+                .pending
+                .lock()
+                .expect("Codex RPC pending state poisoned")
+                .is_empty()
+            || !self
+                .active_turns
+                .lock()
+                .expect("Codex active turn state poisoned")
+                .is_empty()
+            || !self
+                .pending_approvals
+                .lock()
+                .expect("Codex approval state poisoned")
+                .is_empty()
+        {
+            return;
+        }
+        if wire
+            .closed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        *slot = None;
+        for context in self
+            .sessions
+            .write()
+            .expect("Codex session state poisoned")
+            .values_mut()
+        {
+            if context.loaded_generation == wire.generation {
+                context.loaded_generation = 0;
+            }
+        }
+        drop(slot);
+        if let Err(error) = wire.close_writer().await {
+            tracing::warn!(%error, "failed to stop idle Codex app-server");
         }
     }
 
@@ -1396,6 +1449,8 @@ struct RpcWire {
     pending: Mutex<HashMap<RpcId, oneshot::Sender<std::result::Result<Value, RpcFailure>>>>,
     next_id: AtomicU64,
     closed: AtomicBool,
+    idle_epoch: AtomicU64,
+    shared: Weak<Shared>,
     generation: u64,
 }
 
@@ -1410,6 +1465,8 @@ impl RpcWire {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
+            idle_epoch: AtomicU64::new(0),
+            shared: shared.clone(),
             generation,
         });
         let reader_wire = Arc::downgrade(&wire);
@@ -1455,7 +1512,11 @@ impl RpcWire {
                                 .handle_server_request(Arc::clone(&wire), id, method, params)
                                 .await;
                         } else {
+                            let turn_completed = method == "turn/completed";
                             shared.handle_notification(&method, params);
+                            if turn_completed {
+                                wire.schedule_idle_shutdown();
+                            }
                         }
                     }
                     Ok(None) => break,
@@ -1471,37 +1532,69 @@ impl RpcWire {
         wire
     }
 
-    async fn request<P, R>(&self, method: &'static str, params: &P) -> Result<R>
+    async fn request<P, R>(self: &Arc<Self>, method: &'static str, params: &P) -> Result<R>
     where
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        if self.closed.load(Ordering::Acquire) {
-            bail!("Codex app-server connection is closed");
-        }
-        let id = RpcId::Number(self.next_id.fetch_add(1, Ordering::Relaxed) as i64);
-        let (sender, receiver) = oneshot::channel();
-        self.pending
-            .lock()
-            .expect("Codex RPC pending state poisoned")
-            .insert(id.clone(), sender);
-        let request = OutgoingRequest {
-            method,
-            id: &id,
-            params,
-        };
-        if let Err(error) = self.write_json(&request).await {
+        self.begin_activity();
+        let result = async {
+            if self.closed.load(Ordering::Acquire) {
+                bail!("Codex app-server connection is closed");
+            }
+            let id = RpcId::Number(self.next_id.fetch_add(1, Ordering::Relaxed) as i64);
+            let (sender, receiver) = oneshot::channel();
             self.pending
                 .lock()
                 .expect("Codex RPC pending state poisoned")
-                .remove(&id);
-            return Err(error);
+                .insert(id.clone(), sender);
+            let request = OutgoingRequest {
+                method,
+                id: &id,
+                params,
+            };
+            if let Err(error) = self.write_json(&request).await {
+                self.pending
+                    .lock()
+                    .expect("Codex RPC pending state poisoned")
+                    .remove(&id);
+                return Err(error);
+            }
+            let value = receiver
+                .await
+                .context("Codex app-server response channel closed")?
+                .map_err(|error| anyhow!(error.to_string()))?;
+            serde_json::from_value(value)
+                .with_context(|| format!("decode Codex response for {method}"))
         }
-        let value = receiver
+        .await;
+        self.schedule_idle_shutdown();
+        result
+    }
+
+    fn begin_activity(&self) {
+        self.idle_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn schedule_idle_shutdown(self: &Arc<Self>) {
+        let idle_epoch = self.idle_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let wire = Arc::downgrade(self);
+        let shared = self.shared.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(APP_SERVER_IDLE_TIMEOUT).await;
+            if let (Some(shared), Some(wire)) = (shared.upgrade(), wire.upgrade()) {
+                shared.retire_idle_connection(&wire, idle_epoch).await;
+            }
+        });
+    }
+
+    async fn close_writer(&self) -> Result<()> {
+        self.writer
+            .lock()
             .await
-            .context("Codex app-server response channel closed")?
-            .map_err(|error| anyhow!(error.to_string()))?;
-        serde_json::from_value(value).with_context(|| format!("decode Codex response for {method}"))
+            .shutdown()
+            .await
+            .context("close Codex app-server stdin")
     }
 
     async fn notify_initialized(&self) -> Result<()> {
@@ -2375,7 +2468,7 @@ fn approval_prompt(reason: Option<&str>, command: Option<&str>, cwd: Option<&str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncWriteExt, DuplexStream, duplex, split};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex, split};
 
     fn test_provider() -> CodexProvider {
         CodexProvider::with_executable("unused-in-duplex-tests")
@@ -2466,6 +2559,52 @@ mod tests {
             .await
             .expect("initialized notification");
         mock.await.expect("mock server");
+    }
+
+    #[tokio::test]
+    async fn idle_connection_closes_writer_and_marks_sessions_for_resume() {
+        let provider = test_provider();
+        let project = test_project();
+        provider.shared.register_session(
+            "thread-idle".to_owned(),
+            SessionContext {
+                project_id: project.id,
+                conversation_id: ConversationId::new(),
+                project_path: project.canonical_path,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                loaded_generation: 1,
+            },
+        );
+        let server = install_duplex(&provider).await;
+        let wire = provider
+            .shared
+            .connection
+            .lock()
+            .await
+            .as_ref()
+            .cloned()
+            .expect("installed connection");
+
+        provider
+            .shared
+            .retire_idle_connection(&wire, wire.idle_epoch.load(Ordering::Acquire))
+            .await;
+
+        assert!(wire.closed.load(Ordering::Acquire));
+        assert!(provider.shared.connection.lock().await.is_none());
+        assert_eq!(
+            provider
+                .shared
+                .session("thread-idle")
+                .expect("registered session")
+                .loaded_generation,
+            0
+        );
+        let (mut server_reader, _) = split(server);
+        let mut byte = [0_u8; 1];
+        assert_eq!(server_reader.read(&mut byte).await.expect("read EOF"), 0);
     }
 
     #[tokio::test]

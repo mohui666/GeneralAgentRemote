@@ -4,7 +4,6 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -14,22 +13,28 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
@@ -40,10 +45,28 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.AddComment
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.TouchApp
 import androidx.compose.material.icons.outlined.WarningAmber
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.ArrowUpward
+import androidx.compose.material.icons.rounded.ChatBubbleOutline
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.ChevronRight
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Computer
+import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.ContentPaste
+import androidx.compose.material.icons.rounded.Folder
+import androidx.compose.material.icons.rounded.History
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
+import androidx.compose.material.icons.rounded.Menu
+import androidx.compose.material.icons.rounded.MoreHoriz
+import androidx.compose.material.icons.rounded.PowerSettingsNew
+import androidx.compose.material.icons.rounded.QrCodeScanner
+import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -77,15 +100,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -392,6 +408,7 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
     ) {
         Scaffold(
             containerColor = RemoteBlack,
+            contentWindowInsets = WindowInsets(0, 0, 0, 0),
             topBar = {
                 RemoteTopBar(
                     hostName = snapshot.hostName,
@@ -568,12 +585,7 @@ private fun RemoteTopBar(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 IconButton(onClick = onNewConversation, modifier = Modifier.size(50.dp)) {
-                    Icon(
-                        imageVector = Icons.Rounded.AddComment,
-                        contentDescription = "新建会话",
-                        modifier = Modifier.size(24.dp),
-                        tint = RemoteText,
-                    )
+                    RemoteIcon(RemoteGlyph.Compose, "新建会话", Modifier.size(24.dp), RemoteText)
                 }
                 Box {
                     IconButton(onClick = onToggleMenu, modifier = Modifier.size(50.dp)) {
@@ -831,7 +843,10 @@ private fun ConversationListItem(conversation: Conversation, onClick: () -> Unit
 @Composable
 private fun HomeBottomBar(search: String, onSearch: (String) -> Unit, onNewConversation: () -> Unit) {
     Row(
-        Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 18.dp, vertical = 12.dp),
+        Modifier
+            .fillMaxWidth()
+            .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
+            .padding(start = 18.dp, top = 12.dp, end = 18.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
@@ -978,6 +993,7 @@ private fun ProviderStatus(capability: ProviderCapability) {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ConversationScreen(
     state: RemoteUiState,
@@ -993,7 +1009,11 @@ private fun ConversationScreen(
     LaunchedEffect(timeline.size, timeline.lastOrNull()?.revision) {
         if (timeline.isNotEmpty()) listState.animateScrollToItem(timeline.lastIndex)
     }
-    Column(Modifier.fillMaxSize().navigationBarsPadding().imePadding()) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
+    ) {
         ConversationHeader(conversation)
         if (timeline.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -1102,7 +1122,10 @@ private fun Composer(
     val inputEnabled = online && (!running || supportsSteer)
     var settingsOpen by rememberSaveable { mutableStateOf(false) }
     Column(
-        Modifier.fillMaxWidth().background(RemoteBlack).padding(horizontal = 14.dp, vertical = 12.dp),
+        Modifier
+            .fillMaxWidth()
+            .background(RemoteBlack)
+            .padding(start = 14.dp, top = 12.dp, end = 14.dp),
     ) {
         Row(
             horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -1282,7 +1305,11 @@ private fun SessionSettingsSheet(
             }
         } else {
             Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 20.dp)) {
-                TextButton(onClick = { activeOptionId = null }) { Text("‹  会话设置") }
+                TextButton(onClick = { activeOptionId = null }) {
+                    RemoteIcon(RemoteGlyph.Back, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("会话设置")
+                }
                 Text(
                     if (activeOption.id == "permission_mode") "应如何批准 ChatGPT 操作？" else sessionOptionLabel(activeOption),
                     style = MaterialTheme.typography.titleLarge,
@@ -1360,7 +1387,7 @@ private fun SessionSettingRow(option: SessionOption, enabled: Boolean, onClick: 
         Text(sessionOptionLabel(option), modifier = Modifier.weight(1f), fontWeight = FontWeight.Medium)
         Text(sessionOptionValueLabel(option), color = RemoteMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Spacer(Modifier.width(10.dp))
-        Text("›", color = RemoteMuted, style = MaterialTheme.typography.titleLarge)
+        RemoteIcon(RemoteGlyph.ChevronRight, null, Modifier.size(20.dp), RemoteMuted)
     }
 }
 
@@ -1769,25 +1796,26 @@ private fun <T> Picker(
     }
 }
 
-private enum class RemoteGlyph {
-    Menu,
-    Back,
-    More,
-    Computer,
-    Folder,
-    Compose,
-    Disconnect,
-    Recent,
-    Chat,
-    Check,
-    ChevronDown,
-    Search,
-    Close,
-    Send,
-    Stop,
-    Copy,
-    Scan,
-    Paste,
+private enum class RemoteGlyph(val imageVector: ImageVector) {
+    Menu(Icons.Rounded.Menu),
+    Back(Icons.AutoMirrored.Rounded.ArrowBack),
+    More(Icons.Rounded.MoreHoriz),
+    Computer(Icons.Rounded.Computer),
+    Folder(Icons.Rounded.Folder),
+    Compose(Icons.Rounded.Add),
+    Disconnect(Icons.Rounded.PowerSettingsNew),
+    Recent(Icons.Rounded.History),
+    Chat(Icons.Rounded.ChatBubbleOutline),
+    Check(Icons.Rounded.Check),
+    ChevronDown(Icons.Rounded.KeyboardArrowDown),
+    ChevronRight(Icons.Rounded.ChevronRight),
+    Search(Icons.Rounded.Search),
+    Close(Icons.Rounded.Close),
+    Send(Icons.Rounded.ArrowUpward),
+    Stop(Icons.Rounded.Stop),
+    Copy(Icons.Rounded.ContentCopy),
+    Scan(Icons.Rounded.QrCodeScanner),
+    Paste(Icons.Rounded.ContentPaste),
 }
 
 @Composable
@@ -1828,181 +1856,12 @@ private fun RemoteIcon(
     modifier: Modifier = Modifier,
     tint: Color = RemoteText,
 ) {
-    val iconModifier = if (description == null) modifier else modifier.semantics { contentDescription = description }
-    Canvas(iconModifier) {
-        val w = size.width
-        val h = size.height
-        val unit = minOf(w, h)
-        val strokeWidth = unit * 0.085f
-        val lineStyle = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
-        fun point(x: Float, y: Float) = Offset(w * x, h * y)
-        fun line(x1: Float, y1: Float, x2: Float, y2: Float) {
-            drawLine(tint, point(x1, y1), point(x2, y2), strokeWidth, StrokeCap.Round)
-        }
-
-        when (glyph) {
-            RemoteGlyph.Menu -> {
-                line(0.2f, 0.35f, 0.8f, 0.35f)
-                line(0.2f, 0.65f, 0.68f, 0.65f)
-            }
-            RemoteGlyph.Back -> {
-                line(0.55f, 0.22f, 0.28f, 0.5f)
-                line(0.28f, 0.5f, 0.55f, 0.78f)
-                line(0.3f, 0.5f, 0.8f, 0.5f)
-            }
-            RemoteGlyph.More -> {
-                drawCircle(tint, unit * 0.065f, point(0.22f, 0.5f))
-                drawCircle(tint, unit * 0.065f, point(0.5f, 0.5f))
-                drawCircle(tint, unit * 0.065f, point(0.78f, 0.5f))
-            }
-            RemoteGlyph.Computer -> {
-                drawRoundRect(
-                    tint,
-                    topLeft = point(0.12f, 0.2f),
-                    size = Size(w * 0.76f, h * 0.54f),
-                    cornerRadius = CornerRadius(unit * 0.08f),
-                    style = lineStyle,
-                )
-                line(0.5f, 0.74f, 0.5f, 0.84f)
-                line(0.32f, 0.84f, 0.68f, 0.84f)
-            }
-            RemoteGlyph.Folder -> {
-                val path = Path().apply {
-                    moveTo(w * 0.12f, h * 0.34f)
-                    lineTo(w * 0.12f, h * 0.78f)
-                    quadraticTo(w * 0.12f, h * 0.86f, w * 0.21f, h * 0.86f)
-                    lineTo(w * 0.79f, h * 0.86f)
-                    quadraticTo(w * 0.88f, h * 0.86f, w * 0.88f, h * 0.77f)
-                    lineTo(w * 0.88f, h * 0.36f)
-                    quadraticTo(w * 0.88f, h * 0.29f, w * 0.79f, h * 0.29f)
-                    lineTo(w * 0.49f, h * 0.29f)
-                    lineTo(w * 0.39f, h * 0.18f)
-                    lineTo(w * 0.21f, h * 0.18f)
-                    quadraticTo(w * 0.12f, h * 0.18f, w * 0.12f, h * 0.27f)
-                    close()
-                }
-                drawPath(path, tint, style = lineStyle)
-            }
-            RemoteGlyph.Compose -> {
-                drawRoundRect(
-                    tint,
-                    topLeft = point(0.16f, 0.24f),
-                    size = Size(w * 0.58f, h * 0.6f),
-                    cornerRadius = CornerRadius(unit * 0.09f),
-                    style = lineStyle,
-                )
-                line(0.38f, 0.66f, 0.79f, 0.25f)
-                line(0.71f, 0.22f, 0.82f, 0.33f)
-                line(0.35f, 0.7f, 0.46f, 0.67f)
-            }
-            RemoteGlyph.Disconnect -> {
-                line(0.5f, 0.14f, 0.5f, 0.5f)
-                drawArc(
-                    color = tint,
-                    startAngle = -42f,
-                    sweepAngle = 264f,
-                    useCenter = false,
-                    topLeft = point(0.17f, 0.2f),
-                    size = Size(w * 0.66f, h * 0.66f),
-                    style = lineStyle,
-                )
-            }
-            RemoteGlyph.Recent -> {
-                drawCircle(tint, unit * 0.34f, point(0.5f, 0.52f), style = lineStyle)
-                line(0.5f, 0.52f, 0.5f, 0.31f)
-                line(0.5f, 0.52f, 0.66f, 0.62f)
-                line(0.17f, 0.22f, 0.17f, 0.42f)
-                line(0.17f, 0.22f, 0.36f, 0.22f)
-            }
-            RemoteGlyph.Chat -> {
-                drawRoundRect(
-                    tint,
-                    topLeft = point(0.13f, 0.18f),
-                    size = Size(w * 0.74f, h * 0.56f),
-                    cornerRadius = CornerRadius(unit * 0.16f),
-                    style = lineStyle,
-                )
-                val tail = Path().apply {
-                    moveTo(w * 0.3f, h * 0.72f)
-                    lineTo(w * 0.22f, h * 0.86f)
-                    lineTo(w * 0.45f, h * 0.74f)
-                }
-                drawPath(tail, tint, style = lineStyle)
-            }
-            RemoteGlyph.Check -> {
-                line(0.18f, 0.52f, 0.41f, 0.75f)
-                line(0.41f, 0.75f, 0.82f, 0.27f)
-            }
-            RemoteGlyph.ChevronDown -> {
-                line(0.22f, 0.38f, 0.5f, 0.65f)
-                line(0.5f, 0.65f, 0.78f, 0.38f)
-            }
-            RemoteGlyph.Search -> {
-                drawCircle(tint, unit * 0.25f, point(0.43f, 0.43f), style = lineStyle)
-                line(0.61f, 0.61f, 0.84f, 0.84f)
-            }
-            RemoteGlyph.Close -> {
-                line(0.22f, 0.22f, 0.78f, 0.78f)
-                line(0.78f, 0.22f, 0.22f, 0.78f)
-            }
-            RemoteGlyph.Send -> {
-                line(0.5f, 0.78f, 0.5f, 0.22f)
-                line(0.5f, 0.22f, 0.25f, 0.46f)
-                line(0.5f, 0.22f, 0.75f, 0.46f)
-            }
-            RemoteGlyph.Stop -> {
-                drawRoundRect(
-                    tint,
-                    topLeft = point(0.28f, 0.28f),
-                    size = Size(w * 0.44f, h * 0.44f),
-                    cornerRadius = CornerRadius(unit * 0.07f),
-                )
-            }
-            RemoteGlyph.Copy -> {
-                drawRoundRect(
-                    tint,
-                    topLeft = point(0.29f, 0.17f),
-                    size = Size(w * 0.55f, h * 0.58f),
-                    cornerRadius = CornerRadius(unit * 0.1f),
-                    style = lineStyle,
-                )
-                drawRoundRect(
-                    tint,
-                    topLeft = point(0.16f, 0.3f),
-                    size = Size(w * 0.55f, h * 0.58f),
-                    cornerRadius = CornerRadius(unit * 0.1f),
-                    style = lineStyle,
-                )
-            }
-            RemoteGlyph.Scan -> {
-                line(0.14f, 0.38f, 0.14f, 0.16f)
-                line(0.14f, 0.16f, 0.36f, 0.16f)
-                line(0.64f, 0.16f, 0.86f, 0.16f)
-                line(0.86f, 0.16f, 0.86f, 0.38f)
-                line(0.14f, 0.62f, 0.14f, 0.84f)
-                line(0.14f, 0.84f, 0.36f, 0.84f)
-                line(0.64f, 0.84f, 0.86f, 0.84f)
-                line(0.86f, 0.84f, 0.86f, 0.62f)
-                line(0.28f, 0.5f, 0.72f, 0.5f)
-            }
-            RemoteGlyph.Paste -> {
-                drawRoundRect(
-                    tint,
-                    topLeft = point(0.2f, 0.22f),
-                    size = Size(w * 0.6f, h * 0.66f),
-                    cornerRadius = CornerRadius(unit * 0.1f),
-                    style = lineStyle,
-                )
-                drawRoundRect(
-                    tint,
-                    topLeft = point(0.34f, 0.12f),
-                    size = Size(w * 0.32f, h * 0.2f),
-                    cornerRadius = CornerRadius(unit * 0.08f),
-                    style = lineStyle,
-                )
-            }
-        }
-    }
+    Icon(
+        imageVector = glyph.imageVector,
+        contentDescription = description,
+        modifier = modifier,
+        tint = tint,
+    )
 }
 
 private fun providerStateLabel(state: String): String = when (state) {
