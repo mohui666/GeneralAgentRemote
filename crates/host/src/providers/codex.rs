@@ -16,9 +16,9 @@ use std::{
 };
 
 use agent_remote_protocol::{
-    AgentMessagePhase, ApprovalOption, ConversationId, ItemStatus, ModelOption, PlanStep,
-    ProjectId, ProviderHealth, ProviderId, ProviderState, SessionOption, SessionOptionValue,
-    SessionSummary,
+    AgentMessagePhase, ApprovalOption, AttachmentCapability, ConversationId, ItemStatus,
+    ModelOption, PermissionModeOption, PermissionRisk, PlanStep, ProjectId, ProviderHealth,
+    ProviderId, ProviderState, SessionOption, SessionOptionValue, SessionSummary, TimelineItemKind,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -33,7 +33,8 @@ use tokio::{
 
 use super::{
     AgentProvider, CommandAck, CreateSession, InterruptSession, NativeSession,
-    ProviderCapabilities, ProviderEvent, ProviderEventKind, ResolveApproval, ResumeSession,
+    ProviderCapabilities, ProviderEvent, ProviderEventKind, ProviderHistoryItem,
+    ProviderHistoryPage, ReadSessionHistory, RenameSession, ResolveApproval, ResumeSession,
     SendMessage, SetSessionOption, SteerMessage,
 };
 use crate::storage::Project;
@@ -159,6 +160,9 @@ impl AgentProvider for CodexProvider {
         ProviderCapabilities {
             supports_session_list: true,
             supports_resume: true,
+            supports_history: true,
+            supports_incremental_sync: false,
+            supports_rename: true,
             supports_steer: true,
         }
     }
@@ -322,6 +326,82 @@ impl AgentProvider for CodexProvider {
         Ok(sessions)
     }
 
+    fn permission_modes(&self) -> Vec<PermissionModeOption> {
+        vec![
+            PermissionModeOption {
+                id: "request_approval".to_owned(),
+                display_name: "Ask before elevated actions".to_owned(),
+                description: "Work in the project and request approval before broader access."
+                    .to_owned(),
+                risk: PermissionRisk::Standard,
+            },
+            PermissionModeOption {
+                id: "auto_review".to_owned(),
+                display_name: "Automatic review".to_owned(),
+                description: "Let Codex review elevated actions before they run.".to_owned(),
+                risk: PermissionRisk::Standard,
+            },
+            PermissionModeOption {
+                id: "full_access".to_owned(),
+                display_name: "Full access".to_owned(),
+                description: "Allow unrestricted filesystem and network access.".to_owned(),
+                risk: PermissionRisk::Elevated,
+            },
+        ]
+    }
+
+    fn default_permission_mode(&self) -> Option<String> {
+        Some("request_approval".to_owned())
+    }
+
+    fn attachment_capability(&self) -> AttachmentCapability {
+        AttachmentCapability {
+            allowed_mime_types: ["image/png", "image/jpeg", "image/webp", "image/gif"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            max_count: 4,
+            max_bytes: 10 * 1024 * 1024,
+            max_total_bytes: 10 * 1024 * 1024,
+        }
+    }
+
+    async fn read_session_history(
+        &self,
+        request: ReadSessionHistory,
+    ) -> Result<ProviderHistoryPage> {
+        let wire = self.connection().await?;
+        let response: ThreadReadResponse = wire
+            .request(
+                "thread/read",
+                &ThreadReadParams {
+                    thread_id: &request.native_session_id,
+                    include_turns: true,
+                },
+            )
+            .await?;
+        validate_thread_project(&response.thread, &request.project.canonical_path)?;
+        Ok(ProviderHistoryPage {
+            items: history_items(&response.thread),
+            next_cursor: None,
+            full_read_fallback: true,
+        })
+    }
+
+    async fn rename_session(&self, request: RenameSession) -> Result<CommandAck> {
+        let wire = self.connection().await?;
+        let _: EmptyResponse = wire
+            .request(
+                "thread/name/set",
+                &ThreadSetNameParams {
+                    thread_id: &request.native_session_id,
+                    name: &request.title,
+                },
+            )
+            .await?;
+        Ok(CommandAck)
+    }
+
     async fn create_session(&self, request: CreateSession) -> Result<NativeSession> {
         let wire = self.connection().await?;
         let response: ThreadOpenResponse = wire
@@ -422,6 +502,16 @@ impl AgentProvider for CodexProvider {
     }
 
     async fn send_message(&self, request: SendMessage) -> Result<CommandAck> {
+        if self.shared.session(&request.native_session_id).is_none() {
+            self.resume_session(ResumeSession {
+                conversation_id: request.conversation_id,
+                project: request.project.clone(),
+                native_session_id: request.native_session_id.clone(),
+                model: request.model.clone(),
+                effort: request.effort.clone(),
+            })
+            .await?;
+        }
         let (wire, context) = self
             .ensure_loaded_session(request.conversation_id, &request.native_session_id)
             .await?;
@@ -434,16 +524,23 @@ impl AgentProvider for CodexProvider {
         let approval_policy = permission.as_ref().map(|config| config.0);
         let approvals_reviewer = permission.as_ref().map_or("user", |config| config.1);
         let sandbox_policy = permission.map(|config| config.2);
+        let mut input = vec![UserInput::Text { text: request.text }];
+        input.extend(
+            request
+                .attachments
+                .into_iter()
+                .map(|attachment| UserInput::LocalImage {
+                    path: path_string(&attachment.path),
+                    detail: None,
+                }),
+        );
         let response: TurnStartResponse = wire
             .request(
                 "turn/start",
                 &TurnStartParams {
                     thread_id: &request.native_session_id,
-                    client_user_message_id: Some(ConversationId::new().to_string()),
-                    input: vec![TextInput {
-                        kind: "text",
-                        text: request.text,
-                    }],
+                    client_user_message_id: request.client_message_id,
+                    input,
                     cwd: path_string(&context.project_path),
                     approvals_reviewer,
                     model: request.model.as_deref().or(context.model.as_deref()),
@@ -479,10 +576,7 @@ impl AgentProvider for CodexProvider {
                 &TurnSteerParams {
                     thread_id: &request.native_session_id,
                     client_user_message_id: Some(ConversationId::new().to_string()),
-                    input: vec![TextInput {
-                        kind: "text",
-                        text: request.text,
-                    }],
+                    input: vec![UserInput::Text { text: request.text }],
                     expected_turn_id: &active_turn,
                 },
             )
@@ -1321,6 +1415,7 @@ impl Shared {
                         self.emit(
                             thread_id,
                             ProviderEventKind::ImagePath {
+                                provider_item_id: Some(item.id),
                                 path: PathBuf::from(item.path),
                                 controlled_temp_roots: Vec::new(),
                                 alt: "Image viewed by Codex".to_owned(),
@@ -1345,6 +1440,7 @@ impl Shared {
                             Ok(bytes) => self.emit(
                                 thread_id,
                                 ProviderEventKind::ImageBytes {
+                                    provider_item_id: Some(item.id),
                                     bytes,
                                     mime_type: "image/png".to_owned(),
                                     alt: item
@@ -1910,7 +2006,21 @@ struct CodexThread {
     #[serde(default)]
     updated_at: i64,
     #[serde(default)]
+    created_at: i64,
+    #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    turns: Vec<HistoryTurn>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryTurn {
+    id: String,
+    #[serde(default)]
+    started_at: Option<i64>,
+    #[serde(default)]
+    items: Vec<Value>,
 }
 
 #[derive(Serialize)]
@@ -1923,6 +2033,13 @@ struct ThreadReadParams<'a> {
 #[derive(Deserialize)]
 struct ThreadReadResponse {
     thread: CodexThread,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadSetNameParams<'a> {
+    thread_id: &'a str,
+    name: &'a str,
 }
 
 #[derive(Serialize)]
@@ -1961,7 +2078,7 @@ struct ThreadOpenResponse {
 struct TurnStartParams<'a> {
     thread_id: &'a str,
     client_user_message_id: Option<String>,
-    input: Vec<TextInput>,
+    input: Vec<UserInput>,
     cwd: String,
     approvals_reviewer: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1975,10 +2092,16 @@ struct TurnStartParams<'a> {
 }
 
 #[derive(Serialize)]
-struct TextInput {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    text: String,
+#[serde(tag = "type")]
+enum UserInput {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "localImage")]
+    LocalImage {
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<&'static str>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -1991,7 +2114,7 @@ struct TurnStartResponse {
 struct TurnSteerParams<'a> {
     thread_id: &'a str,
     client_user_message_id: Option<String>,
-    input: Vec<TextInput>,
+    input: Vec<UserInput>,
     expected_turn_id: &'a str,
 }
 
@@ -2297,6 +2420,185 @@ fn validate_thread_project(thread: &CodexThread, project: &Path) -> Result<()> {
     Ok(())
 }
 
+fn history_items(thread: &CodexThread) -> Vec<ProviderHistoryItem> {
+    let mut history = Vec::new();
+    for turn in &thread.turns {
+        let turn_timestamp = turn
+            .started_at
+            .unwrap_or(thread.created_at)
+            .saturating_mul(1_000);
+        for (index, value) in turn.items.iter().enumerate() {
+            let timestamp = turn_timestamp.saturating_add(index as i64);
+            let fallback_id = format!("{}:{index}", turn.id);
+            let item_id = value
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or(&fallback_id)
+                .to_owned();
+            match value.get("type").and_then(Value::as_str) {
+                Some("userMessage") => {
+                    let text = value
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|content| {
+                            content.get("type").and_then(Value::as_str) == Some("text")
+                        })
+                        .filter_map(|content| content.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.trim().is_empty() {
+                        history.push(ProviderHistoryItem {
+                            provider_item_id: item_id,
+                            created_at_ms: timestamp,
+                            kind: TimelineItemKind::UserMessage { text },
+                        });
+                    }
+                }
+                Some("agentMessage") => {
+                    if let Ok(item) = serde_json::from_value::<AgentMessageItem>(value.clone())
+                        && !item.text.is_empty()
+                    {
+                        history.push(ProviderHistoryItem {
+                            provider_item_id: item.id,
+                            created_at_ms: timestamp,
+                            kind: TimelineItemKind::AgentMessage {
+                                phase: map_phase(item.phase.as_deref()),
+                                text: item.text,
+                            },
+                        });
+                    }
+                }
+                Some("reasoning") => {
+                    if let Ok(item) = serde_json::from_value::<ReasoningItem>(value.clone()) {
+                        for (summary_index, summary) in item.summary.into_iter().enumerate() {
+                            if !summary.is_empty() {
+                                history.push(ProviderHistoryItem {
+                                    provider_item_id: format!(
+                                        "reasoning:{}:{summary_index}",
+                                        item.id
+                                    ),
+                                    created_at_ms: timestamp.saturating_add(summary_index as i64),
+                                    kind: TimelineItemKind::AgentMessage {
+                                        phase: AgentMessagePhase::ReasoningSummary,
+                                        text: summary,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+                Some("commandExecution") => {
+                    if let Ok(item) = serde_json::from_value::<CommandItem>(value.clone()) {
+                        history.push(ProviderHistoryItem {
+                            provider_item_id: item.id,
+                            created_at_ms: timestamp,
+                            kind: TimelineItemKind::Command {
+                                command: item.command,
+                                relative_cwd: history_relative_path(thread, &item.cwd),
+                                status: map_status(
+                                    item.status.as_deref().unwrap_or("completed"),
+                                    ItemStatus::Completed,
+                                ),
+                                exit_code: item.exit_code,
+                                output: item.aggregated_output.map(truncate_history_output),
+                            },
+                        });
+                    }
+                }
+                Some("fileChange") => {
+                    if let Ok(item) = serde_json::from_value::<FileChangeItem>(value.clone()) {
+                        for (change_index, change) in item.changes.into_iter().enumerate() {
+                            if let Some(relative_path) = history_relative_path(thread, &change.path)
+                            {
+                                history.push(ProviderHistoryItem {
+                                    provider_item_id: format!("{}:{change_index}", item.id),
+                                    created_at_ms: timestamp.saturating_add(change_index as i64),
+                                    kind: TimelineItemKind::FileChange {
+                                        relative_path,
+                                        change_kind: file_change_kind(&change.kind),
+                                        status: map_status(&item.status, ItemStatus::Completed),
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+                Some("mcpToolCall" | "dynamicToolCall" | "collabAgentToolCall") => {
+                    if let Ok(item) = serde_json::from_value::<GenericToolItem>(value.clone()) {
+                        let name = match (item.server, item.tool) {
+                            (Some(server), Some(tool)) => format!("{server}/{tool}"),
+                            (_, Some(tool)) => tool,
+                            _ => "Codex tool".to_owned(),
+                        };
+                        history.push(ProviderHistoryItem {
+                            provider_item_id: item.id,
+                            created_at_ms: timestamp,
+                            kind: TimelineItemKind::ToolCall {
+                                name,
+                                status: map_status(
+                                    item.status.as_deref().unwrap_or("completed"),
+                                    ItemStatus::Completed,
+                                ),
+                                input_summary: item.arguments.as_ref().map(compact_json),
+                                output_summary: item
+                                    .error
+                                    .as_ref()
+                                    .or(item.result.as_ref())
+                                    .map(compact_json),
+                            },
+                        });
+                    }
+                }
+                Some("plan") => {
+                    if let Some(text) = value.get("text").and_then(Value::as_str)
+                        && !text.trim().is_empty()
+                    {
+                        history.push(ProviderHistoryItem {
+                            provider_item_id: item_id,
+                            created_at_ms: timestamp,
+                            kind: TimelineItemKind::Plan {
+                                steps: vec![PlanStep {
+                                    text: text.to_owned(),
+                                    status: ItemStatus::Completed,
+                                }],
+                            },
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    history
+}
+
+fn history_relative_path(thread: &CodexThread, raw: &str) -> Option<String> {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        path.strip_prefix(Path::new(&thread.cwd))
+            .ok()
+            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+    } else if path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        None
+    } else {
+        Some(path.to_string_lossy().replace('\\', "/"))
+    }
+}
+
+fn truncate_history_output(mut output: String) -> String {
+    const LIMIT: usize = 64 * 1024;
+    if output.len() > LIMIT {
+        output.truncate(LIMIT);
+        output.push_str("\n[output truncated at 64 KiB]");
+    }
+    output
+}
+
 fn permission_mode_from_response(
     sandbox: &Value,
     approvals_reviewer: &str,
@@ -2435,13 +2737,49 @@ fn file_change_kind(kind: &Value) -> String {
 }
 
 fn compact_json(value: &Value) -> String {
-    const LIMIT: usize = 8 * 1024;
+    const LIMIT: usize = 2 * 1024;
     let mut result = match value {
         Value::String(value) => value.clone(),
-        _ => serde_json::to_string(value).unwrap_or_else(|_| "<unavailable>".to_owned()),
+        Value::Number(value) => value.to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Null => "无内容".to_owned(),
+        Value::Array(values) => {
+            let scalar_values = values
+                .iter()
+                .take(6)
+                .filter_map(|value| match value {
+                    Value::String(value) => Some(value.clone()),
+                    Value::Number(value) => Some(value.to_string()),
+                    Value::Bool(value) => Some(value.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if scalar_values.len() == values.len().min(6) {
+                let suffix = if values.len() > 6 { " · …" } else { "" };
+                format!("{}{suffix}", scalar_values.join(" · "))
+            } else {
+                format!("{} 项结果", values.len())
+            }
+        }
+        Value::Object(values) => values
+            .iter()
+            .take(8)
+            .map(|(key, value)| {
+                let summary = match value {
+                    Value::String(value) => value.clone(),
+                    Value::Number(value) => value.to_string(),
+                    Value::Bool(value) => value.to_string(),
+                    Value::Null => "无".to_owned(),
+                    Value::Array(values) => format!("{} 项", values.len()),
+                    Value::Object(values) => format!("{} 个字段", values.len()),
+                };
+                format!("{key}: {summary}")
+            })
+            .collect::<Vec<_>>()
+            .join(" · "),
     };
-    if result.len() > LIMIT {
-        result.truncate(LIMIT);
+    if let Some((end, _)) = result.char_indices().nth(LIMIT) {
+        result.truncate(end);
         result.push('…');
     }
     result
@@ -2481,6 +2819,16 @@ mod tests {
             canonical_path: std::env::current_dir().expect("current directory"),
             enabled_providers: vec![ProviderId::Codex],
         }
+    }
+
+    #[test]
+    fn tool_values_are_summarized_without_raw_json() {
+        let summary = compact_json(&serde_json::json!({
+            "query": "rust cbor",
+            "results": [{"title": "one"}, {"title": "two"}]
+        }));
+        assert_eq!(summary, "query: rust cbor · results: 2 项");
+        assert!(!summary.contains('{'));
     }
 
     async fn install_duplex(provider: &CodexProvider) -> DuplexStream {

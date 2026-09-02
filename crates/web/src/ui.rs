@@ -1,22 +1,27 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use agent_remote_protocol::{
-    ApprovalId, AttachmentId, ClientCommand, CommandId, Conversation, ConversationId,
-    ConversationState, DeviceId, HostId, ProjectId, ProviderCapability, ProviderId, ServerMessage,
-    Snapshot, TimelineItem, TimelineItemKind, decode, encode,
+    ApprovalId, AttachmentId, ClientAttachment, ClientCommand, CommandId, Conversation,
+    ConversationId, ConversationState, DeviceId, HostId, PermissionRisk, ProjectId,
+    ProviderCapability, ProviderId, ServerMessage, Snapshot, TimelineItem, TimelineItemKind,
+    TimelinePageCursor, decode, encode,
 };
-use js_sys::{Array, ArrayBuffer, Uint8Array};
+use js_sys::{Array, ArrayBuffer, Math, Uint8Array};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{
-    BinaryType, Blob, CloseEvent, Event, HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement,
-    MessageEvent, Url, UrlSearchParams, WebSocket, window,
+    BinaryType, Blob, ClipboardEvent, CloseEvent, DataTransfer, DragEvent, Event, File, FileReader,
+    HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement, MessageEvent, Url, UrlSearchParams,
+    WebSocket, window,
 };
 use yew::{Component, Context, Html, InputEvent, MouseEvent, TargetCast, classes, html};
 
 const CREDENTIALS_KEY: &str = "agent_remote_credentials_v1";
+const LAST_HOST_KEY: &str = "agent_remote_last_host_v2";
+const CACHE_PREFIX: &str = "agent_remote_cache_v2_";
 const WS_SUBPROTOCOL: &str = "agent-remote.cbor.v1";
+const MAX_RECONNECT_ATTEMPTS: u8 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredCredential {
@@ -36,6 +41,37 @@ struct ConnectionConfig {
     relay: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppCache {
+    version: u16,
+    host_id: HostId,
+    snapshot: Snapshot,
+    selected_conversation: Option<ConversationId>,
+    selected_project: Option<ProjectId>,
+    selected_provider: ProviderId,
+    selected_model: Option<String>,
+    selected_effort: Option<String>,
+    selected_permission: Option<String>,
+    #[serde(default)]
+    draft_conversation: Option<ConversationId>,
+    #[serde(default)]
+    pending_command: Option<ClientCommand>,
+    composer: String,
+    sidebar_collapsed: bool,
+    pinned_projects: Vec<ProjectId>,
+    recent_projects: Vec<ProjectId>,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserAttachment {
+    id: AttachmentId,
+    file_name: String,
+    mime_type: String,
+    byte_len: u64,
+    bytes: Option<Vec<u8>>,
+    error: Option<String>,
+}
+
 struct SocketCallbacks {
     _open: Closure<dyn FnMut(Event)>,
     _message: Closure<dyn FnMut(MessageEvent)>,
@@ -51,6 +87,12 @@ pub struct App {
     snapshot: Option<Snapshot>,
     connected: bool,
     authenticated: bool,
+    connection_generation: u64,
+    reconnect_attempt: u8,
+    reconnect_timer: Option<i32>,
+    retry_enabled: bool,
+    manually_disconnected: bool,
+    _online_callback: Option<Closure<dyn FnMut(Event)>>,
     status: String,
     pair_link: String,
     selected_conversation: Option<ConversationId>,
@@ -58,16 +100,35 @@ pub struct App {
     selected_provider: ProviderId,
     selected_model: Option<String>,
     selected_effort: Option<String>,
-    selected_native_session: Option<String>,
+    selected_permission: Option<String>,
+    draft_conversation: Option<ConversationId>,
+    pending_send: Option<(CommandId, ClientCommand)>,
     composer: String,
+    pending_attachments: Vec<BrowserAttachment>,
     attachments: HashMap<AttachmentId, String>,
     fullscreen_image: Option<AttachmentId>,
+    conversation_search: String,
+    project_picker_open: bool,
+    project_search: String,
+    pinned_projects: Vec<ProjectId>,
+    recent_projects: Vec<ProjectId>,
+    sidebar_collapsed: bool,
+    sidebar_open: bool,
+    history_before: HashMap<ConversationId, TimelinePageCursor>,
+    history_exhausted: HashSet<ConversationId>,
+    editing_title: bool,
+    title_draft: String,
 }
 
 pub enum Msg {
-    Opened,
-    Closed(String),
-    SocketError,
+    Opened(u64),
+    Closed(u64, String),
+    SocketError(u64),
+    Reconnect(u64),
+    RetryNow,
+    StopRetrying,
+    NetworkOnline,
+    Disconnect,
     Server(ServerMessage),
     DecodeError(String),
     PairLinkChanged(String),
@@ -79,14 +140,29 @@ pub enum Msg {
     SelectProvider(ProviderId),
     SelectModel(Option<String>),
     SelectEffort(Option<String>),
-    SelectNativeSession(Option<String>),
-    CreateConversation,
+    SelectPermission(Option<String>),
+    NewConversation,
+    ToggleProjectPicker,
+    ProjectSearchChanged(String),
+    ToggleProjectPin(ProjectId),
+    ConversationSearchChanged(String),
+    ToggleSidebar,
+    OpenSidebar,
+    CloseSidebar,
     ComposerChanged(String),
+    FilesSelected(Vec<File>),
+    AttachmentLoaded(AttachmentId, String, String, Vec<u8>),
+    AttachmentFailed(AttachmentId, String),
+    RemoveAttachment(AttachmentId),
     Send,
     Steer,
     Interrupt,
     ResolveApproval(ApprovalId, String),
     SetSessionOption(String, String),
+    EditTitle,
+    TitleChanged(String),
+    SaveTitle,
+    LoadOlder,
     OpenImage(AttachmentId),
     CloseImage,
 }
@@ -97,38 +173,99 @@ impl Component for App {
 
     fn create(context: &Context<Self>) -> Self {
         let credentials = load_credentials();
-        let connection = fragment_connection().or_else(|| {
-            credentials
-                .first()
-                .cloned()
-                .map(|credential| ConnectionConfig {
-                    host_id: credential.host_id,
-                    pair_token: None,
-                    origin: credential.origin.clone(),
-                    relay: credential.relay,
-                    credential: Some(credential),
-                })
+        let fragment = fragment_connection();
+        let stored = load_last_host()
+            .and_then(|host_id| {
+                credentials
+                    .iter()
+                    .find(|item| item.host_id == host_id)
+                    .cloned()
+            })
+            .or_else(|| credentials.first().cloned());
+        let connection = fragment.or_else(|| {
+            stored.map(|credential| ConnectionConfig {
+                host_id: credential.host_id,
+                pair_token: None,
+                origin: credential.origin.clone(),
+                relay: credential.relay,
+                credential: Some(credential),
+            })
         });
+        let cache = connection
+            .as_ref()
+            .and_then(|connection| load_cache(connection.host_id));
         let mut app = Self {
             socket: None,
             _socket_callbacks: None,
             connection,
             credentials,
-            snapshot: None,
+            snapshot: cache.as_ref().map(|cache| cache.snapshot.clone()),
             connected: false,
             authenticated: false,
-            status: "等待连接".to_owned(),
+            connection_generation: 0,
+            reconnect_attempt: 0,
+            reconnect_timer: None,
+            retry_enabled: true,
+            manually_disconnected: false,
+            _online_callback: None,
+            status: if cache.is_some() {
+                "离线 · 正在恢复连接".to_owned()
+            } else {
+                "等待连接".to_owned()
+            },
             pair_link: String::new(),
-            selected_conversation: None,
-            selected_project: None,
-            selected_provider: ProviderId::Codex,
-            selected_model: None,
-            selected_effort: None,
-            selected_native_session: None,
-            composer: String::new(),
+            selected_conversation: cache.as_ref().and_then(|cache| cache.selected_conversation),
+            selected_project: cache.as_ref().and_then(|cache| cache.selected_project),
+            selected_provider: cache
+                .as_ref()
+                .map_or(ProviderId::Codex, |cache| cache.selected_provider),
+            selected_model: cache
+                .as_ref()
+                .and_then(|cache| cache.selected_model.clone()),
+            selected_effort: cache
+                .as_ref()
+                .and_then(|cache| cache.selected_effort.clone()),
+            selected_permission: cache
+                .as_ref()
+                .and_then(|cache| cache.selected_permission.clone()),
+            draft_conversation: cache.as_ref().and_then(|cache| cache.draft_conversation),
+            pending_send: cache
+                .as_ref()
+                .and_then(|cache| cache.pending_command.clone())
+                .and_then(|command| command.command_id().map(|id| (id, command))),
+            composer: cache
+                .as_ref()
+                .map_or_else(String::new, |cache| cache.composer.clone()),
+            pending_attachments: Vec::new(),
             attachments: HashMap::new(),
             fullscreen_image: None,
+            conversation_search: String::new(),
+            project_picker_open: false,
+            project_search: String::new(),
+            pinned_projects: cache
+                .as_ref()
+                .map_or_else(Vec::new, |cache| cache.pinned_projects.clone()),
+            recent_projects: cache
+                .as_ref()
+                .map_or_else(Vec::new, |cache| cache.recent_projects.clone()),
+            sidebar_collapsed: cache.as_ref().is_some_and(|cache| cache.sidebar_collapsed),
+            sidebar_open: false,
+            history_before: HashMap::new(),
+            history_exhausted: HashSet::new(),
+            editing_title: false,
+            title_draft: String::new(),
         };
+        if let Some(browser) = window() {
+            let link = context.link().clone();
+            let callback =
+                Closure::wrap(
+                    Box::new(move |_: Event| link.send_message(Msg::NetworkOnline))
+                        as Box<dyn FnMut(_)>,
+                );
+            let _ = browser
+                .add_event_listener_with_callback("online", callback.as_ref().unchecked_ref());
+            app._online_callback = Some(callback);
+        }
         if app.connection.is_some() {
             app.connect(context);
         }
@@ -137,8 +274,12 @@ impl Component for App {
 
     fn update(&mut self, context: &Context<Self>, message: Self::Message) -> bool {
         match message {
-            Msg::Opened => {
+            Msg::Opened(generation) => {
+                if generation != self.connection_generation {
+                    return false;
+                }
                 self.connected = true;
+                self.reconnect_attempt = 0;
                 self.status = "正在认证…".to_owned();
                 if let Some(connection) = &self.connection {
                     let command = if let Some(pair_token) = &connection.pair_token {
@@ -160,17 +301,58 @@ impl Component for App {
                     self.send(command);
                 }
             }
-            Msg::Closed(reason) => {
+            Msg::Closed(generation, reason) => {
+                if generation != self.connection_generation {
+                    return false;
+                }
+                self.handle_disconnect(context, reason);
+            }
+            Msg::SocketError(generation) => {
+                if generation == self.connection_generation {
+                    self.status = "连接异常，等待 WebSocket 关闭后重试".to_owned();
+                }
+            }
+            Msg::Reconnect(generation) => {
+                if generation == self.connection_generation
+                    && self.retry_enabled
+                    && !self.manually_disconnected
+                    && !self.connected
+                {
+                    self.reconnect_timer = None;
+                    self.connect(context);
+                }
+            }
+            Msg::RetryNow => {
+                self.retry_enabled = true;
+                self.manually_disconnected = false;
+                self.reconnect_attempt = 0;
+                self.cancel_reconnect_timer();
+                self.connect(context);
+            }
+            Msg::StopRetrying => {
+                self.retry_enabled = false;
+                self.cancel_reconnect_timer();
+                self.status = "离线 · 已停止自动重连".to_owned();
+            }
+            Msg::NetworkOnline => {
+                if !self.connected
+                    && self.retry_enabled
+                    && !self.manually_disconnected
+                    && self.connection.is_some()
+                {
+                    self.reconnect_attempt = 0;
+                    self.cancel_reconnect_timer();
+                    self.connect(context);
+                }
+            }
+            Msg::Disconnect => {
+                self.manually_disconnected = true;
+                self.retry_enabled = false;
+                self.cancel_reconnect_timer();
+                self.close_socket("manual disconnect");
                 self.connected = false;
                 self.authenticated = false;
-                self.status = if reason.is_empty() {
-                    "Host 离线或连接已关闭".to_owned()
-                } else {
-                    format!("连接已关闭：{reason}")
-                };
-            }
-            Msg::SocketError => {
-                self.status = "无法连接 Host；请确认 Host 在线且地址可达".to_owned();
+                self.status = "离线 · 已手动断开".to_owned();
             }
             Msg::DecodeError(error) => self.status = format!("协议错误：{error}"),
             Msg::Server(server_message) => self.apply_server_message(server_message),
@@ -189,30 +371,57 @@ impl Component for App {
                         relay: credential.relay,
                         credential: Some(credential),
                     });
+                    self.restore_cache_for_connection();
+                    self.retry_enabled = true;
+                    self.manually_disconnected = false;
                     self.connect(context);
                 }
             }
             Msg::ForgetCredentials => {
+                if let Some(connection) = &self.connection {
+                    remove_cache(connection.host_id);
+                }
                 self.credentials.clear();
                 save_credentials(&self.credentials);
+                self.manually_disconnected = true;
+                self.retry_enabled = false;
+                self.cancel_reconnect_timer();
+                self.close_socket("credentials removed");
                 self.connection = None;
                 self.snapshot = None;
-                self.socket = None;
-                self._socket_callbacks = None;
                 self.status = "本地设备凭证已删除".to_owned();
             }
             Msg::SelectConversation(id) => {
                 self.selected_conversation = Some(id);
+                self.draft_conversation = None;
+                self.pending_attachments.clear();
+                self.sidebar_open = false;
+                self.editing_title = false;
                 self.request_images_for_selected();
             }
             Msg::SelectProject(id) => {
                 self.selected_project = Some(id);
+                self.selected_conversation = None;
+                self.draft_conversation = None;
+                self.pending_attachments.clear();
+                self.project_picker_open = false;
+                self.sidebar_open = false;
+                self.recent_projects.retain(|project| *project != id);
+                self.recent_projects.insert(0, id);
+                self.recent_projects.truncate(8);
                 self.reset_dynamic_selection();
+                self.sync_selected_project();
             }
             Msg::SelectProvider(provider) => {
                 self.selected_provider = provider;
-                self.ensure_project_for_provider();
+                self.selected_project = None;
+                self.selected_conversation = None;
+                self.draft_conversation = None;
+                self.pending_attachments.clear();
                 self.reset_dynamic_selection();
+                if self.authenticated {
+                    self.send(ClientCommand::RefreshProjects { provider });
+                }
             }
             Msg::SelectModel(model) => {
                 self.selected_model = model;
@@ -226,30 +435,99 @@ impl Component for App {
                         .and_then(|model| model.default_effort.clone());
             }
             Msg::SelectEffort(effort) => self.selected_effort = effort,
-            Msg::SelectNativeSession(session) => self.selected_native_session = session,
-            Msg::CreateConversation => {
-                if let Some(project_id) = self.selected_project {
-                    self.send(ClientCommand::CreateConversation {
-                        command_id: CommandId::new(),
-                        project_id,
-                        provider: self.selected_provider,
-                        native_session_id: self.selected_native_session.clone(),
-                        model: self.selected_model.clone(),
-                        effort: self.selected_effort.clone(),
-                    });
+            Msg::SelectPermission(permission) => {
+                if permission
+                    .as_deref()
+                    .is_none_or(|permission| self.confirm_permission_change(permission))
+                {
+                    self.selected_permission = permission;
                 }
             }
+            Msg::NewConversation => {
+                self.selected_conversation = None;
+                self.draft_conversation = Some(ConversationId::new());
+                self.pending_attachments.clear();
+                self.sidebar_open = false;
+                self.editing_title = false;
+            }
+            Msg::ToggleProjectPicker => self.project_picker_open = !self.project_picker_open,
+            Msg::ProjectSearchChanged(value) => self.project_search = value,
+            Msg::ToggleProjectPin(id) => {
+                if self.pinned_projects.contains(&id) {
+                    self.pinned_projects.retain(|project| *project != id);
+                } else {
+                    self.pinned_projects.push(id);
+                }
+            }
+            Msg::ConversationSearchChanged(value) => self.conversation_search = value,
+            Msg::ToggleSidebar => self.sidebar_collapsed = !self.sidebar_collapsed,
+            Msg::OpenSidebar => self.sidebar_open = true,
+            Msg::CloseSidebar => self.sidebar_open = false,
             Msg::ComposerChanged(value) => self.composer = value,
-            Msg::Send => {
-                if let Some(conversation_id) = self.selected_conversation
-                    && !self.composer.trim().is_empty()
+            Msg::FilesSelected(files) => self.read_files(context, files),
+            Msg::AttachmentLoaded(id, file_name, mime_type, bytes) => {
+                if let Some(attachment) = self
+                    .pending_attachments
+                    .iter_mut()
+                    .find(|attachment| attachment.id == id)
                 {
-                    let text = std::mem::take(&mut self.composer);
-                    self.send(ClientCommand::SendMessage {
-                        command_id: CommandId::new(),
-                        conversation_id,
-                        text,
-                    });
+                    attachment.file_name = file_name;
+                    attachment.mime_type = mime_type;
+                    attachment.bytes = Some(bytes);
+                    attachment.error = None;
+                }
+            }
+            Msg::AttachmentFailed(id, error) => {
+                if let Some(attachment) = self
+                    .pending_attachments
+                    .iter_mut()
+                    .find(|attachment| attachment.id == id)
+                {
+                    attachment.error = Some(error);
+                }
+            }
+            Msg::RemoveAttachment(id) => self
+                .pending_attachments
+                .retain(|attachment| attachment.id != id),
+            Msg::Send => {
+                if self.pending_send.is_none()
+                    && !self.composer.trim().is_empty()
+                    && self
+                        .pending_attachments
+                        .iter()
+                        .all(|attachment| attachment.bytes.is_some() && attachment.error.is_none())
+                {
+                    let text = self.composer.trim().to_owned();
+                    let attachments = self.client_attachments();
+                    let command_id = CommandId::new();
+                    let client_message_id = Uuid::new_v4().to_string();
+                    if let Some(conversation_id) = self.selected_conversation {
+                        let command = ClientCommand::SendMessage {
+                            command_id,
+                            conversation_id,
+                            client_message_id: Some(client_message_id),
+                            text: text.clone(),
+                            attachments,
+                        };
+                        self.send(command.clone());
+                        self.pending_send = Some((command_id, command));
+                    } else if let (Some(conversation_id), Some(project_id)) =
+                        (self.draft_conversation, self.selected_project)
+                    {
+                        let command = ClientCommand::StartConversation {
+                            command_id,
+                            conversation_id,
+                            project_id,
+                            provider: self.selected_provider,
+                            model: self.selected_model.clone(),
+                            effort: self.selected_effort.clone(),
+                            permission_mode: self.selected_permission.clone(),
+                            text: text.clone(),
+                            attachments,
+                        };
+                        self.send(command.clone());
+                        self.pending_send = Some((command_id, command));
+                    }
                 }
             }
             Msg::Steer => {
@@ -280,12 +558,62 @@ impl Component for App {
                 });
             }
             Msg::SetSessionOption(option_id, value) => {
+                if option_id == "permission_mode" && !self.confirm_permission_change(&value) {
+                    return true;
+                }
                 if let Some(conversation_id) = self.selected_conversation {
                     self.send(ClientCommand::SetSessionOption {
                         command_id: CommandId::new(),
                         conversation_id,
                         option_id,
                         value,
+                    });
+                }
+            }
+            Msg::EditTitle => {
+                if let Some(conversation) = self.selected_conversation_ref() {
+                    self.title_draft = conversation.title.clone();
+                    self.editing_title = true;
+                }
+            }
+            Msg::TitleChanged(value) => self.title_draft = value,
+            Msg::SaveTitle => {
+                if let Some(conversation_id) = self.selected_conversation
+                    && !self.title_draft.trim().is_empty()
+                {
+                    self.send(ClientCommand::RenameConversation {
+                        command_id: CommandId::new(),
+                        conversation_id,
+                        title: self.title_draft.trim().to_owned(),
+                    });
+                    self.editing_title = false;
+                }
+            }
+            Msg::LoadOlder => {
+                if let Some(conversation_id) = self.selected_conversation
+                    && !self.history_exhausted.contains(&conversation_id)
+                {
+                    let before = self
+                        .history_before
+                        .get(&conversation_id)
+                        .copied()
+                        .or_else(|| {
+                            self.snapshot.as_ref().and_then(|snapshot| {
+                                snapshot
+                                    .timeline
+                                    .iter()
+                                    .filter(|item| item.conversation_id == conversation_id)
+                                    .min_by_key(|item| (item.created_at_ms, item.id))
+                                    .map(|item| TimelinePageCursor {
+                                        created_at_ms: item.created_at_ms,
+                                        item_id: item.id,
+                                    })
+                            })
+                        });
+                    self.send(ClientCommand::GetConversationPage {
+                        conversation_id,
+                        before,
+                        limit: 100,
                     });
                 }
             }
@@ -297,6 +625,7 @@ impl Component for App {
             }
             Msg::CloseImage => self.fullscreen_image = None,
         }
+        self.persist_cache();
         true
     }
 
@@ -306,32 +635,67 @@ impl Component for App {
             return self.view_connection(link);
         };
         let selected = self.selected_conversation.and_then(|id| {
-            snapshot
-                .conversations
-                .iter()
-                .find(|conversation| conversation.id == id)
+            snapshot.conversations.iter().find(|conversation| {
+                conversation.id == id
+                    && Some(conversation.project_id) == self.selected_project
+                    && conversation.provider == self.selected_provider
+            })
         });
+        let project = self
+            .selected_project
+            .and_then(|id| snapshot.projects.iter().find(|project| project.id == id));
+        let query = self.conversation_search.trim().to_lowercase();
         html! {
-            <main class="app-shell">
-                <aside class="sidebar">
+            <main class={classes!("app-shell", self.sidebar_collapsed.then_some("sidebar-collapsed"))}>
+                {if self.sidebar_open { html! {<button class="drawer-scrim" aria-label="关闭侧边栏" onclick={link.callback(|_| Msg::CloseSidebar)}></button>} } else {html! {}}}
+                <aside class={classes!("sidebar", self.sidebar_open.then_some("open"))}>
                     <div class="brand">
                         <span class="brand-mark">{"AR"}</span>
-                        <div><strong>{"Agent Remote"}</strong><small>{&snapshot.host_name}</small></div>
+                        <div class="collapsible-copy"><strong>{"Agent Remote"}</strong><small>{&snapshot.host_name}</small></div>
                     </div>
-                    {self.view_new_conversation(link, snapshot)}
+                    <div class="connection-strip">
+                        <span class={if self.connected {"status-dot online"} else {"status-dot"}}></span>
+                        <span class="collapsible-copy">{&self.status}</span>
+                        {if !self.connected && self.retry_enabled {html! {<button title="停止重连" onclick={link.callback(|_| Msg::StopRetrying)}>{"×"}</button>}} else if !self.connected {html! {<button title="立即重试" onclick={link.callback(|_| Msg::RetryNow)}>{"↻"}</button>}} else {html! {}}}
+                    </div>
+                    <label class="sidebar-agent"><span class="collapsible-copy">{"Agent"}</span>
+                        <select onchange={link.callback(|event: Event| {
+                            let value = event.target_unchecked_into::<HtmlSelectElement>().value();
+                            Msg::SelectProvider(if value == "grok" { ProviderId::Grok } else { ProviderId::Codex })
+                        })}>
+                            <option value="codex" selected={self.selected_provider == ProviderId::Codex}>{"Codex"}</option>
+                            <option value="grok" selected={self.selected_provider == ProviderId::Grok}>{"Grok"}</option>
+                        </select>
+                    </label>
+                    <div class="project-control">
+                        <button class="project-trigger" onclick={link.callback(|_| Msg::ToggleProjectPicker)} title="选择项目">
+                            <span class="project-icon">{"▣"}</span>
+                            <span class="collapsible-copy"><strong>{project.map_or("选择项目", |project| project.display_name.as_str())}</strong><small>{project.map_or("", |project| project.short_path.as_str())}</small></span>
+                            <span class="collapsible-copy">{"⌄"}</span>
+                        </button>
+                        {if self.project_picker_open { self.view_project_picker(link, snapshot) } else {html! {}}}
+                    </div>
+                    <button class="new-button" onclick={link.callback(|_| Msg::NewConversation)} disabled={self.selected_project.is_none()}><span>{"＋"}</span><b class="collapsible-copy">{"新建对话"}</b></button>
+                    <label class="conversation-search collapsible-copy"><span>{"⌕"}</span><input placeholder="搜索当前项目对话" value={self.conversation_search.clone()} oninput={link.callback(|event: InputEvent| Msg::ConversationSearchChanged(event.target_unchecked_into::<HtmlInputElement>().value()))}/></label>
                     <nav class="conversation-list" aria-label="会话列表">
-                        {for snapshot.conversations.iter().map(|conversation| self.view_conversation_row(link, conversation, snapshot))}
+                        {for snapshot.conversations.iter().filter(|conversation| {
+                            Some(conversation.project_id) == self.selected_project
+                                && conversation.provider == self.selected_provider
+                                && (query.is_empty() || conversation.title.to_lowercase().contains(&query))
+                        }).map(|conversation| self.view_conversation_row(link, conversation, snapshot))}
                     </nav>
                     <div class="sidebar-footer">
-                        <span class={if self.connected {"status-dot online"} else {"status-dot"}}></span>
-                        <span>{if self.connected {"Host 在线"} else {"Host 离线"}}</span>
+                        <button onclick={link.callback(|_| Msg::Disconnect)} title="断开连接">{"⏻"}<span class="collapsible-copy">{"断开"}</span></button>
+                        <button onclick={link.callback(|_| Msg::ToggleSidebar)} title="收起侧边栏">{if self.sidebar_collapsed {"›"} else {"‹"}}</button>
                     </div>
                 </aside>
                 <section class="chat-pane">
                     {if let Some(conversation) = selected {
                         self.view_chat(link, conversation, snapshot)
+                    } else if self.draft_conversation.is_some() && self.selected_project.is_some() {
+                        self.view_draft_chat(link, snapshot)
                     } else {
-                        html! { <div class="empty-state"><h2>{"选择或新建会话"}</h2><p>{"消息、过程、审批和图片会显示在这里。"}</p></div> }
+                        html! { <div class="empty-state"><button class="mobile-menu" onclick={link.callback(|_| Msg::OpenSidebar)}>{"☰"}</button><h2>{"选择或新建对话"}</h2><p>{"这里只显示当前 Agent 与项目的远程对话。"}</p></div> }
                     }}
                 </section>
                 {self.view_fullscreen_image(link)}
@@ -345,14 +709,85 @@ impl App {
         let Some(connection) = self.connection.clone() else {
             return;
         };
-        match open_socket(context, &connection) {
+        self.cancel_reconnect_timer();
+        self.close_socket("superseded");
+        self.connection_generation += 1;
+        let generation = self.connection_generation;
+        save_last_host(connection.host_id);
+        match open_socket(context, &connection, generation) {
             Ok((socket, callbacks)) => {
                 self.socket = Some(socket);
                 self._socket_callbacks = Some(callbacks);
-                self.status = "正在连接…".to_owned();
+                self.connected = false;
+                self.authenticated = false;
+                self.status = "连接中…".to_owned();
             }
-            Err(error) => self.status = error,
+            Err(error) => self.handle_disconnect(context, error),
         }
+    }
+
+    fn handle_disconnect(&mut self, context: &Context<Self>, reason: String) {
+        self.connected = false;
+        self.authenticated = false;
+        self.socket = None;
+        self._socket_callbacks = None;
+        if self.manually_disconnected || !self.retry_enabled {
+            self.status = "离线 · 已停止自动重连".to_owned();
+            return;
+        }
+        if self
+            .connection
+            .as_ref()
+            .and_then(|connection| connection.credential.as_ref())
+            .is_none()
+        {
+            self.status = format!("连接失败：{reason}");
+            return;
+        }
+        if self.reconnect_attempt >= MAX_RECONNECT_ATTEMPTS {
+            self.status = format!("连接失败 · 已达到重试上限：{reason}");
+            return;
+        }
+        let base_seconds = 1_u32 << self.reconnect_attempt.min(5);
+        let jitter_ms = (Math::random() * 800.0) as i32;
+        let delay_ms = (base_seconds.min(30) * 1_000) as i32 + jitter_ms;
+        self.reconnect_attempt += 1;
+        self.status = format!(
+            "重连中 · 第 {} 次，约 {:.1} 秒后重试",
+            self.reconnect_attempt,
+            f64::from(delay_ms) / 1_000.0
+        );
+        if let Some(browser) = window() {
+            let generation = self.connection_generation;
+            let link = context.link().clone();
+            let callback =
+                Closure::once_into_js(move || link.send_message(Msg::Reconnect(generation)));
+            if let Ok(handle) = browser.set_timeout_with_callback_and_timeout_and_arguments_0(
+                callback.unchecked_ref(),
+                delay_ms,
+            ) {
+                self.reconnect_timer = Some(handle);
+            }
+        }
+    }
+
+    fn cancel_reconnect_timer(&mut self) {
+        if let Some(handle) = self.reconnect_timer.take()
+            && let Some(browser) = window()
+        {
+            browser.clear_timeout_with_handle(handle);
+        }
+    }
+
+    fn close_socket(&mut self, reason: &str) {
+        if let Some(socket) = self.socket.take() {
+            socket.set_onopen(None);
+            socket.set_onmessage(None);
+            socket.set_onerror(None);
+            socket.set_onclose(None);
+            let _ = socket.close_with_code_and_reason(1000, reason);
+        }
+        self._socket_callbacks = None;
     }
 
     fn send(&self, command: ClientCommand) {
@@ -393,20 +828,109 @@ impl App {
             }
             ServerMessage::Authenticated { .. } => {
                 self.authenticated = true;
-                self.status = "已连接".to_owned();
+                self.status = "同步中…".to_owned();
                 self.send(ClientCommand::GetSnapshot);
             }
             ServerMessage::Snapshot { snapshot } => {
-                self.selected_conversation = self.selected_conversation.or_else(|| {
-                    snapshot
-                        .conversations
-                        .first()
-                        .map(|conversation| conversation.id)
-                });
                 self.snapshot = Some(snapshot);
+                self.history_before.clear();
+                self.history_exhausted.clear();
                 self.ensure_project_for_provider();
                 self.reset_dynamic_selection();
+                self.selected_conversation = self.selected_conversation.filter(|selected| {
+                    self.snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot.conversations.iter().any(|conversation| {
+                            conversation.id == *selected
+                                && Some(conversation.project_id) == self.selected_project
+                                && conversation.provider == self.selected_provider
+                        })
+                    })
+                });
+                self.status = "同步中…".to_owned();
+                self.send(ClientCommand::RefreshProjects {
+                    provider: self.selected_provider,
+                });
+                self.sync_selected_project();
+                if let Some((_, command)) = &self.pending_send {
+                    self.send(command.clone());
+                }
                 self.request_images_for_selected();
+            }
+            ServerMessage::ProjectsUpdated {
+                provider,
+                projects,
+                capabilities,
+            } => {
+                if let Some(snapshot) = &mut self.snapshot {
+                    let incoming_ids = projects
+                        .iter()
+                        .map(|project| project.id)
+                        .collect::<HashSet<_>>();
+                    for project in &mut snapshot.projects {
+                        if project.enabled_providers.contains(&provider)
+                            && !incoming_ids.contains(&project.id)
+                        {
+                            project
+                                .enabled_providers
+                                .retain(|candidate| *candidate != provider);
+                        }
+                    }
+                    for project in projects {
+                        upsert_project(&mut snapshot.projects, project);
+                    }
+                    snapshot
+                        .provider_capabilities
+                        .retain(|capability| capability.provider != provider);
+                    for capability in capabilities {
+                        upsert_capability(&mut snapshot.provider_capabilities, capability);
+                    }
+                }
+                if provider == self.selected_provider {
+                    self.ensure_project_for_provider();
+                    self.reset_dynamic_selection();
+                    self.sync_selected_project();
+                }
+            }
+            ServerMessage::ProjectSyncCompleted {
+                command_id,
+                project_id,
+                provider,
+                conversations_synced,
+                full_history_fallback,
+            } => {
+                if Some(project_id) == self.selected_project && provider == self.selected_provider {
+                    self.status = if full_history_fallback {
+                        format!("已连接 · 已同步 {conversations_synced} 个对话（全量去重）")
+                    } else {
+                        format!("已连接 · 已同步 {conversations_synced} 个对话")
+                    };
+                }
+                if self
+                    .pending_send
+                    .as_ref()
+                    .is_some_and(|(pending, _)| *pending == command_id)
+                {
+                    self.pending_send = None;
+                }
+            }
+            ServerMessage::ConversationPage {
+                conversation_id,
+                items,
+                next_before,
+            } => {
+                if let Some(snapshot) = &mut self.snapshot {
+                    for item in items {
+                        upsert_timeline_item(&mut snapshot.timeline, item);
+                    }
+                }
+                match next_before {
+                    Some(before) => {
+                        self.history_before.insert(conversation_id, before);
+                    }
+                    None => {
+                        self.history_exhausted.insert(conversation_id);
+                    }
+                }
             }
             ServerMessage::ProviderChanged { capability } => {
                 if let Some(snapshot) = &mut self.snapshot {
@@ -415,8 +939,13 @@ impl App {
             }
             ServerMessage::ConversationUpserted { conversation } => {
                 if let Some(snapshot) = &mut self.snapshot {
+                    let project_id = conversation.project_id;
                     upsert_conversation(&mut snapshot.conversations, conversation.clone());
-                    self.selected_conversation = Some(conversation.id);
+                    refresh_project_metrics(snapshot, project_id);
+                    if self.draft_conversation == Some(conversation.id) {
+                        self.selected_conversation = Some(conversation.id);
+                        self.draft_conversation = None;
+                    }
                 }
             }
             ServerMessage::TimelineItemUpserted { item } => {
@@ -433,9 +962,23 @@ impl App {
             }
             ServerMessage::ConversationRemoved { conversation_id } => {
                 if let Some(snapshot) = &mut self.snapshot {
+                    let project_id = snapshot
+                        .conversations
+                        .iter()
+                        .find(|conversation| conversation.id == conversation_id)
+                        .map(|conversation| conversation.project_id);
                     snapshot
                         .conversations
                         .retain(|conversation| conversation.id != conversation_id);
+                    snapshot
+                        .timeline
+                        .retain(|item| item.conversation_id != conversation_id);
+                    if let Some(project_id) = project_id {
+                        refresh_project_metrics(snapshot, project_id);
+                    }
+                }
+                if self.selected_conversation == Some(conversation_id) {
+                    self.selected_conversation = None;
                 }
             }
             ServerMessage::AttachmentData { metadata, bytes } => {
@@ -448,30 +991,105 @@ impl App {
             } => {
                 self.connected = online;
                 if !online {
-                    self.status = message.unwrap_or_else(|| "Host 离线".to_owned());
+                    self.status = message.unwrap_or_else(|| "离线".to_owned());
                 }
             }
-            ServerMessage::CommandRejected { message, .. }
-            | ServerMessage::ProtocolError { message, .. } => self.status = message,
-            ServerMessage::CommandAccepted { .. } => {}
+            ServerMessage::CommandRejected {
+                command_id,
+                code,
+                message,
+            } => {
+                if command_id.is_some_and(|id| {
+                    self.pending_send
+                        .as_ref()
+                        .is_some_and(|(pending, _)| *pending == id)
+                }) {
+                    self.pending_send = None;
+                }
+                if code == "authentication_failed" {
+                    self.retry_enabled = false;
+                    self.status = format!("认证失效，请重新配对：{message}");
+                } else {
+                    self.status = format!("{code}: {message}");
+                }
+            }
+            ServerMessage::ProtocolError { message, .. } => {
+                self.retry_enabled = false;
+                self.status = format!("协议不兼容：{message}");
+            }
+            ServerMessage::CommandAccepted { command_id } => {
+                if self
+                    .pending_send
+                    .as_ref()
+                    .is_some_and(|(pending, _)| *pending == command_id)
+                {
+                    self.pending_send = None;
+                    self.composer.clear();
+                    self.pending_attachments.clear();
+                }
+            }
         }
+        self.persist_cache();
     }
 
     fn reset_dynamic_selection(&mut self) {
         let capability = self.selected_capability().cloned();
-        self.selected_model = capability
-            .as_ref()
-            .and_then(|capability| capability.models.first())
-            .map(|model| model.id.clone());
-        self.selected_effort = capability.as_ref().and_then(|capability| {
-            capability.models.first().and_then(|model| {
-                model
-                    .default_effort
-                    .clone()
-                    .or_else(|| model.effort_options.first().map(|effort| effort.id.clone()))
+        self.selected_model = self
+            .selected_model
+            .take()
+            .filter(|selected| {
+                capability.as_ref().is_some_and(|capability| {
+                    capability.models.iter().any(|model| &model.id == selected)
+                })
             })
+            .or_else(|| {
+                capability
+                    .as_ref()
+                    .and_then(|capability| capability.models.first())
+                    .map(|model| model.id.clone())
+            });
+        let valid_efforts = capability.as_ref().and_then(|capability| {
+            capability
+                .models
+                .iter()
+                .find(|model| Some(model.id.as_str()) == self.selected_model.as_deref())
         });
-        self.selected_native_session = None;
+        self.selected_effort = self
+            .selected_effort
+            .take()
+            .filter(|selected| {
+                valid_efforts.is_some_and(|model| {
+                    model
+                        .effort_options
+                        .iter()
+                        .any(|effort| &effort.id == selected)
+                })
+            })
+            .or_else(|| {
+                capability.as_ref().and_then(|capability| {
+                    capability.models.first().and_then(|model| {
+                        model.default_effort.clone().or_else(|| {
+                            model.effort_options.first().map(|effort| effort.id.clone())
+                        })
+                    })
+                })
+            });
+        self.selected_permission = self
+            .selected_permission
+            .take()
+            .filter(|selected| {
+                capability.as_ref().is_some_and(|capability| {
+                    capability
+                        .permission_modes
+                        .iter()
+                        .any(|mode| &mode.id == selected)
+                })
+            })
+            .or_else(|| {
+                capability
+                    .as_ref()
+                    .and_then(|capability| capability.default_permission_mode.clone())
+            });
     }
 
     fn ensure_project_for_provider(&mut self) {
@@ -505,6 +1123,235 @@ impl App {
             .find(|capability| {
                 capability.project_id == project_id && capability.provider == self.selected_provider
             })
+    }
+
+    fn selected_conversation_ref(&self) -> Option<&Conversation> {
+        let id = self.selected_conversation?;
+        self.snapshot
+            .as_ref()?
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == id)
+    }
+
+    fn confirm_permission_change(&self, permission: &str) -> bool {
+        let elevated = self.selected_capability().is_some_and(|capability| {
+            capability
+                .permission_modes
+                .iter()
+                .any(|mode| mode.id == permission && mode.risk == PermissionRisk::Elevated)
+        });
+        !elevated
+            || window()
+                .and_then(|window| {
+                    window
+                        .confirm_with_message(
+                            "此权限模式由 Provider 标记为高风险，可能允许无需逐次确认的写入或命令。确定切换吗？",
+                        )
+                        .ok()
+                })
+                .unwrap_or(false)
+    }
+
+    fn sync_selected_project(&mut self) {
+        if !self.authenticated {
+            return;
+        }
+        let Some(project_id) = self.selected_project else {
+            return;
+        };
+        self.status = "同步中…".to_owned();
+        self.send(ClientCommand::SyncProject {
+            command_id: CommandId::new(),
+            project_id,
+            provider: self.selected_provider,
+        });
+    }
+
+    fn client_attachments(&self) -> Vec<ClientAttachment> {
+        self.pending_attachments
+            .iter()
+            .filter_map(|attachment| {
+                Some(ClientAttachment {
+                    id: attachment.id,
+                    file_name: attachment.file_name.clone(),
+                    mime_type: attachment.mime_type.clone(),
+                    bytes: attachment.bytes.clone()?,
+                })
+            })
+            .collect()
+    }
+
+    fn read_files(&mut self, context: &Context<Self>, files: Vec<File>) {
+        let Some(capability) = self.selected_capability().cloned() else {
+            return;
+        };
+        let attachment_capability = capability.attachments;
+        let available = usize::from(attachment_capability.max_count)
+            .saturating_sub(self.pending_attachments.len());
+        let mut selected_bytes = self
+            .pending_attachments
+            .iter()
+            .filter(|attachment| attachment.error.is_none())
+            .map(|attachment| attachment.byte_len)
+            .sum::<u64>();
+        for file in files.into_iter().take(available) {
+            let id = AttachmentId::new();
+            let file_name = file.name();
+            let mime_type = file.type_();
+            let error = if !attachment_capability.supported() {
+                Some("当前 Provider 不支持输入附件".to_owned())
+            } else if file.size() as u64 > attachment_capability.max_bytes {
+                Some(format!(
+                    "文件超过 {} MiB 限制",
+                    attachment_capability.max_bytes / 1024 / 1024
+                ))
+            } else if selected_bytes + file.size() as u64 > attachment_capability.max_total_bytes {
+                Some(format!(
+                    "附件总大小超过 {} MiB 限制",
+                    attachment_capability.max_total_bytes / 1024 / 1024
+                ))
+            } else if !attachment_capability
+                .allowed_mime_types
+                .iter()
+                .any(|allowed| allowed == &mime_type)
+            {
+                Some(format!("不支持 {mime_type}"))
+            } else {
+                None
+            };
+            self.pending_attachments.push(BrowserAttachment {
+                id,
+                file_name: file_name.clone(),
+                mime_type: mime_type.clone(),
+                byte_len: file.size() as u64,
+                bytes: None,
+                error: error.clone(),
+            });
+            if error.is_some() {
+                continue;
+            }
+            selected_bytes += file.size() as u64;
+            let Ok(reader) = FileReader::new() else {
+                context
+                    .link()
+                    .send_message(Msg::AttachmentFailed(id, "浏览器无法读取文件".to_owned()));
+                continue;
+            };
+            let callback_reader = reader.clone();
+            let link = context.link().clone();
+            let onload = Closure::wrap(Box::new(move |_: Event| {
+                let result = callback_reader
+                    .result()
+                    .ok()
+                    .and_then(|value| value.dyn_into::<ArrayBuffer>().ok())
+                    .map(|buffer| Uint8Array::new(&buffer).to_vec());
+                match result {
+                    Some(bytes) => link.send_message(Msg::AttachmentLoaded(
+                        id,
+                        file_name.clone(),
+                        mime_type.clone(),
+                        bytes,
+                    )),
+                    None => link
+                        .send_message(Msg::AttachmentFailed(id, "浏览器读取附件失败".to_owned())),
+                }
+            }) as Box<dyn FnMut(_)>);
+            reader.set_onloadend(Some(onload.as_ref().unchecked_ref()));
+            if reader.read_as_array_buffer(&file).is_err() {
+                context
+                    .link()
+                    .send_message(Msg::AttachmentFailed(id, "浏览器读取附件失败".to_owned()));
+            }
+            onload.forget();
+        }
+    }
+
+    fn persist_cache(&self) {
+        let (Some(connection), Some(snapshot)) = (&self.connection, &self.snapshot) else {
+            return;
+        };
+        let mut snapshot = snapshot.clone();
+        if snapshot.timeline.len() > 1_000 {
+            snapshot
+                .timeline
+                .drain(..snapshot.timeline.len().saturating_sub(1_000));
+        }
+        save_cache(&AppCache {
+            version: 2,
+            host_id: connection.host_id,
+            snapshot,
+            selected_conversation: self.selected_conversation,
+            selected_project: self.selected_project,
+            selected_provider: self.selected_provider,
+            selected_model: self.selected_model.clone(),
+            selected_effort: self.selected_effort.clone(),
+            selected_permission: self.selected_permission.clone(),
+            draft_conversation: self.draft_conversation,
+            pending_command: self
+                .pending_send
+                .as_ref()
+                .map(|(_, command)| command.clone()),
+            composer: self.composer.clone(),
+            sidebar_collapsed: self.sidebar_collapsed,
+            pinned_projects: self.pinned_projects.clone(),
+            recent_projects: self.recent_projects.clone(),
+        });
+    }
+
+    fn restore_cache_for_connection(&mut self) {
+        let Some(host_id) = self
+            .connection
+            .as_ref()
+            .map(|connection| connection.host_id)
+        else {
+            return;
+        };
+        for url in self.attachments.values() {
+            let _ = Url::revoke_object_url(url);
+        }
+        self.attachments.clear();
+        self.pending_attachments.clear();
+        self.fullscreen_image = None;
+        self.history_before.clear();
+        self.history_exhausted.clear();
+        self.conversation_search.clear();
+        self.project_picker_open = false;
+        self.project_search.clear();
+        self.sidebar_open = false;
+        self.editing_title = false;
+        self.title_draft.clear();
+        let Some(cache) = load_cache(host_id) else {
+            self.snapshot = None;
+            self.selected_conversation = None;
+            self.selected_project = None;
+            self.selected_provider = ProviderId::Codex;
+            self.selected_model = None;
+            self.selected_effort = None;
+            self.selected_permission = None;
+            self.draft_conversation = None;
+            self.pending_send = None;
+            self.composer.clear();
+            self.sidebar_collapsed = false;
+            self.pinned_projects.clear();
+            self.recent_projects.clear();
+            return;
+        };
+        self.snapshot = Some(cache.snapshot);
+        self.selected_conversation = cache.selected_conversation;
+        self.selected_project = cache.selected_project;
+        self.selected_provider = cache.selected_provider;
+        self.selected_model = cache.selected_model;
+        self.selected_effort = cache.selected_effort;
+        self.selected_permission = cache.selected_permission;
+        self.draft_conversation = cache.draft_conversation;
+        self.pending_send = cache
+            .pending_command
+            .and_then(|command| command.command_id().map(|id| (id, command)));
+        self.composer = cache.composer;
+        self.sidebar_collapsed = cache.sidebar_collapsed;
+        self.pinned_projects = cache.pinned_projects;
+        self.recent_projects = cache.recent_projects;
     }
 
     fn request_images_for_selected(&self) {
@@ -563,61 +1410,75 @@ impl App {
         }
     }
 
-    fn view_new_conversation(&self, link: &yew::html::Scope<Self>, snapshot: &Snapshot) -> Html {
-        let capability = self.selected_capability();
-        let models = capability.map_or(&[][..], |capability| capability.models.as_slice());
-        let efforts = models
+    fn view_project_picker(&self, link: &yew::html::Scope<Self>, snapshot: &Snapshot) -> Html {
+        let query = self.project_search.trim().to_lowercase();
+        let mut projects = snapshot
+            .projects
             .iter()
-            .find(|model| Some(model.id.as_str()) == self.selected_model.as_deref())
-            .map_or(&[][..], |model| model.effort_options.as_slice());
-        let sessions = capability.map_or(&[][..], |capability| capability.sessions.as_slice());
+            .filter(|project| {
+                project.valid
+                    && project.enabled_providers.contains(&self.selected_provider)
+                    && (query.is_empty()
+                        || project.display_name.to_lowercase().contains(&query)
+                        || project.short_path.to_lowercase().contains(&query))
+            })
+            .collect::<Vec<_>>();
+        projects.sort_by(|left, right| {
+            right
+                .last_activity_at_ms
+                .cmp(&left.last_activity_at_ms)
+                .then_with(|| left.display_name.cmp(&right.display_name))
+        });
+        let pinned = projects
+            .iter()
+            .copied()
+            .filter(|project| self.pinned_projects.contains(&project.id))
+            .collect::<Vec<_>>();
+        let recent = self
+            .recent_projects
+            .iter()
+            .filter_map(|id| projects.iter().copied().find(|project| project.id == *id))
+            .filter(|project| !self.pinned_projects.contains(&project.id))
+            .collect::<Vec<_>>();
         html! {
-            <section class="new-conversation">
-                <h2>{"新建会话"}</h2>
-                <label class="compact-field"><span>{"Agent"}</span>
-                    <select onchange={link.callback(|event: Event| {
-                        let value = event.target_unchecked_into::<HtmlSelectElement>().value();
-                        Msg::SelectProvider(if value == "grok" { ProviderId::Grok } else { ProviderId::Codex })
-                    })}>
-                        <option value="codex" selected={self.selected_provider == ProviderId::Codex}>{"OpenAI Codex"}</option>
-                        <option value="grok" selected={self.selected_provider == ProviderId::Grok}>{"Grok Build"}</option>
-                    </select>
-                </label>
-                <label class="compact-field"><span>{"项目"}</span>
-                    <select onchange={link.callback(|event: Event| {
-                        Msg::SelectProject(ProjectId(Uuid::parse_str(&event.target_unchecked_into::<HtmlSelectElement>().value()).expect("project id from option")))
-                    })}>
-                        {for snapshot.projects.iter().filter(|project| project.valid && project.enabled_providers.contains(&self.selected_provider)).map(|project| html! {
-                            <option value={project.id.to_string()} selected={Some(project.id) == self.selected_project}>{&project.display_name}</option>
-                        })}
-                    </select>
-                </label>
-                {if models.is_empty() { html! {
-                    <p class="capability-note">{capability.and_then(|item| item.limitation.clone()).unwrap_or_else(|| "当前 Provider 未暴露预创建模型选择；会话建立后显示正式配置项。".to_owned())}</p>
-                }} else { html! {
-                    <>
-                        <label class="compact-field"><span>{"模型"}</span>
-                            <select onchange={link.callback(|event: Event| Msg::SelectModel(nonempty(event.target_unchecked_into::<HtmlSelectElement>().value())))}>
-                                {for models.iter().map(|model| html! { <option value={model.id.clone()} selected={Some(model.id.as_str()) == self.selected_model.as_deref()}>{&model.display_name}</option> })}
-                            </select>
-                        </label>
-                        <label class="compact-field"><span>{"Effort"}</span>
-                            <select disabled={efforts.is_empty()} onchange={link.callback(|event: Event| Msg::SelectEffort(nonempty(event.target_unchecked_into::<HtmlSelectElement>().value())))}>
-                                {for efforts.iter().map(|effort| html! { <option value={effort.id.clone()} selected={Some(effort.id.as_str()) == self.selected_effort.as_deref()}>{&effort.display_name}</option> })}
-                            </select>
-                        </label>
-                    </>
-                }}}
-                {if sessions.is_empty() { html! {} } else { html! {
-                    <label class="compact-field"><span>{"会话"}</span>
-                        <select onchange={link.callback(|event: Event| Msg::SelectNativeSession(nonempty(event.target_unchecked_into::<HtmlSelectElement>().value())))}>
-                            <option value="">{"新会话"}</option>
-                            {for sessions.iter().map(|session| html! { <option value={session.native_session_id.clone()}>{&session.title}</option> })}
-                        </select>
-                    </label>
-                }}}
-                <button class="primary wide" onclick={link.callback(|_| Msg::CreateConversation)} disabled={self.selected_project.is_none()}>{"创建会话"}</button>
-            </section>
+            <div class="project-popover">
+                <label><span>{"⌕"}</span><input autofocus=true placeholder="搜索项目" value={self.project_search.clone()} oninput={link.callback(|event: InputEvent| Msg::ProjectSearchChanged(event.target_unchecked_into::<HtmlInputElement>().value()))}/></label>
+                {if pinned.is_empty() {html! {}} else {html! {<section><h3>{"固定"}</h3>{for pinned.into_iter().map(|project| self.view_project_row(link, project))}</section>}}}
+                {if recent.is_empty() {html! {}} else {html! {<section><h3>{"最近"}</h3>{for recent.into_iter().map(|project| self.view_project_row(link, project))}</section>}}}
+                <section><h3>{"全部项目"}</h3>{for projects.into_iter().map(|project| self.view_project_row(link, project))}</section>
+            </div>
+        }
+    }
+
+    fn view_project_row(
+        &self,
+        link: &yew::html::Scope<Self>,
+        project: &agent_remote_protocol::ProjectSummary,
+    ) -> Html {
+        let id = project.id;
+        let pinned = self.pinned_projects.contains(&id);
+        html! {
+            <div class={classes!("project-row", (Some(id) == self.selected_project).then_some("active"))}>
+                <button class="project-main" onclick={link.callback(move |_| Msg::SelectProject(id))}><strong>{&project.display_name}</strong><small>{format!("{} · {} 个对话", project.short_path, project.conversation_count)}</small></button>
+                <button class="pin-button" title={if pinned {"取消固定"} else {"固定项目"}} onclick={link.callback(move |_| Msg::ToggleProjectPin(id))}>{if pinned {"★"} else {"☆"}}</button>
+            </div>
+        }
+    }
+
+    fn view_draft_chat(&self, link: &yew::html::Scope<Self>, snapshot: &Snapshot) -> Html {
+        let project_name = self
+            .selected_project
+            .and_then(|id| snapshot.projects.iter().find(|project| project.id == id))
+            .map_or("未知项目", |project| project.display_name.as_str());
+        html! {
+            <>
+                <header class="chat-header">
+                    <button class="mobile-menu" onclick={link.callback(|_| Msg::OpenSidebar)}>{"☰"}</button>
+                    <div><p class="eyebrow">{format!("{} · {}", self.selected_provider, project_name)}</p><h1>{"新对话"}</h1><small>{"首次发送时才会创建远程会话"}</small></div>
+                </header>
+                <div class="timeline empty-draft"><p>{"写下第一条消息。当前项目的 Provider 默认设置会自动继承。"}</p></div>
+                {self.view_composer(link, false, None)}
+            </>
         }
     }
 
@@ -662,41 +1523,134 @@ impl App {
         html! {
             <>
                 <header class="chat-header">
-                    <div><p class="eyebrow">{format!("{} · {}", conversation.provider, project_name)}</p><h1>{&conversation.title}</h1></div>
+                    <button class="mobile-menu" onclick={link.callback(|_| Msg::OpenSidebar)}>{"☰"}</button>
+                    <div class="chat-title"><p class="eyebrow">{format!("{} · {}", conversation.provider, project_name)}</p>
+                        {if self.editing_title {html! {<div class="title-editor"><input value={self.title_draft.clone()} maxlength="80" oninput={link.callback(|event: InputEvent| Msg::TitleChanged(event.target_unchecked_into::<HtmlInputElement>().value()))}/><button onclick={link.callback(|_| Msg::SaveTitle)}>{"保存"}</button></div>}} else {html! {<button class="title-button" onclick={link.callback(|_| Msg::EditTitle)}><h1>{&conversation.title}</h1><span>{"✎"}</span></button>}}}
+                    </div>
                     <div class="header-controls">
-                        {if conversation.session_options.is_empty() { html! {
-                            <><span class="header-chip">{conversation.selected_model.as_deref().unwrap_or("Provider 默认模型")}</span><span class="header-chip">{conversation.selected_effort.as_deref().unwrap_or("默认 effort")}</span></>
-                        }} else { html! {
-                            {for conversation.session_options.iter().map(|option| {
-                                let option_id = option.id.clone();
-                                html! {
-                                    <label class="header-select"><span>{&option.display_name}</span><select disabled={running} onchange={link.callback(move |event: Event| Msg::SetSessionOption(option_id.clone(), event.target_unchecked_into::<HtmlSelectElement>().value()))}>
-                                        {for option.values.iter().map(|value| html! { <option value={value.value.clone()} selected={value.value == option.current_value}>{&value.display_name}</option> })}
-                                    </select></label>
-                                }
-                            })}
-                        }}}
                         <span class={classes!("state-pill", state_class(conversation.state))}>{state_label(conversation.state)}</span>
                     </div>
                 </header>
                 <div class="timeline">
-                    {for snapshot.timeline.iter().filter(|item| item.conversation_id == conversation.id).map(|item| self.view_timeline_item(link, item))}
+                    {if self.history_exhausted.contains(&conversation.id) {html! {}} else {html! {<button class="load-older" onclick={link.callback(|_| Msg::LoadOlder)}>{"加载更早消息"}</button>}}}
+                    {self.view_timeline(link, &snapshot.timeline.iter().filter(|item| item.conversation_id == conversation.id).collect::<Vec<_>>())}
                 </div>
-                <footer class="composer">
-                    <textarea
-                        placeholder={if running {"输入追加指令（Provider 支持时可用）"} else {"发送文字消息…"}}
-                        value={self.composer.clone()}
-                        oninput={link.callback(|event: InputEvent| Msg::ComposerChanged(event.target_unchecked_into::<HtmlTextAreaElement>().value()))}
-                    />
-                    <div class="composer-actions">
-                        {if running { html! { <button class="stop" onclick={link.callback(|_| Msg::Interrupt)}>{"停止"}</button> } } else { html! {} }}
-                        {if running && capability.is_some_and(|capability| capability.supports_steer) {
-                            html! { <button class="secondary" onclick={link.callback(|_| Msg::Steer)} disabled={self.composer.trim().is_empty()}>{"追加指令"}</button> }
-                        } else { html! {} }}
-                        <button class="primary" onclick={link.callback(|_| Msg::Send)} disabled={running || self.composer.trim().is_empty()}>{"发送"}</button>
-                    </div>
-                </footer>
+                {self.view_composer(link, running, capability)}
             </>
+        }
+    }
+
+    fn view_composer(
+        &self,
+        link: &yew::html::Scope<Self>,
+        running: bool,
+        capability_override: Option<&ProviderCapability>,
+    ) -> Html {
+        let capability = capability_override.or_else(|| self.selected_capability());
+        let conversation = self.selected_conversation_ref();
+        let selected_model = conversation
+            .and_then(|conversation| conversation.selected_model.as_deref())
+            .or(self.selected_model.as_deref());
+        let selected_effort = conversation
+            .and_then(|conversation| conversation.selected_effort.as_deref())
+            .or(self.selected_effort.as_deref());
+        let models = capability.map_or(&[][..], |capability| capability.models.as_slice());
+        let efforts = models
+            .iter()
+            .find(|model| Some(model.id.as_str()) == selected_model)
+            .map_or(&[][..], |model| model.effort_options.as_slice());
+        let permission_option = conversation.and_then(|conversation| {
+            conversation
+                .session_options
+                .iter()
+                .find(|option| option.id == "permission_mode")
+        });
+        let selected_permission = permission_option
+            .map(|option| option.current_value.as_str())
+            .or(self.selected_permission.as_deref());
+        let attachment_capability = capability.map(|capability| &capability.attachments);
+        let accepts = attachment_capability
+            .map(|capability| capability.allowed_mime_types.join(","))
+            .unwrap_or_default();
+        let attachment_enabled = attachment_capability.is_some_and(|capability| {
+            capability.supported()
+                && self.pending_attachments.len() < usize::from(capability.max_count)
+                && self
+                    .pending_attachments
+                    .iter()
+                    .filter(|attachment| attachment.error.is_none())
+                    .map(|attachment| attachment.byte_len)
+                    .sum::<u64>()
+                    < capability.max_total_bytes
+        });
+        let files_on_change = link.callback(|event: Event| {
+            Msg::FilesSelected(files_from_input(
+                &event.target_unchecked_into::<HtmlInputElement>(),
+            ))
+        });
+        let ondrop = link.callback(|event: DragEvent| {
+            event.prevent_default();
+            Msg::FilesSelected(files_from_data_transfer(event.data_transfer()))
+        });
+        let onpaste = link.callback(|event: Event| {
+            let event: ClipboardEvent = event.unchecked_into();
+            Msg::FilesSelected(files_from_data_transfer(event.clipboard_data()))
+        });
+        html! {
+            <footer class="composer" {ondrop} ondragover={yew::Callback::from(|event: DragEvent| event.prevent_default())} {onpaste}>
+                {if self.pending_attachments.is_empty() {html! {}} else {html! {<div class="attachment-chips">{for self.pending_attachments.iter().map(|attachment| {
+                    let id = attachment.id;
+                    html! {<span class={classes!(attachment.error.is_some().then_some("failed"))}><b>{&attachment.file_name}</b><small>{attachment.error.as_deref().unwrap_or(if attachment.bytes.is_some() {"已就绪"} else {"读取中…"})}</small><button onclick={link.callback(move |_| Msg::RemoveAttachment(id))}>{"×"}</button></span>}
+                })}</div>}}}
+                <textarea
+                    placeholder={if running {"输入追加指令（Provider 支持时可用）"} else {"发送消息…"}}
+                    value={self.composer.clone()}
+                    oninput={link.callback(|event: InputEvent| Msg::ComposerChanged(event.target_unchecked_into::<HtmlTextAreaElement>().value()))}
+                />
+                <div class="composer-bar">
+                    <div class="composer-left">
+                        <label class={classes!("attachment-action", (!attachment_enabled).then_some("disabled"))} title={attachment_capability.map_or("当前 Provider 不支持附件".to_owned(), |capability| format!("最多 {} 个，每个 {} MiB，总计 {} MiB", capability.max_count, capability.max_bytes / 1024 / 1024, capability.max_total_bytes / 1024 / 1024))}><span>{"＋"}</span><span class="action-label">{"附件"}</span><input type="file" multiple=true accept={accepts} disabled={!attachment_enabled} onchange={files_on_change}/></label>
+                        {if let Some(option) = permission_option {html! {<select class="permission-select" disabled={running} title="权限" onchange={{let id=option.id.clone(); link.callback(move |event: Event| Msg::SetSessionOption(id.clone(), event.target_unchecked_into::<HtmlSelectElement>().value()))}}>{for option.values.iter().map(|value| html! {<option value={value.value.clone()} selected={value.value == option.current_value}>{&value.display_name}</option>})}</select>}} else if let Some(capability) = capability {html! {<select class="permission-select" title="权限" disabled={capability.permission_modes.is_empty()} onchange={link.callback(|event: Event| Msg::SelectPermission(nonempty(event.target_unchecked_into::<HtmlSelectElement>().value())))}><option value="" selected={selected_permission.is_none()}>{"Provider 按次审批"}</option>{for capability.permission_modes.iter().map(|mode| html! {<option value={mode.id.clone()} selected={Some(mode.id.as_str()) == selected_permission}>{&mode.display_name}</option>})}</select>}} else {html! {}}}
+                    </div>
+                    <div class="composer-right">
+                        <div class="model-effort" title="模型 · effort">
+                            <select disabled={running || models.is_empty()} onchange={if conversation.is_some() {{link.callback(|event: Event| Msg::SetSessionOption("model".to_owned(), event.target_unchecked_into::<HtmlSelectElement>().value()))}} else {{link.callback(|event: Event| Msg::SelectModel(nonempty(event.target_unchecked_into::<HtmlSelectElement>().value())))}}}>{for models.iter().map(|model| html! {<option value={model.id.clone()} selected={Some(model.id.as_str()) == selected_model}>{&model.display_name}</option>})}</select>
+                            {if efforts.is_empty() {html! {}} else {html! {<><span>{"·"}</span><select disabled={running} onchange={if conversation.is_some() {{link.callback(|event: Event| Msg::SetSessionOption("reasoning_effort".to_owned(), event.target_unchecked_into::<HtmlSelectElement>().value()))}} else {{link.callback(|event: Event| Msg::SelectEffort(nonempty(event.target_unchecked_into::<HtmlSelectElement>().value())))}}}>{for efforts.iter().map(|effort| html! {<option value={effort.id.clone()} selected={Some(effort.id.as_str()) == selected_effort}>{&effort.display_name}</option>})}</select></>}}}
+                        </div>
+                        {if running {html! {<button class="stop" onclick={link.callback(|_| Msg::Interrupt)}>{"停止"}</button>}} else {html! {}}}
+                        {if running && capability.is_some_and(|capability| capability.supports_steer) {html! {<button class="secondary" onclick={link.callback(|_| Msg::Steer)} disabled={self.composer.trim().is_empty()}>{"追加"}</button>}} else {html! {}}}
+                        <button class="send-button" onclick={link.callback(|_| Msg::Send)} disabled={!self.connected || running || self.pending_send.is_some() || self.composer.trim().is_empty() || self.pending_attachments.iter().any(|attachment| attachment.bytes.is_none() || attachment.error.is_some())}>{if self.pending_send.is_some() {"…"} else {"↑"}}</button>
+                    </div>
+                </div>
+            </footer>
+        }
+    }
+
+    fn view_timeline(&self, link: &yew::html::Scope<Self>, items: &[&TimelineItem]) -> Html {
+        let mut rendered = Vec::new();
+        let mut index = 0;
+        while index < items.len() {
+            if is_activity(&items[index].kind) {
+                let start = index;
+                while index < items.len() && is_activity(&items[index].kind) {
+                    index += 1;
+                }
+                rendered.push(self.view_activity_group(link, &items[start..index]));
+            } else {
+                rendered.push(self.view_timeline_item(link, items[index]));
+                index += 1;
+            }
+        }
+        html! {{for rendered}}
+    }
+
+    fn view_activity_group(&self, link: &yew::html::Scope<Self>, items: &[&TimelineItem]) -> Html {
+        let summary = activity_summary(items);
+        html! {
+            <details class="activity-group">
+                <summary><span>{"⌁"}</span><strong>{summary}</strong><small>{format!("{} 项", items.len())}</small></summary>
+                <div class="activity-details">{for items.iter().map(|item| self.view_timeline_item(link, item))}</div>
+            </details>
         }
     }
 
@@ -774,6 +1728,7 @@ impl App {
 fn open_socket(
     context: &Context<App>,
     config: &ConnectionConfig,
+    generation: u64,
 ) -> Result<(WebSocket, SocketCallbacks), String> {
     let base = config.origin.trim_end_matches('/');
     let websocket_origin = if let Some(rest) = base.strip_prefix("https://") {
@@ -794,7 +1749,7 @@ fn open_socket(
 
     let link = context.link().clone();
     let open = Closure::wrap(
-        Box::new(move |_: Event| link.send_message(Msg::Opened)) as Box<dyn FnMut(_)>
+        Box::new(move |_: Event| link.send_message(Msg::Opened(generation))) as Box<dyn FnMut(_)>,
     );
     socket.set_onopen(Some(open.as_ref().unchecked_ref()));
 
@@ -811,14 +1766,16 @@ fn open_socket(
     socket.set_onmessage(Some(message.as_ref().unchecked_ref()));
 
     let link = context.link().clone();
-    let error = Closure::wrap(
-        Box::new(move |_: Event| link.send_message(Msg::SocketError)) as Box<dyn FnMut(_)>,
-    );
+    let error =
+        Closure::wrap(
+            Box::new(move |_: Event| link.send_message(Msg::SocketError(generation)))
+                as Box<dyn FnMut(_)>,
+        );
     socket.set_onerror(Some(error.as_ref().unchecked_ref()));
 
     let link = context.link().clone();
     let close = Closure::wrap(Box::new(move |event: CloseEvent| {
-        link.send_message(Msg::Closed(event.reason()))
+        link.send_message(Msg::Closed(generation, event.reason()))
     }) as Box<dyn FnMut(_)>);
     socket.set_onclose(Some(close.as_ref().unchecked_ref()));
 
@@ -883,6 +1840,63 @@ fn save_credentials(credentials: &[StoredCredential]) {
     }
 }
 
+fn load_last_host() -> Option<HostId> {
+    window()
+        .and_then(|window| window.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(LAST_HOST_KEY).ok().flatten())
+        .and_then(|value| Uuid::parse_str(&value).ok())
+        .map(HostId)
+}
+
+fn save_last_host(host_id: HostId) {
+    if let Some(storage) = window().and_then(|window| window.local_storage().ok().flatten()) {
+        let _ = storage.set_item(LAST_HOST_KEY, &host_id.to_string());
+    }
+}
+
+fn cache_key(host_id: HostId) -> String {
+    format!("{CACHE_PREFIX}{host_id}")
+}
+
+fn load_cache(host_id: HostId) -> Option<AppCache> {
+    window()
+        .and_then(|window| window.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(&cache_key(host_id)).ok().flatten())
+        .and_then(|json| serde_json::from_str::<AppCache>(&json).ok())
+        .filter(|cache| cache.version == 2 && cache.host_id == host_id)
+}
+
+fn save_cache(cache: &AppCache) {
+    if let Some(storage) = window().and_then(|window| window.local_storage().ok().flatten())
+        && let Ok(json) = serde_json::to_string(cache)
+    {
+        let _ = storage.set_item(&cache_key(cache.host_id), &json);
+    }
+}
+
+fn remove_cache(host_id: HostId) {
+    if let Some(storage) = window().and_then(|window| window.local_storage().ok().flatten()) {
+        let _ = storage.remove_item(&cache_key(host_id));
+    }
+}
+
+fn files_from_input(input: &HtmlInputElement) -> Vec<File> {
+    input.files().map(files_from_list).unwrap_or_default()
+}
+
+fn files_from_data_transfer(transfer: Option<DataTransfer>) -> Vec<File> {
+    transfer
+        .and_then(|transfer| transfer.files())
+        .map(files_from_list)
+        .unwrap_or_default()
+}
+
+fn files_from_list(files: web_sys::FileList) -> Vec<File> {
+    (0..files.length())
+        .filter_map(|index| files.get(index))
+        .collect()
+}
+
 fn browser_device_name() -> String {
     "Browser device".to_owned()
 }
@@ -906,6 +1920,42 @@ fn upsert_conversation(conversations: &mut Vec<Conversation>, incoming: Conversa
         conversations.push(incoming);
     }
     conversations.sort_by_key(|item| std::cmp::Reverse(item.updated_at_ms));
+}
+
+fn upsert_project(
+    projects: &mut Vec<agent_remote_protocol::ProjectSummary>,
+    incoming: agent_remote_protocol::ProjectSummary,
+) {
+    if let Some(existing) = projects.iter_mut().find(|item| item.id == incoming.id) {
+        *existing = incoming;
+    } else {
+        projects.push(incoming);
+    }
+    projects.sort_by(|left, right| {
+        right
+            .last_activity_at_ms
+            .cmp(&left.last_activity_at_ms)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+    });
+}
+
+fn refresh_project_metrics(snapshot: &mut Snapshot, project_id: ProjectId) {
+    let conversations = snapshot
+        .conversations
+        .iter()
+        .filter(|conversation| conversation.project_id == project_id)
+        .collect::<Vec<_>>();
+    if let Some(project) = snapshot
+        .projects
+        .iter_mut()
+        .find(|project| project.id == project_id)
+    {
+        project.conversation_count = conversations.len() as u32;
+        project.last_activity_at_ms = conversations
+            .iter()
+            .map(|conversation| conversation.updated_at_ms)
+            .max();
+    }
 }
 
 fn upsert_timeline_item(items: &mut Vec<TimelineItem>, incoming: TimelineItem) {
@@ -976,6 +2026,74 @@ fn state_class_for_item(status: agent_remote_protocol::ItemStatus) -> &'static s
     }
 }
 
+fn is_activity(kind: &TimelineItemKind) -> bool {
+    matches!(
+        kind,
+        TimelineItemKind::Progress { .. }
+            | TimelineItemKind::ToolCall { .. }
+            | TimelineItemKind::Command { .. }
+            | TimelineItemKind::FileChange { .. }
+            | TimelineItemKind::Approval { .. }
+            | TimelineItemKind::Error { .. }
+    )
+}
+
+fn activity_summary(items: &[&TimelineItem]) -> String {
+    let mut files = 0;
+    let mut commands = 0;
+    let mut tests = 0;
+    let mut tools = 0;
+    let mut approvals = 0;
+    let mut errors = 0;
+    for item in items {
+        match &item.kind {
+            TimelineItemKind::FileChange { .. } => files += 1,
+            TimelineItemKind::Command { .. } => commands += 1,
+            TimelineItemKind::Progress { kind, .. } => match kind {
+                agent_remote_protocol::ProgressKind::File => files += 1,
+                agent_remote_protocol::ProgressKind::Command => commands += 1,
+                agent_remote_protocol::ProgressKind::Test => tests += 1,
+                _ => tools += 1,
+            },
+            TimelineItemKind::ToolCall { .. } => tools += 1,
+            TimelineItemKind::Approval { .. } => approvals += 1,
+            TimelineItemKind::Error { .. } => errors += 1,
+            _ => {}
+        }
+    }
+    let mut parts = Vec::new();
+    for (count, label) in [
+        (files, "文件"),
+        (commands, "命令"),
+        (tests, "测试"),
+        (tools, "工具"),
+        (approvals, "审批"),
+        (errors, "错误"),
+    ] {
+        if count > 0 {
+            parts.push(format!("{label} {count}"));
+        }
+    }
+    format!("活动 · {}", parts.join(" · "))
+}
+
 fn summary_pair(input: &Option<String>, output: &Option<String>) -> Html {
-    html! { <>{input.as_ref().map(|value| html! {<pre>{value}</pre>}).unwrap_or_default()}{output.as_ref().map(|value| html! {<pre>{value}</pre>}).unwrap_or_default()}</> }
+    let input = visible_tool_summary(input.as_deref());
+    let output =
+        visible_tool_summary(output.as_deref()).filter(|value| Some(value) != input.as_ref());
+    html! { <>{input.map(|value| html! {<pre>{value}</pre>}).unwrap_or_default()}{output.map(|value| html! {<pre>{value}</pre>}).unwrap_or_default()}</> }
+}
+
+fn visible_tool_summary(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() || matches!(value, "[]" | "{}" | "null" | "\"\"") {
+        return None;
+    }
+    if (value.starts_with('{') || value.starts_with('['))
+        && serde_json::from_str::<serde_json::Value>(value).is_ok()
+    {
+        Some("Provider 返回了结构化详情（已隐藏）".to_owned())
+    } else {
+        Some(value.to_owned())
+    }
 }

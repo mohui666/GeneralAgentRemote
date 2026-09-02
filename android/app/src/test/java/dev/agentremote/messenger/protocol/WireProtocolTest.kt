@@ -4,8 +4,11 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory
 import dev.agentremote.messenger.model.ConnectionTarget
+import dev.agentremote.messenger.model.PromptAttachment
+import dev.agentremote.messenger.model.ProviderId
 import dev.agentremote.messenger.model.ServerEvent
 import dev.agentremote.messenger.model.StoredCredential
+import dev.agentremote.messenger.model.TimelinePageCursor
 import java.nio.ByteBuffer
 import java.util.UUID
 import org.junit.Assert.assertArrayEquals
@@ -67,6 +70,55 @@ class WireProtocolTest {
         val status = event as ServerEvent.HostStatus
         assertEquals(hostId, status.hostId)
         assertEquals(true, status.online)
+    }
+
+    @Test
+    fun encodesLazyStartWithProviderSelectionAndAttachmentBytes() {
+        val commandId = UUID.fromString("11111111-2222-3333-4444-555555555555")
+        val conversationId = UUID.fromString("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        val projectId = UUID.fromString("01234567-89ab-cdef-0123-456789abcdef")
+        val attachmentId = UUID.fromString("99999999-8888-7777-6666-555555555555")
+        val content = byteArrayOf(1, 3, 5, 7)
+        val root: JsonNode = mapper.readTree(
+            WireProtocol.startConversation(
+                commandId = commandId,
+                conversationId = conversationId,
+                projectId = projectId,
+                provider = ProviderId.CODEX,
+                model = "gpt-test",
+                effort = "high",
+                permissionMode = "workspace-write",
+                text = "hello",
+                attachments = listOf(
+                    PromptAttachment(attachmentId, "reference.png", "image/png", content),
+                ),
+            ),
+        )
+        val message = root["message"]
+        assertEquals("start_conversation", message["type"].asText())
+        assertArrayEquals(uuidBytes(conversationId), message["conversation_id"].binaryValue())
+        assertArrayEquals(uuidBytes(projectId), message["project_id"].binaryValue())
+        assertEquals("codex", message["provider"].asText())
+        assertEquals("workspace-write", message["permission_mode"].asText())
+        assertArrayEquals(content, message["attachments"][0]["bytes"].binaryValue())
+    }
+
+    @Test
+    fun encodesStableTimelinePageCursor() {
+        val conversationId = UUID.fromString("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        val itemId = UUID.fromString("00000000-1111-2222-3333-444444444444")
+        val root: JsonNode = mapper.readTree(
+            WireProtocol.getConversationPage(
+                conversationId,
+                TimelinePageCursor(createdAtMs = 1234L, itemId = itemId),
+                100,
+            ),
+        )
+        val message = root["message"]
+        assertEquals("get_conversation_page", message["type"].asText())
+        assertEquals(1234L, message["before"]["created_at_ms"].asLong())
+        assertArrayEquals(uuidBytes(itemId), message["before"]["item_id"].binaryValue())
+        assertEquals(100, message["limit"].asInt())
     }
 
     private fun uuidBytes(uuid: UUID): ByteArray = ByteBuffer.allocate(16)

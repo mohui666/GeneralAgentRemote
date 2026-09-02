@@ -36,11 +36,47 @@ data class SessionOption(
     val values: List<SessionOptionValue>,
 )
 
+enum class PermissionRisk(val wire: String) {
+    STANDARD("standard"),
+    ELEVATED("elevated");
+
+    companion object {
+        fun fromWire(value: String): PermissionRisk = entries.first { it.wire == value }
+    }
+}
+
+data class PermissionModeOption(
+    val id: String,
+    val displayName: String,
+    val description: String,
+    val risk: PermissionRisk,
+)
+
+data class AttachmentCapability(
+    val allowedMimeTypes: List<String>,
+    val maxCount: Int,
+    val maxBytes: Long,
+    val maxTotalBytes: Long,
+) {
+    val supported: Boolean
+        get() = maxCount > 0 && maxBytes > 0 && maxTotalBytes > 0 && allowedMimeTypes.isNotEmpty()
+}
+
+data class PromptAttachment(
+    val id: UUID,
+    val fileName: String,
+    val mimeType: String,
+    val bytes: ByteArray,
+)
+
 data class ProjectSummary(
     val id: UUID,
     val displayName: String,
+    val shortPath: String,
     val enabledProviders: List<ProviderId>,
     val valid: Boolean,
+    val lastActivityAtMs: Long?,
+    val conversationCount: Int,
 )
 
 data class SessionSummary(
@@ -57,7 +93,13 @@ data class ProviderCapability(
     val detail: String?,
     val models: List<ModelOption>,
     val supportsSessionList: Boolean,
+    val supportsHistory: Boolean,
+    val supportsIncrementalSync: Boolean,
+    val supportsRename: Boolean,
     val supportsSteer: Boolean,
+    val permissionModes: List<PermissionModeOption>,
+    val defaultPermissionMode: String?,
+    val attachments: AttachmentCapability,
     val sessions: List<SessionSummary>,
     val limitation: String?,
 ) {
@@ -71,6 +113,8 @@ data class Conversation(
     val projectId: UUID,
     val nativeSessionId: String,
     val title: String,
+    val titleSource: String,
+    val titleUpdatedAtMs: Long,
     val selectedModel: String?,
     val selectedEffort: String?,
     val state: String,
@@ -136,6 +180,11 @@ data class TimelineItem(
     val content: TimelineContent,
 )
 
+data class TimelinePageCursor(
+    val createdAtMs: Long,
+    val itemId: UUID,
+)
+
 data class AttachmentData(
     val id: UUID,
     val conversationId: UUID,
@@ -184,7 +233,24 @@ data class ConnectionTarget(
 sealed interface ServerEvent {
     data class Paired(val credential: StoredCredential) : ServerEvent
     data class Authenticated(val hostId: UUID, val deviceId: UUID) : ServerEvent
-    data class SnapshotReceived(val snapshot: Snapshot) : ServerEvent
+    data class SnapshotReceived(val snapshot: Snapshot, val encoded: ByteArray) : ServerEvent
+    data class ProjectsUpdated(
+        val provider: ProviderId,
+        val projects: List<ProjectSummary>,
+        val capabilities: List<ProviderCapability>,
+    ) : ServerEvent
+    data class ProjectSyncCompleted(
+        val commandId: UUID,
+        val projectId: UUID,
+        val provider: ProviderId,
+        val conversationsSynced: Int,
+        val fullHistoryFallback: Boolean,
+    ) : ServerEvent
+    data class ConversationPage(
+        val conversationId: UUID,
+        val items: List<TimelineItem>,
+        val nextBefore: TimelinePageCursor?,
+    ) : ServerEvent
     data class ProviderChanged(val capability: ProviderCapability) : ServerEvent
     data class ConversationUpserted(val conversation: Conversation) : ServerEvent
     data class TimelineUpserted(val item: TimelineItem) : ServerEvent

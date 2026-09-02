@@ -2,6 +2,9 @@ package dev.agentremote.messenger.ui
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
@@ -51,6 +54,7 @@ import androidx.compose.material.icons.outlined.TouchApp
 import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.ArrowUpward
+import androidx.compose.material.icons.rounded.AttachFile
 import androidx.compose.material.icons.rounded.ChatBubbleOutline
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.ChevronRight
@@ -120,6 +124,9 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.agentremote.messenger.model.Conversation
+import dev.agentremote.messenger.model.PermissionModeOption
+import dev.agentremote.messenger.model.PermissionRisk
+import dev.agentremote.messenger.model.PromptAttachment
 import dev.agentremote.messenger.model.ProviderCapability
 import dev.agentremote.messenger.model.ProviderId
 import dev.agentremote.messenger.model.SessionOption
@@ -384,7 +391,11 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
     val snapshot = requireNotNull(state.snapshot)
     val drawerState = androidx.compose.material3.rememberDrawerState(androidx.compose.material3.DrawerValue.Closed)
     val scope = rememberCoroutineScope()
-    val selectedConversation = snapshot.conversations.find { it.id == state.selectedConversationId }
+    val selectedConversation = snapshot.conversations.find {
+        it.id == state.selectedConversationId &&
+            it.projectId == state.selectedProjectId &&
+            it.provider == state.selectedProvider
+    }
     var menuExpanded by rememberSaveable { mutableStateOf(false) }
     var sortMode by rememberSaveable { mutableStateOf(HomeSort.AGENT) }
 
@@ -398,10 +409,15 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
                     viewModel.showConversationList()
                     scope.launch { drawerState.close() }
                 },
+                onProvider = viewModel::selectProvider,
+                onProjectSearch = viewModel::setProjectSearch,
+                onPinProject = viewModel::toggleProjectPin,
                 onNewConversation = {
                     viewModel.showNewConversation()
                     scope.launch { drawerState.close() }
                 },
+                onRetryNow = viewModel::retryNow,
+                onStopRetrying = viewModel::stopRetrying,
                 onDisconnect = viewModel::disconnect,
             )
         },
@@ -413,11 +429,9 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
                 RemoteTopBar(
                     hostName = snapshot.hostName,
                     online = state.online,
-                    showConversationActions = state.showingNewConversation || selectedConversation != null,
                     menuExpanded = menuExpanded,
                     sortMode = sortMode,
                     onNavigation = { scope.launch { drawerState.open() } },
-                    onNewConversation = viewModel::showNewConversation,
                     onToggleMenu = { menuExpanded = !menuExpanded },
                     onDismissMenu = { menuExpanded = false },
                     onSort = {
@@ -456,7 +470,12 @@ private enum class HomeSort { AGENT, RECENT, ACTIVE }
 private fun RemoteDrawer(
     state: RemoteUiState,
     onProject: (UUID) -> Unit,
+    onProvider: (ProviderId) -> Unit,
+    onProjectSearch: (String) -> Unit,
+    onPinProject: (UUID) -> Unit,
     onNewConversation: () -> Unit,
+    onRetryNow: () -> Unit,
+    onStopRetrying: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
     val snapshot = requireNotNull(state.snapshot)
@@ -465,7 +484,7 @@ private fun RemoteDrawer(
         drawerContainerColor = RemoteSurface,
         drawerContentColor = RemoteText,
     ) {
-        Column(Modifier.statusBarsPadding().padding(horizontal = 18.dp, vertical = 16.dp)) {
+        Column(Modifier.statusBarsPadding().padding(horizontal = 18.dp, vertical = 14.dp)) {
             Text("Agent Remote", style = MaterialTheme.typography.titleLarge)
             Row(
                 Modifier.padding(top = 6.dp),
@@ -476,46 +495,118 @@ private fun RemoteDrawer(
                 Text(snapshot.hostName, color = RemoteMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             Spacer(Modifier.height(10.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ProviderId.entries.forEach { provider ->
+                    OutlinedButton(
+                        onClick = { onProvider(provider) },
+                        modifier = Modifier.weight(1f).height(40.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(
+                            1.dp,
+                            if (state.selectedProvider == provider) RemotePurple else RemoteBorder,
+                        ),
+                    ) { Text(provider.label, style = MaterialTheme.typography.labelMedium) }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
             Button(
                 onClick = onNewConversation,
+                enabled = state.selectedProjectId != null && state.selectedProvider != null,
                 modifier = Modifier.fillMaxWidth().height(50.dp),
                 shape = RoundedCornerShape(16.dp),
             ) {
                 RemoteIcon(RemoteGlyph.Compose, null, Modifier.size(20.dp))
                 Spacer(Modifier.width(8.dp))
-                Text("新建会话")
+                Text("新建对话")
             }
         }
         HorizontalDivider(color = RemoteBorder)
-        Text(
-            "项目",
-            modifier = Modifier.padding(horizontal = 20.dp, vertical = 14.dp),
-            color = RemoteMuted,
-            style = MaterialTheme.typography.labelMedium,
+        OutlinedTextField(
+            value = state.projectSearch,
+            onValueChange = onProjectSearch,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
+            singleLine = true,
+            label = { Text("搜索项目") },
+            leadingIcon = { RemoteIcon(RemoteGlyph.Search, null, Modifier.size(18.dp), RemoteMuted) },
+            shape = RoundedCornerShape(14.dp),
         )
+        val matchingProjects = snapshot.projects
+            .filter {
+                it.valid && state.selectedProvider in it.enabledProviders &&
+                    (state.projectSearch.isBlank() ||
+                        it.displayName.contains(state.projectSearch, ignoreCase = true) ||
+                        it.shortPath.contains(state.projectSearch, ignoreCase = true))
+            }
+            .sortedByDescending { it.lastActivityAtMs }
+        val pinnedProjects = matchingProjects.filter { it.id in state.pinnedProjects }
+        val recentProjects = state.recentProjects.mapNotNull { recentId ->
+            matchingProjects.find { it.id == recentId && it.id !in state.pinnedProjects }
+        }
+        val remainingProjects = matchingProjects.filter {
+            it.id !in state.pinnedProjects && it.id !in state.recentProjects
+        }
         LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 10.dp)) {
-            items(snapshot.projects.filter { it.valid }, key = { it.id }) { project ->
-                val count = snapshot.conversations.count { it.projectId == project.id }
-                NavigationDrawerItem(
-                    icon = { RemoteIcon(RemoteGlyph.Folder, null, Modifier.size(22.dp), RemoteMuted) },
-                    label = {
-                        Column {
-                            Text(project.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text("$count 个会话", color = RemoteMuted, style = MaterialTheme.typography.labelSmall)
-                        }
-                    },
-                    selected = state.selectedProjectId == project.id && state.selectedConversationId == null,
-                    onClick = { onProject(project.id) },
-                    colors = androidx.compose.material3.NavigationDrawerItemDefaults.colors(
-                        selectedContainerColor = RemoteSurfaceRaised,
-                        unselectedContainerColor = Color.Transparent,
-                        selectedTextColor = RemoteText,
-                        unselectedTextColor = RemoteText,
-                    ),
-                )
+            listOf(
+                "固定" to pinnedProjects,
+                "最近" to recentProjects,
+                "全部项目" to remainingProjects,
+            ).filter { it.second.isNotEmpty() }.forEach { (section, projects) ->
+                item(key = "project-section-$section") {
+                    Text(
+                        section,
+                        modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 5.dp),
+                        color = RemoteMuted,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                items(projects, key = { it.id }) { project ->
+                    NavigationDrawerItem(
+                        icon = { RemoteIcon(RemoteGlyph.Folder, null, Modifier.size(22.dp), RemoteMuted) },
+                        label = {
+                            Column {
+                                Text(project.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(
+                                    "${project.shortPath} · ${project.conversationCount} 个对话",
+                                    color = RemoteMuted,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        },
+                        badge = {
+                            TextButton(onClick = { onPinProject(project.id) }) {
+                                Text(if (project.id in state.pinnedProjects) "★" else "☆")
+                            }
+                        },
+                        selected = state.selectedProjectId == project.id,
+                        onClick = { onProject(project.id) },
+                        colors = androidx.compose.material3.NavigationDrawerItemDefaults.colors(
+                            selectedContainerColor = RemoteSurfaceRaised,
+                            unselectedContainerColor = Color.Transparent,
+                            selectedTextColor = RemoteText,
+                            unselectedTextColor = RemoteText,
+                        ),
+                    )
+                }
             }
         }
         HorizontalDivider(color = RemoteBorder)
+        if (!state.online) {
+            TextButton(
+                onClick = if (state.retryEnabled) onStopRetrying else onRetryNow,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp).height(44.dp),
+            ) {
+                RemoteIcon(
+                    if (state.retryEnabled) RemoteGlyph.Stop else RemoteGlyph.Recent,
+                    null,
+                    Modifier.size(19.dp),
+                    RemoteMuted,
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(if (state.retryEnabled) "停止自动重连" else "立即重连", color = RemoteMuted)
+            }
+        }
         TextButton(
             onClick = onDisconnect,
             modifier = Modifier.fillMaxWidth().padding(10.dp).height(48.dp),
@@ -532,11 +623,9 @@ private fun RemoteDrawer(
 private fun RemoteTopBar(
     hostName: String,
     online: Boolean,
-    showConversationActions: Boolean,
     menuExpanded: Boolean,
     sortMode: HomeSort,
     onNavigation: () -> Unit,
-    onNewConversation: () -> Unit,
     onToggleMenu: () -> Unit,
     onDismissMenu: () -> Unit,
     onSort: (HomeSort) -> Unit,
@@ -575,52 +664,21 @@ private fun RemoteTopBar(
                 )
             }
         }
-        if (showConversationActions) {
-            Row(
-                Modifier
-                    .align(Alignment.CenterEnd)
-                    .clip(RoundedCornerShape(26.dp))
-                    .background(RemoteSurfaceRaised)
-                    .border(1.dp, RemoteBorder, RoundedCornerShape(26.dp)),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                IconButton(onClick = onNewConversation, modifier = Modifier.size(50.dp)) {
-                    RemoteIcon(RemoteGlyph.Compose, "新建会话", Modifier.size(24.dp), RemoteText)
-                }
-                Box {
-                    IconButton(onClick = onToggleMenu, modifier = Modifier.size(50.dp)) {
-                        RemoteIcon(RemoteGlyph.More, "更多选项", Modifier.size(24.dp))
-                    }
-                    RemoteOverflowMenu(
-                        expanded = menuExpanded,
-                        sortMode = sortMode,
-                        online = online,
-                        onDismiss = onDismissMenu,
-                        onSort = onSort,
-                        onShowProjects = onShowProjects,
-                        onNewConversation = onNewConversation,
-                        onDisconnect = onDisconnect,
-                    )
-                }
-            }
-        } else {
-            Box(Modifier.align(Alignment.CenterEnd)) {
-                FloatingIconButton(
-                    glyph = RemoteGlyph.More,
-                    description = "更多选项",
-                    onClick = onToggleMenu,
-                )
-                RemoteOverflowMenu(
-                    expanded = menuExpanded,
-                    sortMode = sortMode,
-                    online = online,
-                    onDismiss = onDismissMenu,
-                    onSort = onSort,
-                    onShowProjects = onShowProjects,
-                    onNewConversation = onNewConversation,
-                    onDisconnect = onDisconnect,
-                )
-            }
+        Box(Modifier.align(Alignment.CenterEnd)) {
+            FloatingIconButton(
+                glyph = RemoteGlyph.More,
+                description = "更多选项",
+                onClick = onToggleMenu,
+            )
+            RemoteOverflowMenu(
+                expanded = menuExpanded,
+                sortMode = sortMode,
+                online = online,
+                onDismiss = onDismissMenu,
+                onSort = onSort,
+                onShowProjects = onShowProjects,
+                onDisconnect = onDisconnect,
+            )
         }
     }
 }
@@ -633,7 +691,6 @@ private fun RemoteOverflowMenu(
     onDismiss: () -> Unit,
     onSort: (HomeSort) -> Unit,
     onShowProjects: () -> Unit,
-    onNewConversation: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
     DropdownMenu(
@@ -651,10 +708,6 @@ private fun RemoteOverflowMenu(
         HorizontalDivider(Modifier.padding(vertical = 8.dp), color = RemoteBorder)
         MenuSectionLabel("管理")
         RemoteMenuRow(RemoteGlyph.Folder, "项目列表") { onShowProjects() }
-        RemoteMenuRow(RemoteGlyph.Compose, "新建会话") {
-            onDismiss()
-            onNewConversation()
-        }
         RemoteMenuRow(RemoteGlyph.Disconnect, "断开 Host", tint = MaterialTheme.colorScheme.error) { onDisconnect() }
         HorizontalDivider(Modifier.padding(vertical = 8.dp), color = RemoteBorder)
         Row(
@@ -703,13 +756,12 @@ private fun RemoteMenuRow(
 @Composable
 private fun RemoteHomeScreen(state: RemoteUiState, sortMode: HomeSort, viewModel: RemoteViewModel) {
     val snapshot = requireNotNull(state.snapshot)
-    val projects = snapshot.projects.filter { it.valid }
-    val selectedProject = projects.find { it.id == state.selectedProjectId }
+    val selectedProject = snapshot.projects.find { it.valid && it.id == state.selectedProjectId }
     var search by rememberSaveable { mutableStateOf("") }
-    var projectMenuExpanded by rememberSaveable { mutableStateOf(false) }
     val filtered = snapshot.conversations
         .asSequence()
-        .filter { selectedProject == null || it.projectId == selectedProject.id }
+        .filter { selectedProject != null && it.projectId == selectedProject.id }
+        .filter { state.selectedProvider == null || it.provider == state.selectedProvider }
         .filter { search.isBlank() || it.title.contains(search.trim(), ignoreCase = true) }
         .let { conversations ->
             when (sortMode) {
@@ -727,58 +779,18 @@ private fun RemoteHomeScreen(state: RemoteUiState, sortMode: HomeSort, viewModel
             style = MaterialTheme.typography.titleLarge,
         )
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 14.dp),
+            Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Box(Modifier.weight(1f)) {
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .height(56.dp)
-                        .clip(RoundedCornerShape(18.dp))
-                        .clickable { projectMenuExpanded = true }
-                        .padding(horizontal = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    RemoteIcon(RemoteGlyph.Folder, null, Modifier.size(27.dp))
-                    Spacer(Modifier.width(12.dp))
-                    Text(
-                        selectedProject?.displayName ?: "全部项目",
-                        modifier = Modifier.weight(1f),
-                        style = MaterialTheme.typography.titleLarge,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    RemoteIcon(RemoteGlyph.ChevronDown, null, Modifier.size(18.dp), RemoteMuted)
-                }
-                DropdownMenu(
-                    expanded = projectMenuExpanded,
-                    onDismissRequest = { projectMenuExpanded = false },
-                    modifier = Modifier.widthIn(min = 260.dp),
-                    shape = RoundedCornerShape(20.dp),
-                    containerColor = RemoteSurfaceRaised,
-                    border = BorderStroke(1.dp, RemoteBorder),
-                ) {
-                    projects.forEach { project ->
-                        DropdownMenuItem(
-                            leadingIcon = { RemoteIcon(RemoteGlyph.Folder, null, Modifier.size(20.dp), RemoteMuted) },
-                            text = { Text(project.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                            trailingIcon = {
-                                if (project.id == state.selectedProjectId) {
-                                    RemoteIcon(RemoteGlyph.Check, null, Modifier.size(18.dp))
-                                }
-                            },
-                            onClick = {
-                                projectMenuExpanded = false
-                                viewModel.selectProject(project.id)
-                            },
-                        )
-                    }
-                }
-            }
-            IconButton(onClick = viewModel::showNewConversation, modifier = Modifier.size(52.dp)) {
-                RemoteIcon(RemoteGlyph.Compose, "在此项目中新建会话", Modifier.size(25.dp), RemoteMuted)
-            }
+            RemoteIcon(RemoteGlyph.Folder, null, Modifier.size(27.dp))
+            Spacer(Modifier.width(12.dp))
+            Text(
+                selectedProject?.displayName ?: "请从侧栏选择项目",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.titleLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
         if (filtered.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -801,7 +813,6 @@ private fun RemoteHomeScreen(state: RemoteUiState, sortMode: HomeSort, viewModel
         HomeBottomBar(
             search = search,
             onSearch = { search = it },
-            onNewConversation = viewModel::showNewConversation,
         )
     }
 }
@@ -841,14 +852,13 @@ private fun ConversationListItem(conversation: Conversation, onClick: () -> Unit
 }
 
 @Composable
-private fun HomeBottomBar(search: String, onSearch: (String) -> Unit, onNewConversation: () -> Unit) {
+private fun HomeBottomBar(search: String, onSearch: (String) -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
             .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
             .padding(start = 18.dp, top = 12.dp, end = 18.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Surface(
             modifier = Modifier.weight(1f).height(52.dp),
@@ -882,114 +892,69 @@ private fun HomeBottomBar(search: String, onSearch: (String) -> Unit, onNewConve
                 },
             )
         }
-        FloatingIconButton(
-            glyph = RemoteGlyph.Compose,
-            description = "新建会话",
-            onClick = onNewConversation,
-            containerColor = RemotePurple,
-            contentColor = Color.White,
-            size = 54.dp,
-        )
     }
 }
 
 @Composable
 private fun NewConversationScreen(state: RemoteUiState, viewModel: RemoteViewModel) {
     val snapshot = requireNotNull(state.snapshot)
-    val projects = snapshot.projects.filter { it.valid }
-    val project = projects.find { it.id == state.selectedProjectId }
+    val project = snapshot.projects.find { it.id == state.selectedProjectId }
     val capability = snapshot.providerCapabilities.find {
         it.projectId == state.selectedProjectId && it.provider == state.selectedProvider
     }
-    val model = capability?.models?.find { it.id == state.selectedModel }
     Column(
         Modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .navigationBarsPadding()
-            .padding(horizontal = 20.dp, vertical = 18.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp),
+            .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
     ) {
-        Text("新建会话", style = MaterialTheme.typography.headlineMedium)
-        Text("选择项目与 Agent。模型和推理强度始终从当前 Provider 动态读取。", color = RemoteMuted)
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            color = RemoteSurface,
-            shape = RoundedCornerShape(26.dp),
-            border = BorderStroke(1.dp, RemoteBorder),
+        Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 13.dp)) {
+            Text("新对话", style = MaterialTheme.typography.titleLarge)
+            Text(
+                "${state.selectedProvider?.label ?: "Agent"} · ${project?.displayName ?: "请选择项目"}",
+                color = RemoteMuted,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Text("首次发送时才创建远程会话", color = RemoteMuted, style = MaterialTheme.typography.labelSmall)
+        }
+        Box(
+            Modifier.weight(1f).fillMaxWidth(),
+            contentAlignment = Alignment.Center,
         ) {
-            Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                Picker(
-                    label = "项目",
-                    entries = projects.map { PickerEntry(it.id, it.displayName) },
-                    selected = state.selectedProjectId,
-                    onSelect = viewModel::selectProject,
-                )
-                Picker(
-                    label = "Agent",
-                    entries = project?.enabledProviders.orEmpty().map { PickerEntry(it, it.label) },
-                    selected = state.selectedProvider,
-                    onSelect = viewModel::selectProvider,
-                )
-                Picker(
-                    label = "模型",
-                    entries = capability?.models.orEmpty().map { PickerEntry(it.id, it.displayName) },
-                    selected = state.selectedModel,
-                    onSelect = viewModel::selectModel,
-                    emptyLabel = "Provider 默认模型",
-                )
-                Picker(
-                    label = "推理强度",
-                    entries = model?.effortOptions.orEmpty().map { PickerEntry(it.id, it.displayName) },
-                    selected = state.selectedEffort,
-                    onSelect = viewModel::selectEffort,
-                    emptyLabel = "Provider 默认强度",
-                )
-                if (capability?.supportsSessionList == true) {
-                    Picker(
-                        label = "已有 Agent 会话（可选）",
-                        entries = listOf(PickerEntry<String?>(null, "新会话")) + capability.sessions.map {
-                            PickerEntry(it.nativeSessionId, it.title)
-                        },
-                        selected = state.selectedNativeSession,
-                        onSelect = viewModel::selectNativeSession,
-                    )
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                RemoteIcon(RemoteGlyph.Chat, null, Modifier.size(34.dp), RemoteMuted)
+                Spacer(Modifier.height(10.dp))
+                Text("写下第一条消息", color = RemoteMuted)
+                capability?.limitation?.let {
+                    Text(it, color = RemoteMuted, style = MaterialTheme.typography.labelSmall)
                 }
             }
         }
-        if (capability != null) {
-            ProviderStatus(capability)
-        }
-        Button(
-            onClick = viewModel::createConversation,
-            enabled = state.online && !state.creatingConversation && state.selectedProjectId != null && state.selectedProvider != null && capability?.ready == true,
-            modifier = Modifier.fillMaxWidth().height(54.dp),
-            shape = RoundedCornerShape(18.dp),
-        ) { Text(if (state.creatingConversation) "正在创建…" else "创建会话") }
-        if (projects.isEmpty()) {
-            Text("Host 没有有效授权项目。请先在电脑使用 project add。", color = MaterialTheme.colorScheme.error)
-        }
-    }
-}
-
-@Composable
-private fun ProviderStatus(capability: ProviderCapability) {
-    Surface(
-        color = if (capability.ready) Color(0xFF13291F) else RemoteSurfaceRaised,
-        shape = RoundedCornerShape(20.dp),
-        border = BorderStroke(1.dp, if (capability.ready) Color(0xFF285A40) else RemoteBorder),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Row(Modifier.padding(15.dp), verticalAlignment = Alignment.Top) {
-            OnlineDot(capability.ready)
-            Spacer(Modifier.width(10.dp))
-            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text("${capability.provider.label} · ${providerStateLabel(capability.state)}", fontWeight = FontWeight.SemiBold)
-                capability.version?.let { Text(it, color = RemoteMuted, style = MaterialTheme.typography.bodySmall) }
-                capability.detail?.let { Text(it, color = RemoteMuted, style = MaterialTheme.typography.bodySmall) }
-                capability.limitation?.let { Text(it, color = RemoteMuted, style = MaterialTheme.typography.bodySmall) }
-            }
-        }
+        Composer(
+            draft = state.draft,
+            running = false,
+            online = state.online && capability?.ready == true,
+            supportsSteer = false,
+            sessionOptions = emptyList(),
+            capability = capability,
+            selectedModel = state.selectedModel,
+            selectedEffort = state.selectedEffort,
+            selectedPermission = state.selectedPermission,
+            promptAttachments = state.promptAttachments,
+            sending = state.creatingConversation,
+            onDraft = viewModel::setDraft,
+            onSend = viewModel::sendMessage,
+            onSteer = {},
+            onInterrupt = {},
+            onSessionOption = { option, value ->
+                when (option) {
+                    "model" -> viewModel.selectModel(value)
+                    "reasoning_effort" -> viewModel.selectEffort(value)
+                    "permission_mode" -> viewModel.selectPermission(value)
+                }
+            },
+            onAttachments = viewModel::addPromptAttachments,
+            onRemoveAttachment = viewModel::removePromptAttachment,
+        )
     }
 }
 
@@ -1005,6 +970,7 @@ private fun ConversationScreen(
         it.projectId == conversation.projectId && it.provider == conversation.provider
     }
     val timeline = snapshot.timeline.filter { it.conversationId == conversation.id }
+    val timelineBlocks = groupTimeline(timeline)
     val listState = rememberLazyListState()
     LaunchedEffect(timeline.size, timeline.lastOrNull()?.revision) {
         if (timeline.isNotEmpty()) listState.animateScrollToItem(timeline.lastIndex)
@@ -1014,7 +980,7 @@ private fun ConversationScreen(
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
     ) {
-        ConversationHeader(conversation)
+        ConversationHeader(conversation, viewModel::renameConversation)
         if (timeline.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -1031,15 +997,30 @@ private fun ConversationScreen(
                     contentPadding = PaddingValues(start = 20.dp, top = 14.dp, end = 25.dp, bottom = 14.dp),
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
-                    items(timeline, key = { it.id }) { item ->
-                        TimelineCard(
-                            item = item,
-                            attachment = (item.content as? TimelineContent.Image)?.let {
-                                state.attachments[it.attachmentId]
-                            },
-                            approvalPending = (item.content as? TimelineContent.Approval)?.approvalId in state.pendingApprovals,
-                            onApproval = viewModel::resolveApproval,
-                        )
+                    item("load-older") {
+                        if (conversation.id !in state.historyExhausted) {
+                            TextButton(onClick = viewModel::loadOlder, modifier = Modifier.fillMaxWidth()) {
+                                Text("加载更早消息", color = RemoteMuted)
+                            }
+                        }
+                    }
+                    items(timelineBlocks, key = { it.key }) { block ->
+                        when (block) {
+                            is TimelineBlock.Single -> TimelineCard(
+                                item = block.item,
+                                attachment = (block.item.content as? TimelineContent.Image)?.let {
+                                    state.attachments[it.attachmentId]
+                                },
+                                approvalPending = (block.item.content as? TimelineContent.Approval)?.approvalId in state.pendingApprovals,
+                                onApproval = viewModel::resolveApproval,
+                            )
+                            is TimelineBlock.Activity -> ActivityTimelineCard(
+                                items = block.items,
+                                attachments = state.attachments,
+                                pendingApprovals = state.pendingApprovals,
+                                onApproval = viewModel::resolveApproval,
+                            )
+                        }
                     }
                 }
                 CodexScrollbar(
@@ -1054,22 +1035,34 @@ private fun ConversationScreen(
             online = state.online,
             supportsSteer = capability?.supportsSteer == true,
             sessionOptions = conversation.sessionOptions,
+            capability = capability,
+            selectedModel = conversation.selectedModel,
+            selectedEffort = conversation.selectedEffort,
+            selectedPermission = conversation.sessionOptions
+                .find { it.id == "permission_mode" }
+                ?.currentValue,
+            promptAttachments = state.promptAttachments,
+            sending = state.pendingCommands.isNotEmpty(),
             onDraft = viewModel::setDraft,
             onSend = viewModel::sendMessage,
             onSteer = viewModel::steer,
             onInterrupt = viewModel::interrupt,
             onSessionOption = viewModel::setSessionOption,
+            onAttachments = viewModel::addPromptAttachments,
+            onRemoveAttachment = viewModel::removePromptAttachment,
         )
     }
 }
 
 @Composable
-private fun ConversationHeader(conversation: Conversation) {
+private fun ConversationHeader(conversation: Conversation, onRename: (String) -> Unit) {
+    var editing by rememberSaveable(conversation.id) { mutableStateOf(false) }
+    var title by remember(conversation.id, conversation.title) { mutableStateOf(conversation.title) }
     Row(
         Modifier.fillMaxWidth().background(RemoteBlack).padding(horizontal = 20.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(Modifier.weight(1f)) {
+        Column(Modifier.weight(1f).clickable { editing = true }) {
             Text(
                 conversation.title,
                 style = MaterialTheme.typography.titleMedium,
@@ -1083,6 +1076,35 @@ private fun ConversationHeader(conversation: Conversation) {
             )
         }
         StatePill(conversation.state)
+    }
+    if (editing) {
+        Dialog(onDismissRequest = { editing = false }) {
+            Surface(
+                color = RemoteSurfaceRaised,
+                shape = RoundedCornerShape(22.dp),
+                border = BorderStroke(1.dp, RemoteBorder),
+            ) {
+                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("重命名对话", style = MaterialTheme.typography.titleLarge)
+                    OutlinedTextField(
+                        value = title,
+                        onValueChange = { title = it },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        TextButton(onClick = { editing = false }) { Text("取消") }
+                        Button(
+                            onClick = {
+                                onRename(title)
+                                editing = false
+                            },
+                            enabled = title.isNotBlank(),
+                        ) { Text("保存") }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1113,20 +1135,77 @@ private fun Composer(
     online: Boolean,
     supportsSteer: Boolean,
     sessionOptions: List<SessionOption>,
+    capability: ProviderCapability?,
+    selectedModel: String?,
+    selectedEffort: String?,
+    selectedPermission: String?,
+    promptAttachments: List<PromptAttachment>,
+    sending: Boolean,
     onDraft: (String) -> Unit,
     onSend: () -> Unit,
     onSteer: () -> Unit,
     onInterrupt: () -> Unit,
     onSessionOption: (String, String) -> Unit,
+    onAttachments: (List<Uri>) -> Unit,
+    onRemoveAttachment: (UUID) -> Unit,
 ) {
     val inputEnabled = online && (!running || supportsSteer)
     var settingsOpen by rememberSaveable { mutableStateOf(false) }
+    val effectiveOptions = remember(
+        sessionOptions,
+        capability,
+        selectedModel,
+        selectedEffort,
+        selectedPermission,
+    ) {
+        if (sessionOptions.isNotEmpty()) {
+            sessionOptions
+        } else {
+            newConversationOptions(capability, selectedModel, selectedEffort, selectedPermission)
+        }
+    }
+    val attachmentTypes = capability?.attachments?.allowedMimeTypes.orEmpty().toTypedArray()
+    val attachmentLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments(),
+        onAttachments,
+    )
     Column(
         Modifier
             .fillMaxWidth()
             .background(RemoteBlack)
             .padding(start = 14.dp, top = 12.dp, end = 14.dp),
     ) {
+        if (promptAttachments.isNotEmpty()) {
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(bottom = 7.dp),
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+            ) {
+                promptAttachments.forEach { attachment ->
+                    Surface(
+                        color = RemoteSurfaceRaised,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, RemoteBorder),
+                    ) {
+                        Row(
+                            Modifier.padding(start = 10.dp, top = 5.dp, bottom = 5.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                attachment.fileName,
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                            )
+                            IconButton(
+                                onClick = { onRemoveAttachment(attachment.id) },
+                                modifier = Modifier.size(30.dp),
+                            ) {
+                                RemoteIcon(RemoteGlyph.Close, "移除附件", Modifier.size(14.dp), RemoteMuted)
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Row(
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalAlignment = Alignment.Bottom,
@@ -1141,6 +1220,16 @@ private fun Composer(
                     Modifier.fillMaxWidth().padding(start = 18.dp, end = 5.dp, top = 5.dp, bottom = 5.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    IconButton(
+                        onClick = { attachmentLauncher.launch(attachmentTypes) },
+                        enabled = inputEnabled && capability?.attachments?.supported == true &&
+                            promptAttachments.size < capability.attachments.maxCount &&
+                            promptAttachments.sumOf { it.bytes.size.toLong() } <
+                            capability.attachments.maxTotalBytes,
+                        modifier = Modifier.size(38.dp),
+                    ) {
+                        RemoteIcon(RemoteGlyph.Attach, "添加附件", Modifier.size(19.dp), RemoteMuted)
+                    }
                     BasicTextField(
                         value = draft,
                         onValueChange = onDraft,
@@ -1176,7 +1265,7 @@ private fun Composer(
                     if (!running || supportsSteer) {
                         IconButton(
                             onClick = if (running) onSteer else onSend,
-                            enabled = online && draft.isNotBlank(),
+                            enabled = online && draft.isNotBlank() && !sending,
                             modifier = Modifier.size(46.dp).background(Color.White, CircleShape),
                         ) {
                             RemoteIcon(RemoteGlyph.Send, if (running) "追加指令" else "发送", Modifier.size(22.dp), Color.Black)
@@ -1194,9 +1283,9 @@ private fun Composer(
                 }
             }
         }
-        if (sessionOptions.isNotEmpty()) {
+        if (effectiveOptions.isNotEmpty()) {
             SessionSettingsBar(
-                options = sessionOptions,
+                options = effectiveOptions,
                 enabled = online && !running,
                 onClick = { settingsOpen = true },
             )
@@ -1204,11 +1293,65 @@ private fun Composer(
     }
     if (settingsOpen) {
         SessionSettingsSheet(
-            options = sessionOptions,
+            options = effectiveOptions,
+            permissionModes = capability?.permissionModes.orEmpty(),
             enabled = online && !running,
             onDismiss = { settingsOpen = false },
             onSelect = onSessionOption,
         )
+    }
+}
+
+private fun newConversationOptions(
+    capability: ProviderCapability?,
+    selectedModel: String?,
+    selectedEffort: String?,
+    selectedPermission: String?,
+): List<SessionOption> {
+    capability ?: return emptyList()
+    val model = capability.models.find { it.id == selectedModel } ?: capability.models.firstOrNull()
+    return buildList {
+        if (capability.models.isNotEmpty()) {
+            add(
+                SessionOption(
+                    id = "model",
+                    displayName = "模型",
+                    category = null,
+                    currentValue = selectedModel ?: capability.models.first().id,
+                    values = capability.models.map {
+                        dev.agentremote.messenger.model.SessionOptionValue(it.id, it.displayName)
+                    },
+                ),
+            )
+        }
+        if (model?.effortOptions?.isNotEmpty() == true) {
+            add(
+                SessionOption(
+                    id = "reasoning_effort",
+                    displayName = "推理强度",
+                    category = null,
+                    currentValue = selectedEffort ?: model.defaultEffort ?: model.effortOptions.first().id,
+                    values = model.effortOptions.map {
+                        dev.agentremote.messenger.model.SessionOptionValue(it.id, it.displayName)
+                    },
+                ),
+            )
+        }
+        if (capability.permissionModes.isNotEmpty()) {
+            add(
+                SessionOption(
+                    id = "permission_mode",
+                    displayName = "权限",
+                    category = null,
+                    currentValue = selectedPermission
+                        ?: capability.defaultPermissionMode
+                        ?: capability.permissionModes.first().id,
+                    values = capability.permissionModes.map {
+                        dev.agentremote.messenger.model.SessionOptionValue(it.id, it.displayName)
+                    },
+                ),
+            )
+        }
     }
 }
 
@@ -1226,12 +1369,6 @@ private fun SessionSettingsBar(options: List<SessionOption>, enabled: Boolean, o
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        SessionSettingsChip(
-            label = primary,
-            enabled = enabled,
-            onClick = onClick,
-            modifier = Modifier.weight(1f),
-        )
         permission?.let {
             SessionSettingsChip(
                 label = sessionOptionValueLabel(it),
@@ -1240,6 +1377,12 @@ private fun SessionSettingsBar(options: List<SessionOption>, enabled: Boolean, o
                 modifier = Modifier.widthIn(min = 100.dp, max = 132.dp),
             )
         }
+        SessionSettingsChip(
+            label = primary,
+            enabled = enabled,
+            onClick = onClick,
+            modifier = Modifier.weight(1f),
+        )
     }
 }
 
@@ -1279,11 +1422,13 @@ private fun SessionSettingsChip(
 @Composable
 private fun SessionSettingsSheet(
     options: List<SessionOption>,
+    permissionModes: List<PermissionModeOption>,
     enabled: Boolean,
     onDismiss: () -> Unit,
     onSelect: (String, String) -> Unit,
 ) {
     var activeOptionId by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingElevatedPermission by remember { mutableStateOf<String?>(null) }
     val activeOption = options.find { it.id == activeOptionId }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -1311,7 +1456,7 @@ private fun SessionSettingsSheet(
                     Text("会话设置")
                 }
                 Text(
-                    if (activeOption.id == "permission_mode") "应如何批准 ChatGPT 操作？" else sessionOptionLabel(activeOption),
+                    sessionOptionLabel(activeOption),
                     style = MaterialTheme.typography.titleLarge,
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp),
                 )
@@ -1319,26 +1464,32 @@ private fun SessionSettingsSheet(
                     items(activeOption.values, key = { it.value }) { value ->
                         val selected = value.value == activeOption.currentValue
                         val permission = activeOption.id == "permission_mode"
-                        val selectedColor = if (permission && selected) RemoteOrange else RemoteText
+                        val permissionMode = permissionModes.find { it.id == value.value }
+                        val elevated = permissionMode?.risk == PermissionRisk.ELEVATED
+                        val selectedColor = if (elevated && selected) RemoteOrange else RemoteText
                         Row(
                             Modifier
                                 .fillMaxWidth()
                                 .heightIn(min = if (permission) 68.dp else 58.dp)
                                 .clip(RoundedCornerShape(18.dp))
                                 .clickable(enabled = enabled) {
-                                    onSelect(activeOption.id, value.value)
-                                    activeOptionId = null
+                                    if (elevated) {
+                                        pendingElevatedPermission = value.value
+                                    } else {
+                                        onSelect(activeOption.id, value.value)
+                                        activeOptionId = null
+                                    }
                                 }
                                 .background(
                                     when {
-                                        permission && selected -> RemoteOrange.copy(alpha = 0.08f)
+                                        elevated && selected -> RemoteOrange.copy(alpha = 0.08f)
                                         selected -> Color(0xFF303033)
                                         else -> Color.Transparent
                                     },
                                 )
                                 .border(
                                     1.dp,
-                                    if (permission && selected) RemoteOrange.copy(alpha = 0.55f) else Color.Transparent,
+                                    if (elevated && selected) RemoteOrange.copy(alpha = 0.55f) else Color.Transparent,
                                     RoundedCornerShape(18.dp),
                                 )
                                 .padding(horizontal = 16.dp, vertical = 10.dp),
@@ -1346,7 +1497,7 @@ private fun SessionSettingsSheet(
                         ) {
                             if (permission) {
                                 Icon(
-                                    imageVector = permissionIcon(value.value),
+                                    imageVector = permissionIcon(permissionMode?.risk),
                                     contentDescription = null,
                                     modifier = Modifier.size(22.dp),
                                     tint = selectedColor,
@@ -1359,7 +1510,7 @@ private fun SessionSettingsSheet(
                                     color = selectedColor,
                                     fontWeight = FontWeight.Medium,
                                 )
-                                if (permission) permissionDescription(value.value)?.let {
+                                permissionMode?.description?.let {
                                     Text(it, color = RemoteMuted, style = MaterialTheme.typography.bodySmall)
                                 }
                             }
@@ -1370,6 +1521,32 @@ private fun SessionSettingsSheet(
             }
         }
         Spacer(Modifier.navigationBarsPadding())
+    }
+    pendingElevatedPermission?.let { permission ->
+        Dialog(onDismissRequest = { pendingElevatedPermission = null }) {
+            Surface(
+                color = RemoteSurfaceRaised,
+                shape = RoundedCornerShape(22.dp),
+                border = BorderStroke(1.dp, Color(0xFF78452E)),
+            ) {
+                Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("确认高风险权限", style = MaterialTheme.typography.titleLarge)
+                    Text(
+                        permissionModes.find { it.id == permission }?.description
+                            ?: "此模式可能允许无需逐次确认的写入或命令。",
+                        color = RemoteMuted,
+                    )
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        TextButton(onClick = { pendingElevatedPermission = null }) { Text("取消") }
+                        Button(onClick = {
+                            onSelect("permission_mode", permission)
+                            pendingElevatedPermission = null
+                            activeOptionId = null
+                        }) { Text("确认切换") }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1401,37 +1578,13 @@ private fun sessionOptionLabel(option: SessionOption): String = when (option.id)
 private fun sessionOptionValueLabel(option: SessionOption): String =
     sessionOptionValueLabel(option, option.currentValue)
 
-private fun sessionOptionValueLabel(option: SessionOption, value: String): String = when {
-    option.id == "permission_mode" -> when (value) {
-        "request_approval" -> "请求批准"
-        "auto_review" -> "帮我批准"
-        "full_access" -> "完全访问权限"
-        else -> option.values.find { it.value == value }?.displayName ?: value
-    }
-    option.id == "reasoning_effort" || option.id == "thought_level" -> when (value) {
-        "minimal" -> "最低"
-        "low" -> "低"
-        "medium" -> "中等"
-        "high" -> "高"
-        "xhigh" -> "极高"
-        "max" -> "最高"
-        "ultra" -> "超高"
-        else -> option.values.find { it.value == value }?.displayName ?: value
-    }
-    else -> option.values.find { it.value == value }?.displayName ?: value
-}
+private fun sessionOptionValueLabel(option: SessionOption, value: String): String =
+    option.values.find { it.value == value }?.displayName ?: value
 
-private fun permissionDescription(value: String): String? = when (value) {
-    "request_approval" -> "编辑外部文件和使用互联网时始终询问"
-    "auto_review" -> "仅对检测到的风险操作请求批准"
-    "full_access" -> "可不受限制地访问互联网和你电脑上的任何文件"
-    else -> null
-}
-
-private fun permissionIcon(value: String): ImageVector = when (value) {
-    "request_approval" -> Icons.Outlined.TouchApp
-    "auto_review" -> Icons.Outlined.Security
-    else -> Icons.Outlined.WarningAmber
+private fun permissionIcon(risk: PermissionRisk?): ImageVector = when (risk) {
+    PermissionRisk.ELEVATED -> Icons.Outlined.WarningAmber
+    PermissionRisk.STANDARD -> Icons.Outlined.Security
+    null -> Icons.Outlined.TouchApp
 }
 
 @Composable
@@ -1458,6 +1611,101 @@ private fun CodexScrollbar(state: LazyListState, modifier: Modifier = Modifier) 
                     CircleShape,
                 ),
         )
+    }
+}
+
+private sealed interface TimelineBlock {
+    val key: String
+
+    data class Single(val item: TimelineItem) : TimelineBlock {
+        override val key: String = item.id.toString()
+    }
+
+    data class Activity(val items: List<TimelineItem>) : TimelineBlock {
+        override val key: String = "activity-${items.first().id}"
+    }
+}
+
+private fun groupTimeline(items: List<TimelineItem>): List<TimelineBlock> = buildList {
+    var activity = mutableListOf<TimelineItem>()
+    fun flush() {
+        if (activity.isNotEmpty()) {
+            add(TimelineBlock.Activity(activity))
+            activity = mutableListOf()
+        }
+    }
+    items.forEach { item ->
+        if (item.content.isActivity()) {
+            activity += item
+        } else {
+            flush()
+            add(TimelineBlock.Single(item))
+        }
+    }
+    flush()
+}
+
+private fun TimelineContent.isActivity(): Boolean = when (this) {
+    is TimelineContent.Progress,
+    is TimelineContent.ToolCall,
+    is TimelineContent.Command,
+    is TimelineContent.FileChange,
+    is TimelineContent.Approval,
+    is TimelineContent.Error,
+    -> true
+    else -> false
+}
+
+@Composable
+private fun ActivityTimelineCard(
+    items: List<TimelineItem>,
+    attachments: Map<UUID, ByteArray>,
+    pendingApprovals: Set<UUID>,
+    onApproval: (UUID, String) -> Unit,
+) {
+    var expanded by rememberSaveable(items.first().id) { mutableStateOf(false) }
+    val labels = items.groupingBy {
+        when (it.content) {
+            is TimelineContent.FileChange -> "文件"
+            is TimelineContent.Command -> "命令"
+            is TimelineContent.Approval -> "审批"
+            is TimelineContent.Error -> "错误"
+            is TimelineContent.Progress -> if (it.content.kind == "test") "测试" else "进度"
+            else -> "工具"
+        }
+    }.eachCount().entries.joinToString(" · ") { "${it.key} ${it.value}" }
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = RemoteSurface,
+        shape = RoundedCornerShape(18.dp),
+        border = BorderStroke(1.dp, RemoteBorder),
+    ) {
+        Column {
+            Row(
+                Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RemoteIcon(RemoteGlyph.ChevronRight, null, Modifier.size(18.dp), RemoteMuted)
+                Spacer(Modifier.width(8.dp))
+                Text("活动 · $labels", modifier = Modifier.weight(1f), style = MaterialTheme.typography.labelMedium)
+                Text("${items.size} 项", color = RemoteMuted, style = MaterialTheme.typography.labelSmall)
+            }
+            if (expanded) {
+                HorizontalDivider(color = RemoteBorder)
+                Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    items.forEach { item ->
+                        TimelineCard(
+                            item = item,
+                            attachment = (item.content as? TimelineContent.Image)?.let {
+                                attachments[it.attachmentId]
+                            },
+                            approvalPending = (item.content as? TimelineContent.Approval)?.approvalId in pendingApprovals,
+                            onApproval = onApproval,
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1555,7 +1803,14 @@ private fun ToolSummaryRow(label: String, value: String) {
 
 private fun meaningfulToolSummary(value: String?): String? {
     val summary = value?.trim().orEmpty()
-    return summary.takeUnless { it.isEmpty() || it == "[]" || it == "{}" || it == "null" || it == "\"\"" }
+    if (summary.isEmpty() || summary == "[]" || summary == "{}" || summary == "null" || summary == "\"\"") {
+        return null
+    }
+    return if (summary.startsWith('{') || summary.startsWith('[')) {
+        "Provider 返回了结构化详情（已隐藏）"
+    } else {
+        summary
+    }
 }
 
 @Composable
@@ -1736,66 +1991,6 @@ private fun decodePreview(bytes: ByteArray): Bitmap? {
     )
 }
 
-private data class PickerEntry<T>(val value: T, val label: String)
-
-@Composable
-private fun <T> Picker(
-    label: String,
-    entries: List<PickerEntry<T>>,
-    selected: T?,
-    onSelect: (T) -> Unit,
-    enabled: Boolean = true,
-    emptyLabel: String = "暂无选项",
-) {
-    var expanded by remember { mutableStateOf(false) }
-    val selectedLabel = entries.find { it.value == selected }?.label ?: emptyLabel
-    Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
-        Text(label, color = RemoteMuted, style = MaterialTheme.typography.labelMedium)
-        Box(Modifier.fillMaxWidth()) {
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .height(52.dp)
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(RemoteSurfaceRaised)
-                    .border(1.dp, RemoteBorder, RoundedCornerShape(16.dp))
-                    .clickable(enabled = enabled && entries.isNotEmpty()) { expanded = true }
-                    .padding(horizontal = 15.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    selectedLabel,
-                    color = if (enabled && entries.isNotEmpty()) RemoteText else RemoteMuted,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                RemoteIcon(RemoteGlyph.ChevronDown, null, Modifier.size(18.dp), RemoteMuted)
-            }
-            DropdownMenu(
-                expanded = expanded,
-                onDismissRequest = { expanded = false },
-                shape = RoundedCornerShape(18.dp),
-                containerColor = RemoteSurfaceRaised,
-                border = BorderStroke(1.dp, RemoteBorder),
-            ) {
-                entries.forEach { entry ->
-                    DropdownMenuItem(
-                        text = { Text(entry.label) },
-                        trailingIcon = {
-                            if (entry.value == selected) RemoteIcon(RemoteGlyph.Check, null, Modifier.size(18.dp))
-                        },
-                        onClick = {
-                            expanded = false
-                            onSelect(entry.value)
-                        },
-                    )
-                }
-            }
-        }
-    }
-}
-
 private enum class RemoteGlyph(val imageVector: ImageVector) {
     Menu(Icons.Rounded.Menu),
     Back(Icons.AutoMirrored.Rounded.ArrowBack),
@@ -1813,6 +2008,7 @@ private enum class RemoteGlyph(val imageVector: ImageVector) {
     Close(Icons.Rounded.Close),
     Send(Icons.Rounded.ArrowUpward),
     Stop(Icons.Rounded.Stop),
+    Attach(Icons.Rounded.AttachFile),
     Copy(Icons.Rounded.ContentCopy),
     Scan(Icons.Rounded.QrCodeScanner),
     Paste(Icons.Rounded.ContentPaste),
@@ -1862,17 +2058,6 @@ private fun RemoteIcon(
         modifier = modifier,
         tint = tint,
     )
-}
-
-private fun providerStateLabel(state: String): String = when (state) {
-    "not_installed" -> "未安装"
-    "not_authenticated" -> "未登录"
-    "starting" -> "正在启动"
-    "ready" -> "可用"
-    "crashed" -> "已崩溃"
-    "protocol_incompatible" -> "协议不兼容"
-    "offline" -> "离线"
-    else -> state
 }
 
 private fun stateLabel(state: String): String = when (state) {

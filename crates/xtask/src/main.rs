@@ -106,11 +106,31 @@ fn build(root: &Path) -> Result<()> {
     fs::create_dir_all(&bin_dir)?;
     for binary in ["agent-remote-host", "agent-remote-relay"] {
         let source = root.join("target/release").join(executable_name(binary));
-        fs::copy(&source, bin_dir.join(executable_name(binary)))
-            .with_context(|| format!("copy {}", source.display()))?;
+        publish_binary(&source, &bin_dir.join(executable_name(binary)))?;
     }
     println!("Release package: {}", root.join("dist").display());
     Ok(())
+}
+
+fn publish_binary(source: &Path, destination: &Path) -> Result<()> {
+    match fs::copy(source, destination) {
+        Ok(_) => Ok(()),
+        #[cfg(unix)]
+        Err(copy_error) => {
+            let staged = destination.with_extension(format!("next-{}", std::process::id()));
+            fs::copy(source, &staged).with_context(|| {
+                format!(
+                    "stage {} after direct copy failed: {copy_error}",
+                    source.display()
+                )
+            })?;
+            fs::rename(&staged, destination)
+                .with_context(|| format!("publish {}", destination.display()))?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        Err(error) => Err(error).with_context(|| format!("copy {}", source.display())),
+    }
 }
 
 fn test(root: &Path) -> Result<()> {

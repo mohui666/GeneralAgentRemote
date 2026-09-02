@@ -6,15 +6,19 @@ import com.fasterxml.jackson.databind.node.ArrayNode
 import com.fasterxml.jackson.databind.node.ObjectNode
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory
 import dev.agentremote.messenger.model.ApprovalOption
+import dev.agentremote.messenger.model.AttachmentCapability
 import dev.agentremote.messenger.model.AttachmentData
 import dev.agentremote.messenger.model.ConnectionTarget
 import dev.agentremote.messenger.model.Conversation
 import dev.agentremote.messenger.model.EffortOption
 import dev.agentremote.messenger.model.ModelOption
+import dev.agentremote.messenger.model.PermissionModeOption
+import dev.agentremote.messenger.model.PermissionRisk
 import dev.agentremote.messenger.model.PlanStep
 import dev.agentremote.messenger.model.ProjectSummary
 import dev.agentremote.messenger.model.ProviderCapability
 import dev.agentremote.messenger.model.ProviderId
+import dev.agentremote.messenger.model.PromptAttachment
 import dev.agentremote.messenger.model.ServerEvent
 import dev.agentremote.messenger.model.SessionOption
 import dev.agentremote.messenger.model.SessionOptionValue
@@ -23,6 +27,7 @@ import dev.agentremote.messenger.model.Snapshot
 import dev.agentremote.messenger.model.StoredCredential
 import dev.agentremote.messenger.model.TimelineContent
 import dev.agentremote.messenger.model.TimelineItem
+import dev.agentremote.messenger.model.TimelinePageCursor
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.UUID
@@ -46,6 +51,17 @@ object WireProtocol {
 
     fun getSnapshot(): ByteArray = command("get_snapshot")
 
+    fun refreshProjects(provider: ProviderId): ByteArray = command("refresh_projects") {
+        put("provider", provider.wire)
+    }
+
+    fun syncProject(commandId: UUID, projectId: UUID, provider: ProviderId): ByteArray =
+        command("sync_project") {
+            setUuid("command_id", commandId)
+            setUuid("project_id", projectId)
+            put("provider", provider.wire)
+        }
+
     fun createConversation(
         commandId: UUID,
         projectId: UUID,
@@ -62,11 +78,41 @@ object WireProtocol {
         putNullable("effort", effort)
     }
 
-    fun sendMessage(commandId: UUID, conversationId: UUID, text: String): ByteArray =
+    fun startConversation(
+        commandId: UUID,
+        conversationId: UUID,
+        projectId: UUID,
+        provider: ProviderId,
+        model: String?,
+        effort: String?,
+        permissionMode: String?,
+        text: String,
+        attachments: List<PromptAttachment>,
+    ): ByteArray = command("start_conversation") {
+        setUuid("command_id", commandId)
+        setUuid("conversation_id", conversationId)
+        setUuid("project_id", projectId)
+        put("provider", provider.wire)
+        putNullable("model", model)
+        putNullable("effort", effort)
+        putNullable("permission_mode", permissionMode)
+        put("text", text)
+        putAttachments(attachments)
+    }
+
+    fun sendMessage(
+        commandId: UUID,
+        conversationId: UUID,
+        clientMessageId: String,
+        text: String,
+        attachments: List<PromptAttachment>,
+    ): ByteArray =
         command("send_message") {
             setUuid("command_id", commandId)
             setUuid("conversation_id", conversationId)
+            put("client_message_id", clientMessageId)
             put("text", text)
+            putAttachments(attachments)
         }
 
     fun steer(commandId: UUID, conversationId: UUID, text: String): ByteArray =
@@ -104,6 +150,31 @@ object WireProtocol {
         setUuid("attachment_id", attachmentId)
     }
 
+    fun renameConversation(commandId: UUID, conversationId: UUID, title: String): ByteArray =
+        command("rename_conversation") {
+            setUuid("command_id", commandId)
+            setUuid("conversation_id", conversationId)
+            put("title", title)
+        }
+
+    fun getConversationPage(
+        conversationId: UUID,
+        before: TimelinePageCursor?,
+        limit: Int,
+    ): ByteArray =
+        command("get_conversation_page") {
+            setUuid("conversation_id", conversationId)
+            if (before == null) {
+                putNull("before")
+            } else {
+                set<ObjectNode>("before", mapper.createObjectNode().apply {
+                    put("created_at_ms", before.createdAtMs)
+                    setUuid("item_id", before.itemId)
+                })
+            }
+            put("limit", limit)
+        }
+
     fun decodeServer(bytes: ByteArray, target: ConnectionTarget): ServerEvent {
         val envelope = mapper.readTree(bytes)
         val version = envelope.required("protocol_version").asInt()
@@ -128,7 +199,32 @@ object WireProtocol {
                 hostId = message.requiredUuid("host_id"),
                 deviceId = message.requiredUuid("device_id"),
             )
-            "snapshot" -> ServerEvent.SnapshotReceived(parseSnapshot(message.required("snapshot")))
+            "snapshot" -> ServerEvent.SnapshotReceived(
+                parseSnapshot(message.required("snapshot")),
+                bytes.copyOf(),
+            )
+            "projects_updated" -> ServerEvent.ProjectsUpdated(
+                provider = ProviderId.fromWire(message.requiredText("provider")),
+                projects = message.requiredArray("projects").map(::parseProject),
+                capabilities = message.requiredArray("capabilities").map(::parseCapability),
+            )
+            "project_sync_completed" -> ServerEvent.ProjectSyncCompleted(
+                commandId = message.requiredUuid("command_id"),
+                projectId = message.requiredUuid("project_id"),
+                provider = ProviderId.fromWire(message.requiredText("provider")),
+                conversationsSynced = message.required("conversations_synced").asInt(),
+                fullHistoryFallback = message.required("full_history_fallback").asBoolean(),
+            )
+            "conversation_page" -> ServerEvent.ConversationPage(
+                conversationId = message.requiredUuid("conversation_id"),
+                items = message.requiredArray("items").map(::parseTimelineItem),
+                nextBefore = message.get("next_before")?.takeUnless(JsonNode::isNull)?.let {
+                    TimelinePageCursor(
+                        createdAtMs = it.required("created_at_ms").asLong(),
+                        itemId = it.requiredUuid("item_id"),
+                    )
+                },
+            )
             "provider_changed" -> ServerEvent.ProviderChanged(
                 parseCapability(message.required("capability")),
             )
@@ -218,8 +314,11 @@ object WireProtocol {
     private fun parseProject(node: JsonNode) = ProjectSummary(
         id = node.requiredUuid("id"),
         displayName = node.requiredText("display_name"),
+        shortPath = node.requiredText("short_path"),
         enabledProviders = node.requiredArray("enabled_providers").map { ProviderId.fromWire(it.asText()) },
         valid = node.required("valid").asBoolean(),
+        lastActivityAtMs = node.get("last_activity_at_ms")?.takeUnless(JsonNode::isNull)?.asLong(),
+        conversationCount = node.required("conversation_count").asInt(),
     )
 
     private fun parseCapability(node: JsonNode): ProviderCapability {
@@ -232,7 +331,27 @@ object WireProtocol {
             detail = health.textOrNull("detail"),
             models = node.requiredArray("models").map(::parseModel),
             supportsSessionList = node.required("supports_session_list").asBoolean(),
+            supportsHistory = node.required("supports_history").asBoolean(),
+            supportsIncrementalSync = node.required("supports_incremental_sync").asBoolean(),
+            supportsRename = node.required("supports_rename").asBoolean(),
             supportsSteer = node.required("supports_steer").asBoolean(),
+            permissionModes = node.requiredArray("permission_modes").map {
+                PermissionModeOption(
+                    id = it.requiredText("id"),
+                    displayName = it.requiredText("display_name"),
+                    description = it.requiredText("description"),
+                    risk = PermissionRisk.fromWire(it.requiredText("risk")),
+                )
+            },
+            defaultPermissionMode = node.textOrNull("default_permission_mode"),
+            attachments = node.required("attachments").let {
+                AttachmentCapability(
+                    allowedMimeTypes = it.requiredArray("allowed_mime_types").map(JsonNode::asText),
+                    maxCount = it.required("max_count").asInt(),
+                    maxBytes = it.required("max_bytes").asLong(),
+                    maxTotalBytes = it.required("max_total_bytes").asLong(),
+                )
+            },
             sessions = node.requiredArray("sessions").map {
                 SessionSummary(
                     nativeSessionId = it.requiredText("native_session_id"),
@@ -260,6 +379,8 @@ object WireProtocol {
         projectId = node.requiredUuid("project_id"),
         nativeSessionId = node.requiredText("native_session_id"),
         title = node.requiredText("title"),
+        titleSource = node.requiredText("title_source"),
+        titleUpdatedAtMs = node.required("title_updated_at_ms").asLong(),
         selectedModel = node.textOrNull("selected_model"),
         selectedEffort = node.textOrNull("selected_effort"),
         state = node.requiredText("state"),
@@ -342,7 +463,7 @@ object WireProtocol {
     private fun progressKind(node: JsonNode): String = when {
         node.isTextual -> node.asText()
         node.has("other") -> node.requiredText("other")
-        else -> node.toString()
+        else -> "progress"
     }
 
     private fun ObjectNode.setUuid(name: String, value: UUID) {
@@ -352,6 +473,18 @@ object WireProtocol {
 
     private fun ObjectNode.putNullable(name: String, value: String?) {
         if (value == null) putNull(name) else put(name, value)
+    }
+
+    private fun ObjectNode.putAttachments(attachments: List<PromptAttachment>) {
+        val values = putArray("attachments")
+        attachments.forEach { attachment ->
+            values.addObject().apply {
+                setUuid("id", attachment.id)
+                put("file_name", attachment.fileName)
+                put("mime_type", attachment.mimeType)
+                set<JsonNode>("bytes", mapper.nodeFactory.binaryNode(attachment.bytes))
+            }
+        }
     }
 
     private fun JsonNode.required(name: String): JsonNode =

@@ -46,7 +46,9 @@ dist\bin\agent-remote-host.exe pair --relay --base-url https://relay.example.com
 ## Expected phone behavior
 
 - A successful first pair immediately opens the Host snapshot and saves that Host in the connection screen.
-- Killing and reopening the app authenticates with the saved credential; it does not reuse the pair token.
-- A dropped connection preserves the visible conversation, reports offline status, then reconnects with bounded backoff and fetches a fresh snapshot.
+- Killing and reopening the app authenticates with the saved credential, restores the cached Host/Provider/project/conversation/settings/draft state, and does not reuse the pair token.
+- A dropped connection preserves the visible cached conversation, reports offline status, then reconnects with bounded backoff and fetches a fresh snapshot. The drawer can stop automatic retries or request an immediate retry.
+- Provider and project selection is scoped to the active Host. Switching Provider refreshes only its authorized projects and syncs the selected project's remote sessions.
+- A new conversation is created on its first send. One unacknowledged send is retained across a reconnect and replayed with the same command ID.
 - Revoking the phone from `agent-remote-host device revoke <device-id>` makes the next authentication fail and removes the invalid local credential.
 - The QR scanner is opened only when the user taps **扫码** and does not require an app-level camera permission.

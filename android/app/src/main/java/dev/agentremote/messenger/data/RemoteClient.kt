@@ -4,7 +4,10 @@ import android.os.Build
 import dev.agentremote.messenger.model.ConnectionTarget
 import dev.agentremote.messenger.model.ServerEvent
 import dev.agentremote.messenger.protocol.WireProtocol
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import kotlin.random.Random
 import kotlin.math.min
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -22,6 +25,8 @@ class RemoteClient(
         fun onConnected(target: ConnectionTarget)
         fun onEvent(event: ServerEvent)
         fun onDisconnected(message: String)
+        fun onRetryScheduled(attempt: Int, delayMillis: Long)
+        fun onRetryStopped(message: String)
         fun onError(message: String)
     }
 
@@ -29,15 +34,23 @@ class RemoteClient(
         .pingInterval(25, TimeUnit.SECONDS)
         .build()
     private val lock = Any()
+    private val scheduler = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "agent-remote-reconnect").apply { isDaemon = true }
+    }
     private var socket: WebSocket? = null
     private var target: ConnectionTarget? = null
     private var generation = 0L
     private var reconnectAttempt = 0
+    private var reconnectFuture: ScheduledFuture<*>? = null
+    private var retryEnabled = true
     private var closedByUser = false
 
     fun connect(newTarget: ConnectionTarget) {
         synchronized(lock) {
             closedByUser = false
+            retryEnabled = true
+            reconnectAttempt = 0
+            cancelReconnectLocked()
             target = newTarget
             generation += 1
             socket?.cancel()
@@ -48,12 +61,58 @@ class RemoteClient(
     fun disconnect() {
         synchronized(lock) {
             closedByUser = true
+            retryEnabled = false
+            cancelReconnectLocked()
             generation += 1
             socket?.close(1000, "user disconnected")
             socket = null
             target = null
             reconnectAttempt = 0
         }
+    }
+
+    fun retryNow() {
+        synchronized(lock) {
+            val reconnectTarget = target?.takeIf { it.credential != null } ?: return
+            retryEnabled = true
+            closedByUser = false
+            reconnectAttempt = 0
+            cancelReconnectLocked()
+            generation += 1
+            socket?.cancel()
+            socket = null
+            openLocked(generation, reconnectTarget)
+        }
+    }
+
+    fun stopRetrying() {
+        synchronized(lock) {
+            retryEnabled = false
+            cancelReconnectLocked()
+        }
+        listener.onRetryStopped("已停止自动重连")
+    }
+
+    fun close() {
+        synchronized(lock) {
+            closedByUser = true
+            retryEnabled = false
+            cancelReconnectLocked()
+            generation += 1
+            socket?.cancel()
+            socket = null
+            target = null
+        }
+        scheduler.shutdownNow()
+        http.dispatcher.executorService.shutdown()
+        http.connectionPool.evictAll()
+    }
+
+    fun networkAvailable() {
+        val shouldRetry = synchronized(lock) {
+            retryEnabled && !closedByUser && socket == null && target?.credential != null
+        }
+        if (shouldRetry) retryNow()
     }
 
     fun send(bytes: ByteArray): Boolean = synchronized(lock) {
@@ -142,24 +201,40 @@ class RemoteClient(
 
     private fun handleDisconnect(connectionGeneration: Long, message: String) {
         listener.onDisconnected(message.ifBlank { "连接已关闭" })
-        val reconnectTarget = synchronized(lock) {
+        val scheduled = synchronized(lock) {
             socket = null
-            if (closedByUser || generation != connectionGeneration) null else target?.takeIf { it.credential != null }
-        } ?: return
-        val delaySeconds = min(30, 1 shl min(5, reconnectAttempt++))
-        Thread {
-            Thread.sleep(delaySeconds * 1_000L)
-            synchronized(lock) {
-                if (!closedByUser && generation == connectionGeneration && socket == null) {
-                    generation += 1
-                    openLocked(generation, reconnectTarget)
-                }
+            if (closedByUser || !retryEnabled || generation != connectionGeneration || reconnectFuture != null) {
+                return@synchronized null
             }
-        }.apply {
-            name = "agent-remote-reconnect"
-            isDaemon = true
-            start()
+            val reconnectTarget = target?.takeIf { it.credential != null } ?: return@synchronized null
+            if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+                retryEnabled = false
+                return@synchronized RetrySchedule.Stopped
+            }
+            val attempt = ++reconnectAttempt
+            val delaySeconds = min(30, 1 shl min(5, attempt - 1))
+            val delayMillis = delaySeconds * 1_000L + Random.nextLong(0, 800)
+            reconnectFuture = scheduler.schedule({
+                synchronized(lock) {
+                    reconnectFuture = null
+                    if (!closedByUser && retryEnabled && generation == connectionGeneration && socket == null) {
+                        generation += 1
+                        openLocked(generation, reconnectTarget)
+                    }
+                }
+            }, delayMillis, TimeUnit.MILLISECONDS)
+            RetrySchedule.Pending(attempt, delayMillis)
         }
+        when (scheduled) {
+            is RetrySchedule.Pending -> listener.onRetryScheduled(scheduled.attempt, scheduled.delayMillis)
+            RetrySchedule.Stopped -> listener.onRetryStopped("已达到自动重连上限")
+            null -> Unit
+        }
+    }
+
+    private fun cancelReconnectLocked() {
+        reconnectFuture?.cancel(false)
+        reconnectFuture = null
     }
 
     private fun current(expectedGeneration: Long): Boolean = synchronized(lock) {
@@ -168,5 +243,14 @@ class RemoteClient(
 
     private fun currentTarget(fallback: ConnectionTarget): ConnectionTarget = synchronized(lock) {
         target ?: fallback
+    }
+
+    private sealed interface RetrySchedule {
+        data class Pending(val attempt: Int, val delayMillis: Long) : RetrySchedule
+        data object Stopped : RetrySchedule
+    }
+
+    companion object {
+        private const val MAX_RECONNECT_ATTEMPTS = 6
     }
 }

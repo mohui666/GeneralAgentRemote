@@ -347,9 +347,12 @@ async fn smoke_one(provider: Arc<dyn AgentProvider>, project: &Project) -> Resul
     provider
         .send_message(SendMessage {
             conversation_id,
+            project: project.clone(),
             native_session_id: native.native_session_id,
+            client_message_id: Some("provider-smoke".to_owned()),
             text: "Reply with exactly AGENT_REMOTE_SMOKE_OK. Do not run commands or modify files."
                 .to_owned(),
+            attachments: Vec::new(),
             model: selected_model,
             effort: selected_effort,
             permission_mode: None,

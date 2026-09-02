@@ -213,6 +213,7 @@ mod tests {
                 supports_session_list: true,
                 supports_resume: true,
                 supports_steer: true,
+                ..ProviderCapabilities::default()
             }
         }
         fn subscribe(&self) -> broadcast::Receiver<ProviderEvent> {
@@ -419,7 +420,9 @@ mod tests {
         let send = ClientCommand::SendMessage {
             command_id: send_id,
             conversation_id,
+            client_message_id: Some("direct-test".to_owned()),
             text: "hello".to_owned(),
+            attachments: Vec::new(),
         };
         send_client(&mut socket, &send).await;
         let mut saw_final = false;

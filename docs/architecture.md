@@ -23,12 +23,12 @@ phone / desktop browser
  JSONL stdio       ACP v1 JSON-RPC
 ```
 
-The Host owns Provider processes, authorized project paths, native-session mappings, conversation state, merged timeline items, approvals, device credentials, command idempotency, and managed images. The Relay and browser are projections of Host state. A reconnect requests a complete Snapshot; v0.1 has no offline command queue or event-sourcing layer.
+The Host owns Provider processes, authorized project paths, native-session mappings, conversation state, merged timeline items, approvals, device credentials, command idempotency, Provider sync cursors, and managed images. The Relay and clients are projections of Host state. A reconnect first requests a Snapshot containing the newest 100 timeline items per conversation, refreshes projects for the selected Provider, then syncs the selected project. Older items use a stable `(created_at_ms, item_id)` cursor. Android and Web each retain at most one unacknowledged send for replay after reconnect; this is not a general offline work queue.
 
 ## Crate responsibilities
 
 - `agent-remote-protocol` contains wire-safe IDs, Provider capability summaries, conversations, timeline variants, attachment metadata, commands, server messages, and Relay frames. Every encoded CBOR envelope carries protocol version `1`. Attachment and tunneled payload bytes use CBOR byte strings.
-- `agent-remote-host` validates project boundaries, persists minimal state with SQLite, runs Provider protocol adapters, merges streaming deltas by item ID/revision, serves the web application, authenticates direct clients, and maintains the optional outbound Relay tunnel.
+- `agent-remote-host` validates project boundaries, persists state with SQLite, runs Provider protocol adapters, imports remote session history, merges history and streaming deltas by stable item ID/revision, serves the web application, authenticates direct clients, and maintains the optional outbound Relay tunnel.
 - `agent-remote-relay` maintains an in-memory `host_id -> Host connection` registry. Its per-Host and per-client channels are bounded. A slow client is closed and must reconnect for a Snapshot.
 - `agent-remote-web` is a Yew CSR application. It sends and receives only binary CBOR WebSocket frames. Device credentials are origin-scoped browser `localStorage` records; browsers do not expose an OS credential vault to WASM.
 - `agent-remote-web-entry` is the root package's minimal WASM launcher. Trunk 0.21.14 requires a root package when it reads Cargo metadata from a workspace, so this entry delegates immediately to `agent-remote-web`; UI and protocol logic remain in the Web crate.
@@ -54,13 +54,13 @@ SQLite tables cover:
 - attachment metadata (not image bytes);
 - paired devices and single-use pair tokens;
 - used device command IDs;
-- Provider session mappings.
+- Provider session mappings, remote history watermarks, and stable Provider item IDs.
 
-Rows left in `running` or `needs_approval` are changed to `interrupted` at Host restart. The native Provider session remains resumable only when its current protocol reports that capability.
+Rows left in `running` or `needs_approval` are changed to `interrupted` at Host restart. Conversations remain permanently scoped to their Host, Provider, and authorized project. The native Provider session is resumed only when its current protocol reports that capability.
 
 ## Attachments
 
-Codex paths and ACP base64 images enter one attachment pipeline. Before copying, the Host enforces the configured byte limit (10 MiB by default), detects the real format, decodes it, accepts only PNG/JPEG/WebP/GIF, and records dimensions. A random attachment ID becomes the managed filename. Remote timeline data never contains the original absolute path or managed path.
+Codex paths, ACP base64 images, and capability-approved client prompt images enter one attachment pipeline. Before copying, the Host enforces the Provider-advertised input limit and its managed-image limit, detects the real format, decodes it, accepts only PNG/JPEG/WebP/GIF, and records dimensions. A random attachment ID becomes the managed filename. Remote timeline data never contains the original absolute path or managed path.
 
 ## Trust boundary
 

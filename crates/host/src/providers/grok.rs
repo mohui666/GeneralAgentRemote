@@ -33,13 +33,14 @@ use agent_client_protocol::{
 use agent_remote_protocol::{
     AgentMessagePhase, ApprovalOption, ConversationId, EffortOption, ItemStatus, ModelOption,
     PlanStep, ProjectId, ProviderHealth, ProviderId, ProviderState, SessionOption,
-    SessionOptionValue, SessionSummary,
+    SessionOptionValue, SessionSummary, TimelineItemKind,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     io::AsyncReadExt,
     process::Command,
@@ -49,10 +50,11 @@ use uuid::Uuid;
 
 use super::{
     AgentProvider, CommandAck, CreateSession, InterruptSession, NativeSession,
-    ProviderCapabilities, ProviderEvent, ProviderEventKind, ResolveApproval, ResumeSession,
-    SendMessage, SetSessionOption, SteerMessage,
+    ProviderCapabilities, ProviderEvent, ProviderEventKind, ProviderHistoryBarrier,
+    ProviderHistoryPage, ReadSessionHistory, ResolveApproval, ResumeSession, SendMessage,
+    SetSessionOption, SteerMessage,
 };
-use crate::storage::Project;
+use crate::storage::{Project, now_ms};
 
 const GROK_EXTENSION_VERSION: &str = "1.0.13";
 
@@ -113,6 +115,9 @@ impl Negotiated {
         ProviderCapabilities {
             supports_session_list: self.supports_list,
             supports_resume: self.supports_resume || self.supports_load,
+            supports_history: self.supports_load,
+            supports_incremental_sync: false,
+            supports_rename: false,
             supports_steer: self.supports_extensions(),
         }
     }
@@ -159,8 +164,65 @@ struct SessionBinding {
     conversation_id: ConversationId,
     model: Option<String>,
     effort: Option<String>,
+    replaying: bool,
+    turn_index: u64,
+    user_item_id: String,
     agent_item_id: String,
     thought_item_id: String,
+    replay_user_text: String,
+    replay_agent_text: String,
+    replay_thought_text: String,
+    replay_has_response: bool,
+    replay_image_index: u64,
+}
+
+#[derive(Clone, Copy)]
+enum ReplayTextKind {
+    User,
+    Agent,
+    Thought,
+}
+
+fn start_replay_turn(binding: &mut SessionBinding, session_id: &str) {
+    binding.turn_index += 1;
+    let prefix = format!("history:{session_id}:{}", binding.turn_index);
+    binding.user_item_id = format!("{prefix}:user");
+    binding.agent_item_id = format!("{prefix}:agent");
+    binding.thought_item_id = format!("{prefix}:thought");
+    binding.replay_has_response = false;
+}
+
+fn drain_replay_items(binding: &mut SessionBinding) -> Vec<(String, TimelineItemKind)> {
+    let mut items = Vec::with_capacity(3);
+    let user = std::mem::take(&mut binding.replay_user_text);
+    if !user.is_empty() {
+        items.push((
+            binding.user_item_id.clone(),
+            TimelineItemKind::UserMessage { text: user },
+        ));
+    }
+    let thought = std::mem::take(&mut binding.replay_thought_text);
+    if !thought.is_empty() {
+        items.push((
+            binding.thought_item_id.clone(),
+            TimelineItemKind::AgentMessage {
+                phase: AgentMessagePhase::ReasoningSummary,
+                text: thought,
+            },
+        ));
+    }
+    let agent = std::mem::take(&mut binding.replay_agent_text);
+    if !agent.is_empty() {
+        items.push((
+            binding.agent_item_id.clone(),
+            TimelineItemKind::AgentMessage {
+                phase: AgentMessagePhase::Final,
+                text: agent,
+            },
+        ));
+    }
+    binding.replay_has_response = false;
+    items
 }
 
 struct PendingPermission {
@@ -434,6 +496,10 @@ impl GrokProvider {
             model.clone(),
             effort.clone(),
         );
+        if replay {
+            self.shared
+                .set_replaying(request.project.id, &request.native_session_id, true);
+        }
 
         let meta = selection_meta(model.as_deref(), effort.as_deref());
         let result = if replay {
@@ -481,6 +547,8 @@ impl GrokProvider {
                 .remove(&(request.project.id, request.native_session_id.clone()));
             return Err(anyhow!(error));
         }
+        self.shared
+            .set_replaying(request.project.id, &request.native_session_id, false);
 
         Ok(native_session(
             request.native_session_id,
@@ -508,6 +576,9 @@ impl AgentProvider for GrokProvider {
             .unwrap_or(ProviderCapabilities {
                 supports_session_list: false,
                 supports_resume: false,
+                supports_history: false,
+                supports_incremental_sync: false,
+                supports_rename: false,
                 supports_steer: false,
             })
     }
@@ -599,8 +670,7 @@ impl AgentProvider for GrokProvider {
                     title: session
                         .title
                         .unwrap_or_else(|| "Untitled Grok session".to_owned()),
-                    // ACP timestamps are optional strings; zero explicitly means unknown here.
-                    updated_at_ms: 0,
+                    updated_at_ms: acp_timestamp_ms(session.updated_at.as_deref()),
                 }
             }));
             cursor = response.next_cursor;
@@ -609,6 +679,41 @@ impl AgentProvider for GrokProvider {
             }
         }
         Ok(sessions)
+    }
+
+    async fn read_session_history(
+        &self,
+        request: ReadSessionHistory,
+    ) -> Result<ProviderHistoryPage> {
+        self.load_session(ResumeSession {
+            conversation_id: request.conversation_id,
+            project: request.project,
+            native_session_id: request.native_session_id,
+            model: None,
+            effort: None,
+        })
+        .await?;
+        Ok(ProviderHistoryPage {
+            items: Vec::new(),
+            next_cursor: None,
+            full_read_fallback: true,
+        })
+    }
+
+    async fn flush_history_events(
+        &self,
+        project_id: ProjectId,
+        conversation_id: ConversationId,
+    ) -> Result<()> {
+        let barrier = Arc::new(ProviderHistoryBarrier::default());
+        self.shared.emit(
+            project_id,
+            conversation_id,
+            ProviderEventKind::HistoryBarrier {
+                barrier: Arc::clone(&barrier),
+            },
+        );
+        barrier.wait().await
     }
 
     async fn create_session(&self, request: CreateSession) -> Result<NativeSession> {
@@ -648,6 +753,26 @@ impl AgentProvider for GrokProvider {
     }
 
     async fn send_message(&self, request: SendMessage) -> Result<CommandAck> {
+        if self
+            .shared
+            .sessions
+            .read()
+            .expect("Grok session map poisoned")
+            .iter()
+            .all(|((_, session_id), binding)| {
+                session_id != &request.native_session_id
+                    || binding.conversation_id != request.conversation_id
+            })
+        {
+            self.resume_session(ResumeSession {
+                conversation_id: request.conversation_id,
+                project: request.project.clone(),
+                native_session_id: request.native_session_id.clone(),
+                model: request.model.clone(),
+                effort: request.effort.clone(),
+            })
+            .await?;
+        }
         let (project_id, connection, binding) = self
             .connection_for_bound_session(&request.native_session_id, request.conversation_id)
             .await?;
@@ -780,6 +905,17 @@ impl AgentProvider for GrokProvider {
             .update_selection(project_id, &request.native_session_id, model, effort);
         Ok(CommandAck)
     }
+}
+
+fn acp_timestamp_ms(value: Option<&str>) -> i64 {
+    value
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        .and_then(|timestamp| {
+            (timestamp.unix_timestamp_nanos() / 1_000_000)
+                .try_into()
+                .ok()
+        })
+        .unwrap_or_else(now_ms)
 }
 
 impl Shared {
@@ -1037,6 +1173,7 @@ impl Shared {
         model: Option<String>,
         effort: Option<String>,
     ) {
+        let prefix = format!("history:{session_id}:0");
         self.sessions
             .write()
             .expect("Grok session map poisoned")
@@ -1046,10 +1183,42 @@ impl Shared {
                     conversation_id,
                     model,
                     effort,
-                    agent_item_id: format!("agent:{}", Uuid::new_v4()),
-                    thought_item_id: format!("thought:{}", Uuid::new_v4()),
+                    replaying: false,
+                    turn_index: 0,
+                    user_item_id: format!("{prefix}:user"),
+                    agent_item_id: format!("{prefix}:agent"),
+                    thought_item_id: format!("{prefix}:thought"),
+                    replay_user_text: String::new(),
+                    replay_agent_text: String::new(),
+                    replay_thought_text: String::new(),
+                    replay_has_response: false,
+                    replay_image_index: 0,
                 },
             );
+    }
+
+    fn set_replaying(&self, project_id: ProjectId, session_id: &str, replaying: bool) {
+        let completed = {
+            let mut sessions = self.sessions.write().expect("Grok session map poisoned");
+            let Some(binding) = sessions.get_mut(&(project_id, session_id.to_owned())) else {
+                return;
+            };
+            binding.replaying = replaying;
+            if replaying {
+                binding.turn_index = 0;
+                binding.replay_user_text.clear();
+                binding.replay_agent_text.clear();
+                binding.replay_thought_text.clear();
+                binding.replay_has_response = false;
+                binding.replay_image_index = 0;
+                None
+            } else {
+                Some((binding.conversation_id, drain_replay_items(binding)))
+            }
+        };
+        if let Some((conversation_id, items)) = completed {
+            self.emit_replay_items(project_id, conversation_id, items);
+        }
     }
 
     fn start_turn(&self, project_id: ProjectId, session_id: &str) {
@@ -1059,8 +1228,15 @@ impl Shared {
             .expect("Grok session map poisoned")
             .get_mut(&(project_id, session_id.to_owned()))
         {
-            binding.agent_item_id = format!("agent:{}", Uuid::new_v4());
-            binding.thought_item_id = format!("thought:{}", Uuid::new_v4());
+            binding.turn_index += 1;
+            let prefix = format!("history:{session_id}:{}", binding.turn_index);
+            binding.user_item_id = format!("{prefix}:user");
+            binding.agent_item_id = format!("{prefix}:agent");
+            binding.thought_item_id = format!("{prefix}:thought");
+            binding.replay_user_text.clear();
+            binding.replay_agent_text.clear();
+            binding.replay_thought_text.clear();
+            binding.replay_has_response = false;
         }
     }
 
@@ -2037,6 +2213,83 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn replay_text_chunks_are_coalesced_into_stable_turn_items() {
+        let provider = GrokProvider::new();
+        let project_id = ProjectId::new();
+        let conversation_id = ConversationId::new();
+        provider
+            .shared
+            .bind_session(project_id, "history", conversation_id, None, None);
+        let mut events = provider.subscribe();
+
+        let replay = |provider: &GrokProvider| {
+            provider.shared.set_replaying(project_id, "history", true);
+            for (session_update, text) in [
+                ("user_message_chunk", "hel"),
+                ("user_message_chunk", "lo"),
+                ("agent_thought_chunk", "summary"),
+                ("agent_message_chunk", "ans"),
+                ("agent_message_chunk", "wer"),
+            ] {
+                provider.shared.handle_session_update(
+                    project_id,
+                    RawSessionNotification {
+                        session_id: SessionId::new("history"),
+                        update: serde_json::json!({
+                            "sessionUpdate": session_update,
+                            "content": {"type": "text", "text": text}
+                        }),
+                        meta: None,
+                    },
+                );
+            }
+            provider.shared.set_replaying(project_id, "history", false);
+        };
+        let collect = |events: &mut broadcast::Receiver<ProviderEvent>| {
+            (0..3)
+                .map(|_| {
+                    let event = events.try_recv().expect("coalesced history item");
+                    match event.kind {
+                        ProviderEventKind::HistoryItem {
+                            provider_item_id,
+                            kind,
+                        } => (provider_item_id, kind),
+                        other => panic!("unexpected replay event: {other:?}"),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        replay(&provider);
+        let first = collect(&mut events);
+        assert!(matches!(
+            &first[0].1,
+            TimelineItemKind::UserMessage { text } if text == "hello"
+        ));
+        assert!(matches!(
+            &first[1].1,
+            TimelineItemKind::AgentMessage { phase: AgentMessagePhase::ReasoningSummary, text }
+                if text == "summary"
+        ));
+        assert!(matches!(
+            &first[2].1,
+            TimelineItemKind::AgentMessage { phase: AgentMessagePhase::Final, text }
+                if text == "answer"
+        ));
+
+        replay(&provider);
+        let second = collect(&mut events);
+        assert_eq!(
+            first.iter().map(|item| &item.0).collect::<Vec<_>>(),
+            second.iter().map(|item| &item.0).collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
     #[tokio::test]
     async fn duplex_permission_resolution_and_cancel_notification() {
         let provider = GrokProvider::new();
@@ -2224,6 +2477,63 @@ mod tests {
 }
 
 impl Shared {
+    fn append_replay_text(
+        &self,
+        project_id: ProjectId,
+        session_id: &str,
+        kind: ReplayTextKind,
+        delta: &str,
+    ) {
+        let completed = {
+            let mut sessions = self.sessions.write().expect("Grok session map poisoned");
+            let Some(binding) = sessions.get_mut(&(project_id, session_id.to_owned())) else {
+                return;
+            };
+            let mut completed = Vec::new();
+            if matches!(kind, ReplayTextKind::User)
+                && (binding.turn_index == 0 || binding.replay_has_response)
+            {
+                if binding.turn_index > 0 {
+                    completed = drain_replay_items(binding);
+                }
+                start_replay_turn(binding, session_id);
+            } else if binding.turn_index == 0 {
+                start_replay_turn(binding, session_id);
+            }
+            match kind {
+                ReplayTextKind::User => binding.replay_user_text.push_str(delta),
+                ReplayTextKind::Agent => {
+                    binding.replay_has_response = true;
+                    binding.replay_agent_text.push_str(delta);
+                }
+                ReplayTextKind::Thought => {
+                    binding.replay_has_response = true;
+                    binding.replay_thought_text.push_str(delta);
+                }
+            }
+            (binding.conversation_id, completed)
+        };
+        self.emit_replay_items(project_id, completed.0, completed.1);
+    }
+
+    fn emit_replay_items(
+        &self,
+        project_id: ProjectId,
+        conversation_id: ConversationId,
+        items: Vec<(String, TimelineItemKind)>,
+    ) {
+        for (provider_item_id, kind) in items {
+            self.emit(
+                project_id,
+                conversation_id,
+                ProviderEventKind::HistoryItem {
+                    provider_item_id,
+                    kind,
+                },
+            );
+        }
+    }
+
     fn handle_session_update(&self, project_id: ProjectId, notification: RawSessionNotification) {
         let session_id = notification.session_id.to_string();
         let Some(binding) = self
@@ -2244,6 +2554,22 @@ impl Shared {
         };
 
         match update {
+            SessionUpdate::AgentMessageChunk(chunk) if binding.replaying => match chunk.content {
+                ContentBlock::Text(text) => self.append_replay_text(
+                    project_id,
+                    &session_id,
+                    ReplayTextKind::Agent,
+                    &text.text,
+                ),
+                content => self.emit_replay_content(
+                    project_id,
+                    &session_id,
+                    binding.conversation_id,
+                    AgentMessagePhase::Final,
+                    &content,
+                    "Grok image",
+                ),
+            },
             SessionUpdate::AgentMessageChunk(chunk) => self.emit_content(
                 project_id,
                 binding.conversation_id,
@@ -2252,6 +2578,22 @@ impl Shared {
                 &chunk.content,
                 "Grok image",
             ),
+            SessionUpdate::AgentThoughtChunk(chunk) if binding.replaying => match chunk.content {
+                ContentBlock::Text(text) => self.append_replay_text(
+                    project_id,
+                    &session_id,
+                    ReplayTextKind::Thought,
+                    &text.text,
+                ),
+                content => self.emit_replay_content(
+                    project_id,
+                    &session_id,
+                    binding.conversation_id,
+                    AgentMessagePhase::ReasoningSummary,
+                    &content,
+                    "Grok reasoning image",
+                ),
+            },
             SessionUpdate::AgentThoughtChunk(chunk) => self.emit_content(
                 project_id,
                 binding.conversation_id,
@@ -2270,7 +2612,7 @@ impl Shared {
                 project_id,
                 binding.conversation_id,
                 ProviderEventKind::Plan {
-                    provider_item_id: format!("plan:{session_id}"),
+                    provider_item_id: format!("plan:{session_id}:{}", binding.turn_index),
                     steps: plan
                         .entries
                         .into_iter()
@@ -2286,6 +2628,16 @@ impl Shared {
                         .collect(),
                 },
             ),
+            SessionUpdate::UserMessageChunk(chunk) if binding.replaying => {
+                if let ContentBlock::Text(text) = chunk.content {
+                    self.append_replay_text(
+                        project_id,
+                        &session_id,
+                        ReplayTextKind::User,
+                        &text.text,
+                    );
+                }
+            }
             SessionUpdate::UserMessageChunk(_)
             | SessionUpdate::AvailableCommandsUpdate(_)
             | SessionUpdate::CurrentModeUpdate(_)
@@ -2296,6 +2648,35 @@ impl Shared {
         }
     }
 
+    fn emit_replay_content(
+        &self,
+        project_id: ProjectId,
+        session_id: &str,
+        conversation_id: ConversationId,
+        phase: AgentMessagePhase,
+        content: &ContentBlock,
+        image_alt: &str,
+    ) {
+        let provider_item_id = {
+            let mut sessions = self.sessions.write().expect("Grok session map poisoned");
+            sessions
+                .get_mut(&(project_id, session_id.to_owned()))
+                .map(|binding| {
+                    binding.replay_image_index += 1;
+                    format!("history:{session_id}:image:{}", binding.replay_image_index)
+                })
+        };
+        self.emit_content_with_image_id(
+            project_id,
+            conversation_id,
+            "replay-content",
+            phase,
+            content,
+            image_alt,
+            provider_item_id.as_deref(),
+        );
+    }
+
     fn emit_content(
         &self,
         project_id: ProjectId,
@@ -2304,6 +2685,28 @@ impl Shared {
         phase: AgentMessagePhase,
         content: &ContentBlock,
         image_alt: &str,
+    ) {
+        self.emit_content_with_image_id(
+            project_id,
+            conversation_id,
+            provider_item_id,
+            phase,
+            content,
+            image_alt,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_content_with_image_id(
+        &self,
+        project_id: ProjectId,
+        conversation_id: ConversationId,
+        provider_item_id: &str,
+        phase: AgentMessagePhase,
+        content: &ContentBlock,
+        image_alt: &str,
+        image_provider_item_id: Option<&str>,
     ) {
         match content {
             ContentBlock::Text(text) => self.emit(
@@ -2320,6 +2723,7 @@ impl Shared {
                     project_id,
                     conversation_id,
                     ProviderEventKind::ImageBytes {
+                        provider_item_id: image_provider_item_id.map(str::to_owned),
                         bytes,
                         mime_type: image.mime_type.clone(),
                         alt: image_alt.to_owned(),
@@ -2347,6 +2751,7 @@ impl Shared {
                             project_id,
                             conversation_id,
                             ProviderEventKind::ImageBytes {
+                                provider_item_id: image_provider_item_id.map(str::to_owned),
                                 bytes,
                                 mime_type: mime_type.to_owned(),
                                 alt: image_alt.to_owned(),

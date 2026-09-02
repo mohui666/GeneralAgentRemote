@@ -68,6 +68,7 @@ impl AgentProvider for LoopProvider {
             supports_session_list: true,
             supports_resume: true,
             supports_steer: true,
+            ..ProviderCapabilities::default()
         }
     }
 
@@ -376,7 +377,9 @@ async fn relay_websocket_runs_the_authenticated_application_flow_once() {
     let send = ClientCommand::SendMessage {
         command_id: send_id,
         conversation_id,
+        client_message_id: Some("relay-e2e".to_owned()),
         text: "hello through relay".to_owned(),
+        attachments: Vec::new(),
     };
     send_client(&mut client, &send).await;
     let mut send_accepted = false;

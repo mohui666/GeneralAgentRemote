@@ -32,6 +32,9 @@ turn/interrupt
 
 - Picker entries come from paginated `model/list`. The wire `model` ID, advertised `supportedReasoningEfforts`, `defaultReasoningEffort`, and `hidden` flag are authoritative.
 - `thread/list` requests `cli`, `vscode`, and `appServer` sources, filters by the canonical cwd, and re-checks each returned cwd.
+- Project sync reads each changed thread through `thread/read`. The installed schema exposes no incremental history cursor, so the adapter performs an idempotent full-thread read and the Host merges stable native item IDs.
+- Conversation rename uses `thread/name/set`. A locally generated first-message title remains until Codex reports a non-empty Provider title; a user title is never overwritten by later sync.
+- Prompt input accepts only the adapter-advertised PNG/JPEG/WebP/GIF set (up to four images, 10 MiB each and 10 MiB total). Permission choices are adapter capability data rather than client constants because app-server does not enumerate them.
 - `turn/steer` requires the active `expectedTurnId`; the control is unavailable when no current turn exists.
 - Command, file, and permission approvals are server-initiated requests. The adapter retains their JSON-RPC request ID and answers that ID.
 - Only commentary/final Agent messages and user-visible reasoning summaries enter the timeline. Raw reasoning deltas/content are ignored.
@@ -57,6 +60,7 @@ Current Grok-specific compatibility boundary:
 - Grok 1.0.13 does not implement standard `session/set_config_option`; it reports model/effort under `_meta.modelState` and accepts the version-gated legacy `session/set_model` request. The adapter keeps this in `providers/grok.rs` and does not claim generic ACP support for it.
 - ACP v1 has no standard steer method. Grok 1.0.13 implements the unadvertised `_x.ai/interject` extension. The UI only enables steering when this exact compatible Provider version is active.
 - Authentication has no reliable ACP status call. A successful lightweight `grok models` probe indicates a logged-in local CLI; otherwise the Host reports the actual launch/auth error rather than treating executable presence as authentication.
+- ACP `session/load` replays the whole changed session and does not expose a portable incremental cursor. Text chunks are coalesced by turn, history events cross a persistence barrier before the sync watermark advances, and stable synthetic item IDs make repeated full reads idempotent. A missing/invalid ACP update timestamp deliberately forces another full replay. Grok does not advertise conversation rename or prompt-image input, so those controls remain unavailable for this Provider.
 
 Filesystem and terminal reverse requests are bound to the conversation project. Terminal output is capped and visibly marked when truncated; exit status is preserved. Permissions use the exact Provider-supplied options.
 

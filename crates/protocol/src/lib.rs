@@ -43,6 +43,47 @@ uuid_id!(AttachmentId);
 uuid_id!(CommandId);
 uuid_id!(ApprovalId);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionRisk {
+    Standard,
+    Elevated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionModeOption {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    pub risk: PermissionRisk,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AttachmentCapability {
+    pub allowed_mime_types: Vec<String>,
+    pub max_count: u16,
+    pub max_bytes: u64,
+    pub max_total_bytes: u64,
+}
+
+impl AttachmentCapability {
+    pub fn supported(&self) -> bool {
+        self.max_count > 0
+            && self.max_bytes > 0
+            && self.max_total_bytes > 0
+            && !self.allowed_mime_types.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientAttachment {
+    pub id: AttachmentId,
+    pub file_name: String,
+    pub mime_type: String,
+    #[serde(with = "serde_bytes")]
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
@@ -112,8 +153,11 @@ pub struct SessionOptionValue {
 pub struct ProjectSummary {
     pub id: ProjectId,
     pub display_name: String,
+    pub short_path: String,
     pub enabled_providers: Vec<ProviderId>,
     pub valid: bool,
+    pub last_activity_at_ms: Option<i64>,
+    pub conversation_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +179,16 @@ pub enum ConversationState {
     Offline,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationTitleSource {
+    #[default]
+    Fallback,
+    Generated,
+    Provider,
+    User,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: ConversationId,
@@ -143,6 +197,10 @@ pub struct Conversation {
     pub project_id: ProjectId,
     pub native_session_id: String,
     pub title: String,
+    #[serde(default)]
+    pub title_source: ConversationTitleSource,
+    #[serde(default)]
+    pub title_updated_at_ms: i64,
     pub selected_model: Option<String>,
     pub selected_effort: Option<String>,
     pub state: ConversationState,
@@ -254,6 +312,12 @@ pub struct TimelineItem {
     pub kind: TimelineItemKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimelinePageCursor {
+    pub created_at_ms: i64,
+    pub item_id: TimelineItemId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachmentMetadata {
     pub id: AttachmentId,
@@ -272,7 +336,13 @@ pub struct ProviderCapability {
     pub health: ProviderHealth,
     pub models: Vec<ModelOption>,
     pub supports_session_list: bool,
+    pub supports_history: bool,
+    pub supports_incremental_sync: bool,
+    pub supports_rename: bool,
     pub supports_steer: bool,
+    pub permission_modes: Vec<PermissionModeOption>,
+    pub default_permission_mode: Option<String>,
+    pub attachments: AttachmentCapability,
     pub sessions: Vec<SessionSummary>,
     pub limitation: Option<String>,
 }
@@ -301,6 +371,14 @@ pub enum ClientCommand {
         device_token: String,
     },
     GetSnapshot,
+    RefreshProjects {
+        provider: ProviderId,
+    },
+    SyncProject {
+        command_id: CommandId,
+        project_id: ProjectId,
+        provider: ProviderId,
+    },
     CreateConversation {
         command_id: CommandId,
         project_id: ProjectId,
@@ -309,10 +387,26 @@ pub enum ClientCommand {
         model: Option<String>,
         effort: Option<String>,
     },
+    StartConversation {
+        command_id: CommandId,
+        conversation_id: ConversationId,
+        project_id: ProjectId,
+        provider: ProviderId,
+        model: Option<String>,
+        effort: Option<String>,
+        permission_mode: Option<String>,
+        text: String,
+        #[serde(default)]
+        attachments: Vec<ClientAttachment>,
+    },
     SendMessage {
         command_id: CommandId,
         conversation_id: ConversationId,
+        #[serde(default)]
+        client_message_id: Option<String>,
         text: String,
+        #[serde(default)]
+        attachments: Vec<ClientAttachment>,
     },
     Steer {
         command_id: CommandId,
@@ -334,6 +428,16 @@ pub enum ClientCommand {
         option_id: String,
         value: String,
     },
+    RenameConversation {
+        command_id: CommandId,
+        conversation_id: ConversationId,
+        title: String,
+    },
+    GetConversationPage {
+        conversation_id: ConversationId,
+        before: Option<TimelinePageCursor>,
+        limit: u32,
+    },
     GetAttachment {
         attachment_id: AttachmentId,
     },
@@ -343,14 +447,19 @@ impl ClientCommand {
     pub fn command_id(&self) -> Option<CommandId> {
         match self {
             Self::CreateConversation { command_id, .. }
+            | Self::StartConversation { command_id, .. }
+            | Self::SyncProject { command_id, .. }
             | Self::SendMessage { command_id, .. }
             | Self::Steer { command_id, .. }
             | Self::Interrupt { command_id, .. }
             | Self::ResolveApproval { command_id, .. }
-            | Self::SetSessionOption { command_id, .. } => Some(*command_id),
+            | Self::SetSessionOption { command_id, .. }
+            | Self::RenameConversation { command_id, .. } => Some(*command_id),
             Self::Pair { .. }
             | Self::Authenticate { .. }
             | Self::GetSnapshot
+            | Self::RefreshProjects { .. }
+            | Self::GetConversationPage { .. }
             | Self::GetAttachment { .. } => None,
         }
     }
@@ -370,6 +479,23 @@ pub enum ServerMessage {
     },
     Snapshot {
         snapshot: Snapshot,
+    },
+    ProjectsUpdated {
+        provider: ProviderId,
+        projects: Vec<ProjectSummary>,
+        capabilities: Vec<ProviderCapability>,
+    },
+    ProjectSyncCompleted {
+        command_id: CommandId,
+        project_id: ProjectId,
+        provider: ProviderId,
+        conversations_synced: u32,
+        full_history_fallback: bool,
+    },
+    ConversationPage {
+        conversation_id: ConversationId,
+        items: Vec<TimelineItem>,
+        next_before: Option<TimelinePageCursor>,
     },
     ProviderChanged {
         capability: ProviderCapability,
@@ -497,7 +623,9 @@ mod tests {
         let command = ClientCommand::SendMessage {
             command_id: CommandId::new(),
             conversation_id: ConversationId::new(),
+            client_message_id: Some("client-message-1".to_owned()),
             text: "hello".to_owned(),
+            attachments: Vec::new(),
         };
         let bytes = encode(&command).expect("encode command");
         let decoded: ClientCommand = decode(&bytes).expect("decode command");
