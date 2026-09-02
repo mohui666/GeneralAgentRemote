@@ -132,6 +132,10 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
         defaults(it.copy(showingNewConversation = true, selectedConversationId = null, attachments = emptyMap()))
     }
 
+    fun showConversationList() = mutableState.update {
+        it.copy(showingNewConversation = false, selectedConversationId = null, attachments = emptyMap())
+    }
+
     fun selectConversation(id: UUID) {
         mutableState.update {
             it.copy(selectedConversationId = id, showingNewConversation = false, attachments = emptyMap())
@@ -385,8 +389,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                         conversations = snapshot.conversations.sortedByDescending(Conversation::updatedAtMs),
                         timeline = snapshot.timeline.sortedWith(timelineComparator),
                     ),
-                    selectedConversationId = selectedStillExists
-                        ?: snapshot.conversations.maxByOrNull(Conversation::updatedAtMs)?.id,
+                    selectedConversationId = selectedStillExists,
                     showingNewConversation = snapshot.conversations.isEmpty(),
                     attachments = emptyMap(),
                     pendingCommands = emptySet(),
