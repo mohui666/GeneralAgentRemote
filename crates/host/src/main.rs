@@ -352,6 +352,7 @@ async fn smoke_one(provider: Arc<dyn AgentProvider>, project: &Project) -> Resul
                 .to_owned(),
             model: selected_model,
             effort: selected_effort,
+            permission_mode: None,
         })
         .await?;
 

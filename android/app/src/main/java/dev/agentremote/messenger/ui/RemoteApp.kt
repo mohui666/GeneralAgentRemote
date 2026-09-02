@@ -12,6 +12,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -23,12 +24,14 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -36,13 +39,20 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AddComment
+import androidx.compose.material.icons.outlined.Security
+import androidx.compose.material.icons.outlined.TouchApp
+import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.NavigationDrawerItem
@@ -76,6 +86,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -113,6 +124,7 @@ private val RemoteText = Color(0xFFF5F5F6)
 private val RemoteMuted = Color(0xFFA7A7AD)
 private val RemotePurple = Color(0xFFA477ED)
 private val RemoteGreen = Color(0xFF58D59A)
+private val RemoteOrange = Color(0xFFFF6B2C)
 
 private val AgentRemoteColors = darkColorScheme(
     primary = RemotePurple,
@@ -556,7 +568,12 @@ private fun RemoteTopBar(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 IconButton(onClick = onNewConversation, modifier = Modifier.size(50.dp)) {
-                    RemoteIcon(RemoteGlyph.Compose, "新建会话", Modifier.size(23.dp))
+                    Icon(
+                        imageVector = Icons.Rounded.AddComment,
+                        contentDescription = "新建会话",
+                        modifier = Modifier.size(24.dp),
+                        tint = RemoteText,
+                    )
                 }
                 Box {
                     IconButton(onClick = onToggleMenu, modifier = Modifier.size(50.dp)) {
@@ -977,7 +994,7 @@ private fun ConversationScreen(
         if (timeline.isNotEmpty()) listState.animateScrollToItem(timeline.lastIndex)
     }
     Column(Modifier.fillMaxSize().navigationBarsPadding().imePadding()) {
-        ConversationHeader(conversation, viewModel)
+        ConversationHeader(conversation)
         if (timeline.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -987,22 +1004,28 @@ private fun ConversationScreen(
                 }
             }
         } else {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.weight(1f).fillMaxWidth(),
-                contentPadding = PaddingValues(horizontal = 20.dp, vertical = 14.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
-            ) {
-                items(timeline, key = { it.id }) { item ->
-                    TimelineCard(
-                        item = item,
-                        attachment = (item.content as? TimelineContent.Image)?.let {
-                            state.attachments[it.attachmentId]
-                        },
-                        approvalPending = (item.content as? TimelineContent.Approval)?.approvalId in state.pendingApprovals,
-                        onApproval = viewModel::resolveApproval,
-                    )
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(start = 20.dp, top = 14.dp, end = 25.dp, bottom = 14.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    items(timeline, key = { it.id }) { item ->
+                        TimelineCard(
+                            item = item,
+                            attachment = (item.content as? TimelineContent.Image)?.let {
+                                state.attachments[it.attachmentId]
+                            },
+                            approvalPending = (item.content as? TimelineContent.Approval)?.approvalId in state.pendingApprovals,
+                            onApproval = viewModel::resolveApproval,
+                        )
+                    }
                 }
+                CodexScrollbar(
+                    state = listState,
+                    modifier = Modifier.align(Alignment.CenterEnd).padding(vertical = 10.dp, horizontal = 4.dp),
+                )
             }
         }
         Composer(
@@ -1010,41 +1033,36 @@ private fun ConversationScreen(
             running = conversation.running,
             online = state.online,
             supportsSteer = capability?.supportsSteer == true,
+            sessionOptions = conversation.sessionOptions,
             onDraft = viewModel::setDraft,
             onSend = viewModel::sendMessage,
             onSteer = viewModel::steer,
             onInterrupt = viewModel::interrupt,
+            onSessionOption = viewModel::setSessionOption,
         )
     }
 }
 
 @Composable
-private fun ConversationHeader(conversation: Conversation, viewModel: RemoteViewModel) {
-    Column(
+private fun ConversationHeader(conversation: Conversation) {
+    Row(
         Modifier.fillMaxWidth().background(RemoteBlack).padding(horizontal = 20.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text(
-                    conversation.title,
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    "${conversation.provider.label} · ${conversation.selectedModel ?: "默认模型"}",
-                    color = RemoteMuted,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-            StatePill(conversation.state)
+        Column(Modifier.weight(1f)) {
+            Text(
+                conversation.title,
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                conversation.provider.label,
+                color = RemoteMuted,
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
-        conversation.sessionOptions.forEach { option ->
-            SessionOptionPicker(option, enabled = !conversation.running) { value ->
-                viewModel.setSessionOption(option.id, value)
-            }
-        }
+        StatePill(conversation.state)
     }
 }
 
@@ -1067,96 +1085,352 @@ private fun StatePill(state: String) {
     }
 }
 
-@Composable
-private fun SessionOptionPicker(option: SessionOption, enabled: Boolean, onSelect: (String) -> Unit) {
-    Picker(
-        label = option.displayName,
-        entries = option.values.map { PickerEntry(it.value, it.displayName) },
-        selected = option.currentValue,
-        onSelect = onSelect,
-        enabled = enabled,
-    )
-}
-
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun Composer(
     draft: String,
     running: Boolean,
     online: Boolean,
     supportsSteer: Boolean,
+    sessionOptions: List<SessionOption>,
     onDraft: (String) -> Unit,
     onSend: () -> Unit,
     onSteer: () -> Unit,
     onInterrupt: () -> Unit,
+    onSessionOption: (String, String) -> Unit,
 ) {
     val inputEnabled = online && (!running || supportsSteer)
-    Row(
+    var settingsOpen by rememberSaveable { mutableStateOf(false) }
+    Column(
         Modifier.fillMaxWidth().background(RemoteBlack).padding(horizontal = 14.dp, vertical = 12.dp),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-        verticalAlignment = Alignment.Bottom,
     ) {
-        Surface(
-            modifier = Modifier.weight(1f).heightIn(min = 56.dp, max = 144.dp),
-            color = RemoteSurfaceRaised,
-            shape = RoundedCornerShape(28.dp),
-            border = BorderStroke(1.dp, RemoteBorder),
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.Bottom,
         ) {
-            Row(
-                Modifier.fillMaxWidth().padding(start = 18.dp, end = 5.dp, top = 5.dp, bottom = 5.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            Surface(
+                modifier = Modifier.weight(1f).heightIn(min = 56.dp, max = 144.dp),
+                color = RemoteSurfaceRaised,
+                shape = RoundedCornerShape(28.dp),
+                border = BorderStroke(1.dp, RemoteBorder),
             ) {
-                BasicTextField(
-                    value = draft,
-                    onValueChange = onDraft,
-                    enabled = inputEnabled,
-                    textStyle = MaterialTheme.typography.bodyLarge.copy(color = if (inputEnabled) RemoteText else RemoteMuted),
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(vertical = 9.dp)
-                        .semantics {
-                            contentDescription = when {
-                                running && !supportsSteer -> "当前 Agent 不支持追加指令"
-                                running -> "输入追加指令"
-                                else -> "回复 Agent"
+                Row(
+                    Modifier.fillMaxWidth().padding(start = 18.dp, end = 5.dp, top = 5.dp, bottom = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    BasicTextField(
+                        value = draft,
+                        onValueChange = onDraft,
+                        enabled = inputEnabled,
+                        textStyle = MaterialTheme.typography.bodyLarge.copy(color = if (inputEnabled) RemoteText else RemoteMuted),
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(vertical = 9.dp)
+                            .semantics {
+                                contentDescription = when {
+                                    running && !supportsSteer -> "当前 Agent 不支持追加指令"
+                                    running -> "输入追加指令"
+                                    else -> "回复 Agent"
+                                }
+                            },
+                        maxLines = 5,
+                        decorationBox = { input ->
+                            Box {
+                                if (draft.isEmpty()) {
+                                    Text(
+                                        when {
+                                            running && !supportsSteer -> "当前 Agent 不支持追加指令"
+                                            running -> "输入追加指令…"
+                                            else -> "回复 Agent"
+                                        },
+                                        color = RemoteMuted,
+                                    )
+                                }
+                                input()
                             }
                         },
-                    maxLines = 5,
-                    decorationBox = { input ->
-                        Box {
-                            if (draft.isEmpty()) {
-                                Text(
-                                    when {
-                                        running && !supportsSteer -> "当前 Agent 不支持追加指令"
-                                        running -> "输入追加指令…"
-                                        else -> "回复 Agent"
-                                    },
-                                    color = RemoteMuted,
-                                )
-                            }
-                            input()
+                    )
+                    if (!running || supportsSteer) {
+                        IconButton(
+                            onClick = if (running) onSteer else onSend,
+                            enabled = online && draft.isNotBlank(),
+                            modifier = Modifier.size(46.dp).background(Color.White, CircleShape),
+                        ) {
+                            RemoteIcon(RemoteGlyph.Send, if (running) "追加指令" else "发送", Modifier.size(22.dp), Color.Black)
                         }
-                    },
+                    }
+                }
+            }
+            if (running) {
+                IconButton(
+                    onClick = onInterrupt,
+                    enabled = online,
+                    modifier = Modifier.size(56.dp).border(1.dp, Color(0xFF70343D), CircleShape).background(Color(0xFF2B171B), CircleShape),
+                ) {
+                    RemoteIcon(RemoteGlyph.Stop, "停止", Modifier.size(22.dp), MaterialTheme.colorScheme.error)
+                }
+            }
+        }
+        if (sessionOptions.isNotEmpty()) {
+            SessionSettingsBar(
+                options = sessionOptions,
+                enabled = online && !running,
+                onClick = { settingsOpen = true },
+            )
+        }
+    }
+    if (settingsOpen) {
+        SessionSettingsSheet(
+            options = sessionOptions,
+            enabled = online && !running,
+            onDismiss = { settingsOpen = false },
+            onSelect = onSessionOption,
+        )
+    }
+}
+
+@Composable
+private fun SessionSettingsBar(options: List<SessionOption>, enabled: Boolean, onClick: () -> Unit) {
+    val model = options.find { it.id == "model" }
+    val effort = options.find { it.id == "reasoning_effort" || it.id == "thought_level" }
+    val permission = options.find { it.id == "permission_mode" }
+    val primary = listOfNotNull(
+        model?.let(::sessionOptionValueLabel),
+        effort?.let(::sessionOptionValueLabel),
+    ).joinToString(" · ").ifEmpty { "会话设置" }
+    Row(
+        Modifier.fillMaxWidth().padding(top = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        SessionSettingsChip(
+            label = primary,
+            enabled = enabled,
+            onClick = onClick,
+            modifier = Modifier.weight(1f),
+        )
+        permission?.let {
+            SessionSettingsChip(
+                label = sessionOptionValueLabel(it),
+                enabled = enabled,
+                onClick = onClick,
+                modifier = Modifier.widthIn(min = 100.dp, max = 132.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun SessionSettingsChip(
+    label: String,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier.height(40.dp).clip(RoundedCornerShape(14.dp)).clickable(enabled = enabled, onClick = onClick),
+        color = RemoteSurfaceRaised,
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, RemoteBorder),
+    ) {
+        Row(
+            Modifier.fillMaxSize().padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+        ) {
+            Text(
+                label,
+                modifier = Modifier.weight(1f),
+                color = if (enabled) RemoteText else RemoteMuted,
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.width(7.dp))
+            RemoteIcon(RemoteGlyph.ChevronDown, null, Modifier.size(14.dp), RemoteMuted)
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SessionSettingsSheet(
+    options: List<SessionOption>,
+    enabled: Boolean,
+    onDismiss: () -> Unit,
+    onSelect: (String, String) -> Unit,
+) {
+    var activeOptionId by rememberSaveable { mutableStateOf<String?>(null) }
+    val activeOption = options.find { it.id == activeOptionId }
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = RemoteSurfaceRaised,
+        contentColor = RemoteText,
+    ) {
+        if (activeOption == null) {
+            Column(
+                Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text("会话设置", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(bottom = 10.dp))
+                options.forEach { option ->
+                    SessionSettingRow(option = option, enabled = enabled) { activeOptionId = option.id }
+                }
+                if (!enabled) {
+                    Text("Agent 运行时不能修改这些设置", color = RemoteMuted, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
+                }
+            }
+        } else {
+            Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 20.dp)) {
+                TextButton(onClick = { activeOptionId = null }) { Text("‹  会话设置") }
+                Text(
+                    if (activeOption.id == "permission_mode") "应如何批准 ChatGPT 操作？" else sessionOptionLabel(activeOption),
+                    style = MaterialTheme.typography.titleLarge,
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp),
                 )
-                if (!running || supportsSteer) {
-                    IconButton(
-                        onClick = if (running) onSteer else onSend,
-                        enabled = online && draft.isNotBlank(),
-                        modifier = Modifier.size(46.dp).background(Color.White, CircleShape),
-                    ) {
-                        RemoteIcon(RemoteGlyph.Send, if (running) "追加指令" else "发送", Modifier.size(22.dp), Color.Black)
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 430.dp)) {
+                    items(activeOption.values, key = { it.value }) { value ->
+                        val selected = value.value == activeOption.currentValue
+                        val permission = activeOption.id == "permission_mode"
+                        val selectedColor = if (permission && selected) RemoteOrange else RemoteText
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = if (permission) 68.dp else 58.dp)
+                                .clip(RoundedCornerShape(18.dp))
+                                .clickable(enabled = enabled) {
+                                    onSelect(activeOption.id, value.value)
+                                    activeOptionId = null
+                                }
+                                .background(
+                                    when {
+                                        permission && selected -> RemoteOrange.copy(alpha = 0.08f)
+                                        selected -> Color(0xFF303033)
+                                        else -> Color.Transparent
+                                    },
+                                )
+                                .border(
+                                    1.dp,
+                                    if (permission && selected) RemoteOrange.copy(alpha = 0.55f) else Color.Transparent,
+                                    RoundedCornerShape(18.dp),
+                                )
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            if (permission) {
+                                Icon(
+                                    imageVector = permissionIcon(value.value),
+                                    contentDescription = null,
+                                    modifier = Modifier.size(22.dp),
+                                    tint = selectedColor,
+                                )
+                                Spacer(Modifier.width(12.dp))
+                            }
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    sessionOptionValueLabel(activeOption, value.value),
+                                    color = selectedColor,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                if (permission) permissionDescription(value.value)?.let {
+                                    Text(it, color = RemoteMuted, style = MaterialTheme.typography.bodySmall)
+                                }
+                            }
+                            if (selected) RemoteIcon(RemoteGlyph.Check, null, Modifier.size(19.dp), selectedColor)
+                        }
                     }
                 }
             }
         }
-        if (running) {
-            IconButton(
-                onClick = onInterrupt,
-                enabled = online,
-                modifier = Modifier.size(56.dp).border(1.dp, Color(0xFF70343D), CircleShape).background(Color(0xFF2B171B), CircleShape),
-            ) {
-                RemoteIcon(RemoteGlyph.Stop, "停止", Modifier.size(22.dp), MaterialTheme.colorScheme.error)
-            }
-        }
+        Spacer(Modifier.navigationBarsPadding())
+    }
+}
+
+@Composable
+private fun SessionSettingRow(option: SessionOption, enabled: Boolean, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .height(58.dp)
+            .clip(RoundedCornerShape(17.dp))
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(sessionOptionLabel(option), modifier = Modifier.weight(1f), fontWeight = FontWeight.Medium)
+        Text(sessionOptionValueLabel(option), color = RemoteMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Spacer(Modifier.width(10.dp))
+        Text("›", color = RemoteMuted, style = MaterialTheme.typography.titleLarge)
+    }
+}
+
+private fun sessionOptionLabel(option: SessionOption): String = when (option.id) {
+    "model" -> "模型"
+    "reasoning_effort", "thought_level" -> "推理强度"
+    "permission_mode" -> "权限"
+    else -> option.displayName
+}
+
+private fun sessionOptionValueLabel(option: SessionOption): String =
+    sessionOptionValueLabel(option, option.currentValue)
+
+private fun sessionOptionValueLabel(option: SessionOption, value: String): String = when {
+    option.id == "permission_mode" -> when (value) {
+        "request_approval" -> "请求批准"
+        "auto_review" -> "帮我批准"
+        "full_access" -> "完全访问权限"
+        else -> option.values.find { it.value == value }?.displayName ?: value
+    }
+    option.id == "reasoning_effort" || option.id == "thought_level" -> when (value) {
+        "minimal" -> "最低"
+        "low" -> "低"
+        "medium" -> "中等"
+        "high" -> "高"
+        "xhigh" -> "极高"
+        "max" -> "最高"
+        "ultra" -> "超高"
+        else -> option.values.find { it.value == value }?.displayName ?: value
+    }
+    else -> option.values.find { it.value == value }?.displayName ?: value
+}
+
+private fun permissionDescription(value: String): String? = when (value) {
+    "request_approval" -> "编辑外部文件和使用互联网时始终询问"
+    "auto_review" -> "仅对检测到的风险操作请求批准"
+    "full_access" -> "可不受限制地访问互联网和你电脑上的任何文件"
+    else -> null
+}
+
+private fun permissionIcon(value: String): ImageVector = when (value) {
+    "request_approval" -> Icons.Outlined.TouchApp
+    "auto_review" -> Icons.Outlined.Security
+    else -> Icons.Outlined.WarningAmber
+}
+
+@Composable
+private fun CodexScrollbar(state: LazyListState, modifier: Modifier = Modifier) {
+    val layout = state.layoutInfo
+    val visibleCount = layout.visibleItemsInfo.size
+    val totalCount = layout.totalItemsCount
+    if (visibleCount == 0 || totalCount <= visibleCount || (!state.canScrollBackward && !state.canScrollForward)) return
+    BoxWithConstraints(modifier.fillMaxHeight().width(7.dp)) {
+        val thumbHeight = (maxHeight * (visibleCount.toFloat() / totalCount)).coerceIn(38.dp, maxHeight)
+        val lastStartIndex = (totalCount - visibleCount).coerceAtLeast(1)
+        val firstItemSize = layout.visibleItemsInfo.firstOrNull()?.size?.coerceAtLeast(1) ?: 1
+        val fractionalIndex = state.firstVisibleItemIndex + state.firstVisibleItemScrollOffset.toFloat() / firstItemSize
+        val progress = (fractionalIndex / lastStartIndex).coerceIn(0f, 1f)
+        val thumbOffset = (maxHeight - thumbHeight) * progress
+        Box(
+            Modifier
+                .align(Alignment.TopCenter)
+                .offset(y = thumbOffset)
+                .width(3.dp)
+                .height(thumbHeight)
+                .background(
+                    if (state.isScrollInProgress) Color(0xFF9B9B9F) else Color(0xFF66666A),
+                    CircleShape,
+                ),
+        )
     }
 }
 
@@ -1187,11 +1461,7 @@ private fun TimelineCard(
             title = "计划",
             body = content.steps.joinToString("\n") { "${statusMark(it.status)} ${it.text}" },
         )
-        is TimelineContent.ToolCall -> GenericTimelineCard(
-            title = "工具 · ${content.name}",
-            status = content.status,
-            body = listOfNotNull(content.inputSummary, content.outputSummary).joinToString("\n\n").ifBlank { null },
-        )
+        is TimelineContent.ToolCall -> ToolTimelineCard(content)
         is TimelineContent.Command -> CodeTimelineCard(content)
         is TimelineContent.FileChange -> GenericTimelineCard(
             title = "文件 · ${content.changeKind}",
@@ -1206,6 +1476,59 @@ private fun TimelineCard(
             error = true,
         )
     }
+}
+
+@Composable
+private fun ToolTimelineCard(content: TimelineContent.ToolCall) {
+    val input = meaningfulToolSummary(content.inputSummary)
+    val output = meaningfulToolSummary(content.outputSummary)?.takeUnless { it == input }
+    val displayName = when (content.name) {
+        "web_search" -> "网页搜索"
+        "image_generation" -> "图片生成"
+        "contextCompaction" -> "上下文压缩"
+        "subAgentActivity" -> "子 Agent"
+        else -> content.name
+    }
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = RemoteSurface,
+        shape = RoundedCornerShape(22.dp),
+        border = BorderStroke(1.dp, RemoteBorder),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("工具 · $displayName", fontWeight = FontWeight.SemiBold)
+                    if (displayName != content.name) {
+                        Text(content.name, color = RemoteMuted, style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+                Text(stateLabel(content.status), color = RemoteMuted, style = MaterialTheme.typography.labelMedium)
+            }
+            input?.let { ToolSummaryRow("输入", it) }
+            output?.let { ToolSummaryRow("结果", it) }
+        }
+    }
+}
+
+@Composable
+private fun ToolSummaryRow(label: String, value: String) {
+    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Text(label, color = RemoteMuted, style = MaterialTheme.typography.labelSmall)
+        Text(
+            value,
+            color = RemoteText,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+            maxLines = 8,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+private fun meaningfulToolSummary(value: String?): String? {
+    val summary = value?.trim().orEmpty()
+    return summary.takeUnless { it.isEmpty() || it == "[]" || it == "{}" || it == "null" || it == "\"\"" }
 }
 
 @Composable

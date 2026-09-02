@@ -104,11 +104,16 @@ impl CodexProvider {
                 )
                 .await?;
             validate_thread_project(&response.thread, &context.project_path)?;
+            let permission_mode =
+                permission_mode_from_response(&response.sandbox, &response.approvals_reviewer)
+                    .map(str::to_owned)
+                    .or(context.permission_mode.clone());
             self.shared.register_session(
                 response.thread.id.clone(),
                 SessionContext {
                     model: Some(response.model),
                     effort: response.reasoning_effort,
+                    permission_mode,
                     loaded_generation: wire.generation,
                     ..context.clone()
                 },
@@ -331,6 +336,9 @@ impl AgentProvider for CodexProvider {
         validate_thread_project(&response.thread, &request.project.canonical_path)?;
         let selected_model = Some(response.model.clone());
         let selected_effort = request.effort.clone().or(response.reasoning_effort.clone());
+        let permission_mode =
+            permission_mode_from_response(&response.sandbox, &response.approvals_reviewer)
+                .map(str::to_owned);
         self.shared.register_session(
             response.thread.id.clone(),
             SessionContext {
@@ -339,6 +347,7 @@ impl AgentProvider for CodexProvider {
                 project_path: request.project.canonical_path.clone(),
                 model: selected_model.clone(),
                 effort: selected_effort.clone(),
+                permission_mode: permission_mode.clone(),
                 loaded_generation: wire.generation,
             },
         );
@@ -347,6 +356,7 @@ impl AgentProvider for CodexProvider {
             response.thread,
             selected_model,
             selected_effort,
+            permission_mode,
             &models,
         ))
     }
@@ -384,6 +394,9 @@ impl AgentProvider for CodexProvider {
         validate_thread_project(&response.thread, &request.project.canonical_path)?;
         let selected_model = Some(response.model.clone());
         let selected_effort = request.effort.clone().or(response.reasoning_effort.clone());
+        let permission_mode =
+            permission_mode_from_response(&response.sandbox, &response.approvals_reviewer)
+                .map(str::to_owned);
         self.shared.register_session(
             response.thread.id.clone(),
             SessionContext {
@@ -392,6 +405,7 @@ impl AgentProvider for CodexProvider {
                 project_path: request.project.canonical_path.clone(),
                 model: selected_model.clone(),
                 effort: selected_effort.clone(),
+                permission_mode: permission_mode.clone(),
                 loaded_generation: wire.generation,
             },
         );
@@ -400,6 +414,7 @@ impl AgentProvider for CodexProvider {
             response.thread,
             selected_model,
             selected_effort,
+            permission_mode,
             &models,
         ))
     }
@@ -408,6 +423,15 @@ impl AgentProvider for CodexProvider {
         let (wire, context) = self
             .ensure_loaded_session(request.conversation_id, &request.native_session_id)
             .await?;
+        let permission = request
+            .permission_mode
+            .as_deref()
+            .or(context.permission_mode.as_deref())
+            .map(|mode| permission_turn_config(mode, &context.project_path))
+            .transpose()?;
+        let approval_policy = permission.as_ref().map(|config| config.0);
+        let approvals_reviewer = permission.as_ref().map_or("user", |config| config.1);
+        let sandbox_policy = permission.map(|config| config.2);
         let response: TurnStartResponse = wire
             .request(
                 "turn/start",
@@ -419,9 +443,11 @@ impl AgentProvider for CodexProvider {
                         text: request.text,
                     }],
                     cwd: path_string(&context.project_path),
-                    approvals_reviewer: "user",
+                    approvals_reviewer,
                     model: request.model.as_deref().or(context.model.as_deref()),
                     effort: request.effort.as_deref().or(context.effort.as_deref()),
+                    approval_policy,
+                    sandbox_policy,
                 },
             )
             .await?;
@@ -544,6 +570,10 @@ impl AgentProvider for CodexProvider {
         match request.option_id.as_str() {
             "model" => context.model = Some(request.value),
             "reasoning_effort" | "thought_level" => context.effort = Some(request.value),
+            "permission_mode" => {
+                permission_turn_config(&request.value, &context.project_path)?;
+                context.permission_mode = Some(request.value);
+            }
             _ => bail!("unsupported Codex session option"),
         }
         Ok(CommandAck)
@@ -1616,6 +1646,7 @@ struct SessionContext {
     project_path: PathBuf,
     model: Option<String>,
     effort: Option<String>,
+    permission_mode: Option<String>,
     loaded_generation: u64,
 }
 
@@ -1828,6 +1859,8 @@ struct ThreadOpenResponse {
     model: String,
     #[serde(default)]
     reasoning_effort: Option<String>,
+    approvals_reviewer: String,
+    sandbox: Value,
 }
 
 #[derive(Serialize)]
@@ -1842,6 +1875,10 @@ struct TurnStartParams<'a> {
     model: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     effort: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_policy: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sandbox_policy: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -2167,10 +2204,46 @@ fn validate_thread_project(thread: &CodexThread, project: &Path) -> Result<()> {
     Ok(())
 }
 
+fn permission_mode_from_response(
+    sandbox: &Value,
+    approvals_reviewer: &str,
+) -> Option<&'static str> {
+    match sandbox.get("type").and_then(Value::as_str) {
+        Some("dangerFullAccess") => Some("full_access"),
+        Some("readOnly" | "workspaceWrite") if approvals_reviewer == "auto_review" => {
+            Some("auto_review")
+        }
+        Some("readOnly" | "workspaceWrite") => Some("request_approval"),
+        _ => None,
+    }
+}
+
+fn permission_turn_config(
+    mode: &str,
+    project_path: &Path,
+) -> Result<(&'static str, &'static str, Value)> {
+    let workspace = || {
+        json!({
+            "type":"workspaceWrite",
+            "writableRoots":[path_string(project_path)],
+            "networkAccess":"restricted",
+            "excludeTmpdirEnvVar":false,
+            "excludeSlashTmp":false
+        })
+    };
+    match mode {
+        "request_approval" => Ok(("on-request", "user", workspace())),
+        "auto_review" => Ok(("on-request", "auto_review", workspace())),
+        "full_access" => Ok(("never", "user", json!({"type":"dangerFullAccess"}))),
+        _ => bail!("unsupported Codex permission mode {mode}"),
+    }
+}
+
 fn native_session(
     thread: CodexThread,
     selected_model: Option<String>,
     selected_effort: Option<String>,
+    permission_mode: Option<String>,
     models: &[ModelOption],
 ) -> NativeSession {
     let title = thread
@@ -2213,6 +2286,25 @@ fn native_session(
                     .collect(),
             });
         }
+    }
+    if let Some(permission_mode) = permission_mode {
+        session_options.push(SessionOption {
+            id: "permission_mode".to_owned(),
+            display_name: "Permissions".to_owned(),
+            category: Some("Codex".to_owned()),
+            current_value: permission_mode,
+            values: [
+                ("request_approval", "Request approval"),
+                ("auto_review", "Auto review"),
+                ("full_access", "Full access permissions"),
+            ]
+            .into_iter()
+            .map(|(value, display_name)| SessionOptionValue {
+                value: value.to_owned(),
+                display_name: display_name.to_owned(),
+            })
+            .collect(),
+        });
     }
     NativeSession {
         native_session_id: thread.id,
@@ -2452,6 +2544,7 @@ mod tests {
                 project_path: project.canonical_path,
                 model: None,
                 effort: None,
+                permission_mode: None,
                 loaded_generation: 1,
             },
         );
@@ -2523,6 +2616,7 @@ mod tests {
                 project_path: project.canonical_path,
                 model: None,
                 effort: None,
+                permission_mode: None,
                 loaded_generation: 1,
             },
         );
@@ -2583,6 +2677,7 @@ mod tests {
                 project_path: project.canonical_path.clone(),
                 model: None,
                 effort: None,
+                permission_mode: None,
                 loaded_generation: 1,
             },
         );

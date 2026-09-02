@@ -334,6 +334,11 @@ impl AppService {
         conversation.revision += 1;
         conversation.updated_at_ms = now_ms();
         self.save_and_emit_conversation(&conversation)?;
+        let permission_mode = conversation
+            .session_options
+            .iter()
+            .find(|option| option.id == "permission_mode")
+            .map(|option| option.current_value.clone());
         if let Err(error) = provider
             .send_message(SendMessage {
                 conversation_id,
@@ -341,6 +346,7 @@ impl AppService {
                 text,
                 model: conversation.selected_model.clone(),
                 effort: conversation.selected_effort.clone(),
+                permission_mode,
             })
             .await
         {

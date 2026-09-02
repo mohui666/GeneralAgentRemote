@@ -39,6 +39,7 @@ pub struct SendMessage {
     pub text: String,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub permission_mode: Option<String>,
 }
 
 #[derive(Debug, Clone)]
