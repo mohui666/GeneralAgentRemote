@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Component, Path},
     sync::{
@@ -24,7 +24,7 @@ use crate::{
         ProviderHistoryItem, ProviderRegistry, ReadSessionHistory, RenameSession, ResolveApproval,
         ResumeSession, SendMessage, SetSessionOption, SteerMessage,
     },
-    storage::{IssuedDevice, Project, Storage, now_ms},
+    storage::{IssuedDevice, Project, Storage, StoredCommand, now_ms},
 };
 
 #[derive(Debug, Clone)]
@@ -32,6 +32,63 @@ struct PendingApproval {
     provider: ProviderId,
     conversation_id: ConversationId,
     provider_request_id: String,
+}
+
+type CommandExecutionKey = (DeviceId, agent_remote_protocol::CommandId);
+
+struct CommandExecutionEntry {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    users: usize,
+}
+
+struct CommandExecutionTicket<'a> {
+    key: CommandExecutionKey,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    entries: &'a Mutex<HashMap<CommandExecutionKey, CommandExecutionEntry>>,
+}
+
+impl Drop for CommandExecutionTicket<'_> {
+    fn drop(&mut self) {
+        let mut entries = self.entries.lock().expect("command lock mutex poisoned");
+        let remove = {
+            let entry = entries.get_mut(&self.key).expect("command lock entry");
+            entry.users -= 1;
+            entry.users == 0
+        };
+        if remove {
+            entries.remove(&self.key);
+        }
+    }
+}
+
+struct ConversationMutationEntry {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    users: usize,
+}
+
+struct ConversationMutationTicket<'a> {
+    conversation_id: ConversationId,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    entries: &'a Mutex<HashMap<ConversationId, ConversationMutationEntry>>,
+}
+
+impl Drop for ConversationMutationTicket<'_> {
+    fn drop(&mut self) {
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("conversation mutation mutex poisoned");
+        let remove = {
+            let entry = entries
+                .get_mut(&self.conversation_id)
+                .expect("conversation mutation entry");
+            entry.users -= 1;
+            entry.users == 0
+        };
+        if remove {
+            entries.remove(&self.conversation_id);
+        }
+    }
 }
 
 pub struct AppService {
@@ -47,6 +104,8 @@ pub struct AppService {
     provider_approval_ids: Mutex<HashMap<(ConversationId, String), ApprovalId>>,
     event_pumps_started: AtomicBool,
     conversation_start_lock: tokio::sync::Mutex<()>,
+    command_execution_locks: Mutex<HashMap<CommandExecutionKey, CommandExecutionEntry>>,
+    conversation_mutation_locks: Mutex<HashMap<ConversationId, ConversationMutationEntry>>,
 }
 
 impl AppService {
@@ -76,6 +135,8 @@ impl AppService {
             provider_approval_ids: Mutex::new(HashMap::new()),
             event_pumps_started: AtomicBool::new(false),
             conversation_start_lock: tokio::sync::Mutex::new(()),
+            command_execution_locks: Mutex::new(HashMap::new()),
+            conversation_mutation_locks: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -95,23 +156,40 @@ impl AppService {
             let mut events = provider.subscribe();
             let service = Arc::clone(self);
             tokio::spawn(async move {
-                let mut history_lagged = false;
+                let mut rejected_histories = HashSet::new();
+                let mut stream_lag_epoch = 0_u64;
+                let mut acknowledged_lag_epochs = HashMap::new();
                 loop {
                     match events.recv().await {
                         Ok(event) => {
+                            let conversation_id = event.conversation_id;
+                            let stream_lagged = acknowledged_lag_epochs
+                                .get(&conversation_id)
+                                .copied()
+                                .unwrap_or_default()
+                                < stream_lag_epoch;
                             if let ProviderEventKind::HistoryBarrier { barrier } = &event.kind {
-                                if history_lagged {
+                                let rejected = rejected_histories.remove(&conversation_id);
+                                if stream_lagged {
+                                    acknowledged_lag_epochs
+                                        .insert(conversation_id, stream_lag_epoch);
+                                }
+                                if rejected || stream_lagged {
                                     barrier.mark_lagged();
                                 }
                                 barrier.complete();
-                                history_lagged = false;
+                                continue;
+                            }
+                            if (rejected_histories.contains(&conversation_id) || stream_lagged)
+                                && matches!(&event.kind, ProviderEventKind::HistoryWatermark { .. })
+                            {
                                 continue;
                             }
                             if !service.apply_provider_event(event).await {
-                                history_lagged = true;
+                                rejected_histories.insert(conversation_id);
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => history_lagged = true,
+                        Err(broadcast::error::RecvError::Lagged(_)) => stream_lag_epoch += 1,
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -219,11 +297,131 @@ impl AppService {
         device_id: DeviceId,
         command: ClientCommand,
     ) -> Result<ServerMessage> {
-        if let Some(command_id) = command.command_id()
-            && !self.storage.begin_command(device_id, command_id)?
-        {
-            return Ok(ServerMessage::CommandAccepted { command_id });
+        let Some(command_id) = command.command_id() else {
+            return self.execute_command_inner(command).await;
+        };
+        let ticket = self.command_execution_ticket(device_id, command_id);
+        let _guard = ticket.lock.lock().await;
+        match self.storage.command_state(device_id, command_id)? {
+            StoredCommand::Complete(result) => return Ok(*result),
+            StoredCommand::Pending => {
+                let result = ServerMessage::CommandRejected {
+                    command_id: Some(command_id),
+                    code: "command_outcome_unknown".to_owned(),
+                    message: "The Host stopped before recording this command's outcome; retry with a new command ID"
+                        .to_owned(),
+                };
+                self.storage
+                    .finish_command(device_id, command_id, &result)?;
+                return Ok(result);
+            }
+            StoredCommand::Missing => {}
         }
+        let command_project = self.project_for_command(&command);
+        let mutation_ticket = ordered_conversation_mutation(&command)
+            .map(|conversation_id| self.conversation_mutation_ticket(conversation_id));
+        let _mutation_guard = match mutation_ticket.as_ref() {
+            Some(ticket) => Some(ticket.lock.lock().await),
+            None => None,
+        };
+        self.storage.begin_command(device_id, command_id)?;
+        let result = match self.execute_command_inner(command).await {
+            Ok(result) => result,
+            Err(error) => ServerMessage::CommandRejected {
+                command_id: Some(command_id),
+                code: "command_failed".to_owned(),
+                message: redact_remote_error(&format!("{error:#}"), command_project.as_ref()),
+            },
+        };
+        self.storage
+            .finish_command(device_id, command_id, &result)?;
+        Ok(result)
+    }
+
+    fn command_execution_ticket(
+        &self,
+        device_id: DeviceId,
+        command_id: agent_remote_protocol::CommandId,
+    ) -> CommandExecutionTicket<'_> {
+        let key = (device_id, command_id);
+        let mut entries = self
+            .command_execution_locks
+            .lock()
+            .expect("command lock mutex poisoned");
+        let entry = entries.entry(key).or_insert_with(|| CommandExecutionEntry {
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            users: 0,
+        });
+        entry.users += 1;
+        CommandExecutionTicket {
+            key,
+            lock: Arc::clone(&entry.lock),
+            entries: &self.command_execution_locks,
+        }
+    }
+
+    fn conversation_mutation_ticket(
+        &self,
+        conversation_id: ConversationId,
+    ) -> ConversationMutationTicket<'_> {
+        let mut entries = self
+            .conversation_mutation_locks
+            .lock()
+            .expect("conversation mutation mutex poisoned");
+        let entry = entries
+            .entry(conversation_id)
+            .or_insert_with(|| ConversationMutationEntry {
+                lock: Arc::new(tokio::sync::Mutex::new(())),
+                users: 0,
+            });
+        entry.users += 1;
+        ConversationMutationTicket {
+            conversation_id,
+            lock: Arc::clone(&entry.lock),
+            entries: &self.conversation_mutation_locks,
+        }
+    }
+
+    fn project_for_command(&self, command: &ClientCommand) -> Option<Project> {
+        let project_id = match command {
+            ClientCommand::SyncProject { project_id, .. }
+            | ClientCommand::CreateConversation { project_id, .. }
+            | ClientCommand::StartConversation { project_id, .. } => *project_id,
+            ClientCommand::SendMessage {
+                conversation_id, ..
+            }
+            | ClientCommand::Steer {
+                conversation_id, ..
+            }
+            | ClientCommand::Interrupt {
+                conversation_id, ..
+            }
+            | ClientCommand::SetSessionOption {
+                conversation_id, ..
+            }
+            | ClientCommand::RenameConversation {
+                conversation_id, ..
+            } => self.storage.conversation(*conversation_id).ok()?.project_id,
+            ClientCommand::ResolveApproval { approval_id, .. } => {
+                let conversation_id = self
+                    .approvals
+                    .lock()
+                    .expect("approval mutex poisoned")
+                    .get(approval_id)?
+                    .conversation_id;
+                self.storage.conversation(conversation_id).ok()?.project_id
+            }
+            ClientCommand::Pair { .. }
+            | ClientCommand::Authenticate { .. }
+            | ClientCommand::GetSnapshot
+            | ClientCommand::RefreshProjects { .. }
+            | ClientCommand::GetConversationPage { .. }
+            | ClientCommand::GetAttachment { .. } => return None,
+        };
+        self.storage.project(project_id).ok()
+    }
+
+    async fn execute_command_inner(&self, command: ClientCommand) -> Result<ServerMessage> {
         let command_id = command.command_id();
         match command {
             ClientCommand::GetSnapshot => Ok(ServerMessage::Snapshot {
@@ -495,6 +693,7 @@ impl AppService {
                 )?
             {
                 let mut cursor = None;
+                let mut history_items = Vec::new();
                 loop {
                     let page = provider
                         .read_session_history(ReadSessionHistory {
@@ -506,9 +705,7 @@ impl AppService {
                         })
                         .await?;
                     full_history_fallback |= page.full_read_fallback;
-                    for item in page.items {
-                        self.upsert_history_item(conversation.id, item)?;
-                    }
+                    history_items.extend(page.items);
                     match page.next_cursor {
                         Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
                         _ => break,
@@ -517,6 +714,9 @@ impl AppService {
                 provider
                     .flush_history_events(project_id, conversation.id)
                     .await?;
+                for item in history_items {
+                    self.upsert_history_item(conversation.id, item)?;
+                }
                 self.storage.mark_remote_history_synced(
                     provider_id,
                     project_id,
@@ -537,11 +737,30 @@ impl AppService {
     fn upsert_history_item(
         &self,
         conversation_id: ConversationId,
-        history: ProviderHistoryItem,
+        mut history: ProviderHistoryItem,
     ) -> Result<()> {
-        let item_id = self
-            .storage
-            .provider_item_id(conversation_id, &history.provider_item_id)?;
+        let conversation = self.storage.conversation(conversation_id)?;
+        let project = self.storage.project(conversation.project_id)?;
+        history.kind = sanitize_history_kind(&project, history.kind)?;
+        let item_id = if history
+            .provider_item_id
+            .starts_with(crate::providers::codex::CANONICAL_ITEM_PREFIX)
+        {
+            match self.storage.reconcile_provider_item_alias(
+                conversation_id,
+                &history.provider_item_id,
+                &history.kind,
+                crate::providers::codex::CANONICAL_ITEM_PREFIX,
+            )? {
+                Some(item_id) => item_id,
+                None => self
+                    .storage
+                    .provider_item_id(conversation_id, &history.provider_item_id)?,
+            }
+        } else {
+            self.storage
+                .provider_item_id(conversation_id, &history.provider_item_id)?
+        };
         let mut cache = self.timeline_cache.lock().expect("timeline mutex poisoned");
         if cache.get(&item_id).is_some_and(|existing| {
             existing.created_at_ms == history.created_at_ms && existing.kind == history.kind
@@ -556,11 +775,7 @@ impl AppService {
             created_at_ms: history.created_at_ms,
             kind: history.kind,
         };
-        cache.insert(item_id, item.clone());
-        drop(cache);
-        self.storage.upsert_timeline_item(&item)?;
-        self.emit(ServerMessage::TimelineItemUpserted { item });
-        Ok(())
+        self.save_and_emit_item_locked(&mut cache, item)
     }
 
     async fn rename_conversation(
@@ -801,7 +1016,13 @@ impl AppService {
             })
             .await
         {
-            self.record_failure(&project, conversation, "provider_error", error.to_string())?;
+            self.record_failure(
+                &project,
+                conversation,
+                None,
+                "provider_error",
+                error.to_string(),
+            )?;
             return Err(error);
         }
         Ok(())
@@ -942,7 +1163,7 @@ impl AppService {
             .copied();
         if let Some(item_id) = item_id {
             let mut cache = self.timeline_cache.lock().expect("timeline mutex poisoned");
-            if let Some(item) = cache.get_mut(&item_id) {
+            if let Some(mut item) = cache.get(&item_id).cloned() {
                 item.revision += 1;
                 if let TimelineItemKind::Approval {
                     resolved_option, ..
@@ -950,10 +1171,7 @@ impl AppService {
                 {
                     *resolved_option = Some(option_id);
                 }
-                let item = item.clone();
-                drop(cache);
-                self.storage.upsert_timeline_item(&item)?;
-                self.emit(ServerMessage::TimelineItemUpserted { item });
+                self.save_and_emit_item_locked(&mut cache, item)?;
             }
         }
         let mut conversation = self.storage.conversation(pending.conversation_id)?;
@@ -1014,7 +1232,7 @@ impl AppService {
         Ok(())
     }
 
-    async fn apply_provider_event(&self, event: ProviderEvent) -> bool {
+    async fn apply_provider_event(self: &Arc<Self>, event: ProviderEvent) -> bool {
         match self.apply_provider_event_inner(event).await {
             Ok(()) => true,
             Err(error) => {
@@ -1024,7 +1242,7 @@ impl AppService {
         }
     }
 
-    async fn apply_provider_event_inner(&self, event: ProviderEvent) -> Result<()> {
+    async fn apply_provider_event_inner(self: &Arc<Self>, event: ProviderEvent) -> Result<()> {
         let mut conversation = self.storage.conversation(event.conversation_id)?;
         if conversation.provider != event.provider || conversation.project_id != event.project_id {
             bail!("provider event did not match the conversation authority boundary");
@@ -1032,11 +1250,40 @@ impl AppService {
         let project = self.storage.project(event.project_id)?;
         match event.kind {
             ProviderEventKind::HistoryBarrier { barrier } => barrier.complete(),
+            ProviderEventKind::HistoryWatermark {
+                remote_updated_at_ms,
+            } => self.storage.mark_remote_history_synced(
+                conversation.provider,
+                conversation.project_id,
+                &conversation.native_session_id,
+                remote_updated_at_ms,
+            )?,
             ProviderEventKind::HistoryItem {
                 provider_item_id,
                 kind,
             } => {
-                self.upsert_provider_item(event.conversation_id, provider_item_id, kind)?;
+                self.upsert_provider_item(
+                    event.conversation_id,
+                    provider_item_id,
+                    sanitize_history_kind(&project, kind)?,
+                )?;
+            }
+            ProviderEventKind::ProviderItemAlias {
+                provider_item_id,
+                alias_provider_item_id,
+            } => {
+                if let Some(item_id) = self.storage.alias_provider_item_id(
+                    event.conversation_id,
+                    &provider_item_id,
+                    &alias_provider_item_id,
+                )? {
+                    let mut ids = self
+                        .provider_item_ids
+                        .lock()
+                        .expect("provider item mutex poisoned");
+                    ids.insert((event.conversation_id, provider_item_id), item_id);
+                    ids.insert((event.conversation_id, alias_provider_item_id), item_id);
+                }
             }
             ProviderEventKind::UserMessageDelta {
                 provider_item_id,
@@ -1044,24 +1291,24 @@ impl AppService {
             } => {
                 let item_id = self.item_id(event.conversation_id, provider_item_id)?;
                 let mut cache = self.timeline_cache.lock().expect("timeline mutex poisoned");
-                let item = cache.entry(item_id).or_insert_with(|| TimelineItem {
-                    id: item_id,
-                    conversation_id: event.conversation_id,
-                    revision: 0,
-                    created_at_ms: now_ms(),
-                    kind: TimelineItemKind::UserMessage {
-                        text: String::new(),
-                    },
-                });
+                let mut item = cache
+                    .get(&item_id)
+                    .cloned()
+                    .unwrap_or_else(|| TimelineItem {
+                        id: item_id,
+                        conversation_id: event.conversation_id,
+                        revision: 0,
+                        created_at_ms: now_ms(),
+                        kind: TimelineItemKind::UserMessage {
+                            text: String::new(),
+                        },
+                    });
                 match &mut item.kind {
                     TimelineItemKind::UserMessage { text } => text.push_str(&delta),
                     _ => bail!("provider reused an item id for a different event kind"),
                 }
                 item.revision += 1;
-                let item = item.clone();
-                drop(cache);
-                self.storage.upsert_timeline_item(&item)?;
-                self.emit(ServerMessage::TimelineItemUpserted { item });
+                self.save_and_emit_item_locked(&mut cache, item)?;
             }
             ProviderEventKind::AgentTextDelta {
                 provider_item_id,
@@ -1070,16 +1317,19 @@ impl AppService {
             } => {
                 let item_id = self.item_id(event.conversation_id, provider_item_id)?;
                 let mut cache = self.timeline_cache.lock().expect("timeline mutex poisoned");
-                let item = cache.entry(item_id).or_insert_with(|| TimelineItem {
-                    id: item_id,
-                    conversation_id: event.conversation_id,
-                    revision: 0,
-                    created_at_ms: now_ms(),
-                    kind: TimelineItemKind::AgentMessage {
-                        phase,
-                        text: String::new(),
-                    },
-                });
+                let mut item = cache
+                    .get(&item_id)
+                    .cloned()
+                    .unwrap_or_else(|| TimelineItem {
+                        id: item_id,
+                        conversation_id: event.conversation_id,
+                        revision: 0,
+                        created_at_ms: now_ms(),
+                        kind: TimelineItemKind::AgentMessage {
+                            phase,
+                            text: String::new(),
+                        },
+                    });
                 match &mut item.kind {
                     TimelineItemKind::AgentMessage {
                         phase: item_phase,
@@ -1088,10 +1338,18 @@ impl AppService {
                     _ => bail!("provider reused an item id for a different event kind"),
                 }
                 item.revision += 1;
-                let item = item.clone();
-                drop(cache);
-                self.storage.upsert_timeline_item(&item)?;
-                self.emit(ServerMessage::TimelineItemUpserted { item });
+                self.save_and_emit_item_locked(&mut cache, item)?;
+            }
+            ProviderEventKind::AgentTextSnapshot {
+                provider_item_id,
+                phase,
+                text,
+            } => {
+                self.upsert_provider_item(
+                    event.conversation_id,
+                    provider_item_id,
+                    TimelineItemKind::AgentMessage { phase, text },
+                )?;
             }
             ProviderEventKind::Plan {
                 provider_item_id,
@@ -1100,7 +1358,9 @@ impl AppService {
                 self.upsert_provider_item(
                     event.conversation_id,
                     provider_item_id,
-                    TimelineItemKind::Plan { steps },
+                    TimelineItemKind::Plan {
+                        steps: redact_plan_steps(steps, &project),
+                    },
                 )?;
             }
             ProviderEventKind::ToolCall {
@@ -1228,7 +1488,9 @@ impl AppService {
                             alt,
                         )?;
                     }
-                    Err(error) => self.record_attachment_error(event.conversation_id, error)?,
+                    Err(error) => {
+                        self.record_attachment_error(&project, event.conversation_id, error)?
+                    }
                 }
             }
             ProviderEventKind::ImageBytes {
@@ -1255,7 +1517,9 @@ impl AppService {
                             alt,
                         )?;
                     }
-                    Err(error) => self.record_attachment_error(event.conversation_id, error)?,
+                    Err(error) => {
+                        self.record_attachment_error(&project, event.conversation_id, error)?
+                    }
                 }
             }
             ProviderEventKind::Completed => {
@@ -1263,16 +1527,7 @@ impl AppService {
                 conversation.revision += 1;
                 conversation.updated_at_ms = now_ms();
                 self.save_and_emit_conversation(&conversation)?;
-                if let Err(error) = self
-                    .refresh_provider_title(&mut conversation, &project)
-                    .await
-                {
-                    tracing::warn!(
-                        conversation_id = %conversation.id,
-                        error = %error,
-                        "provider title refresh failed after the completed turn"
-                    );
-                }
+                self.spawn_provider_title_refresh(&conversation, project);
             }
             ProviderEventKind::Interrupted => {
                 conversation.state = ConversationState::Interrupted;
@@ -1280,11 +1535,15 @@ impl AppService {
                 conversation.updated_at_ms = now_ms();
                 self.save_and_emit_conversation(&conversation)?;
             }
-            ProviderEventKind::Failed { code, message } => {
-                self.record_failure(&project, conversation, &code, message)?;
+            ProviderEventKind::Failed {
+                provider_item_id,
+                code,
+                message,
+            } => {
+                self.record_failure(&project, conversation, provider_item_id, &code, message)?;
             }
             ProviderEventKind::Crashed { message } => {
-                self.record_failure(&project, conversation, "provider_crashed", message)?;
+                self.record_failure(&project, conversation, None, "provider_crashed", message)?;
             }
         }
         Ok(())
@@ -1301,35 +1560,62 @@ impl AppService {
         Ok(project)
     }
 
+    fn spawn_provider_title_refresh(
+        self: &Arc<Self>,
+        conversation: &Conversation,
+        project: Project,
+    ) {
+        let service = Arc::clone(self);
+        let expected = conversation.clone();
+        tokio::spawn(async move {
+            if let Err(error) = service.refresh_provider_title(&expected, project).await {
+                tracing::warn!(
+                    conversation_id = %expected.id,
+                    error = %error,
+                    "provider title refresh failed after the completed turn"
+                );
+            }
+        });
+    }
+
     async fn refresh_provider_title(
         &self,
-        conversation: &mut Conversation,
-        project: &Project,
+        expected: &Conversation,
+        project: Project,
     ) -> Result<()> {
-        if conversation.title_source == ConversationTitleSource::User {
+        let conversation = self.storage.conversation(expected.id)?;
+        if conversation.title_source == ConversationTitleSource::User
+            || conversation.provider != expected.provider
+            || conversation.project_id != project.id
+            || conversation.native_session_id != expected.native_session_id
+            || conversation.title_updated_at_ms != expected.title_updated_at_ms
+            || conversation.title != expected.title
+        {
             return Ok(());
         }
-        let provider = self.providers.get(conversation.provider)?;
+        let provider = self.providers.get(expected.provider)?;
         if !provider.capabilities().supports_session_list {
             return Ok(());
         }
         let Some(session) = provider
-            .list_sessions(project)
+            .list_sessions(&project)
             .await?
             .into_iter()
-            .find(|session| session.native_session_id == conversation.native_session_id)
+            .find(|session| session.native_session_id == expected.native_session_id)
         else {
             return Ok(());
         };
         let title = provider_title(&session.title);
-        if title == "新对话" || title == conversation.title {
+        if title == "新对话" {
             return Ok(());
         }
-        conversation.title = title;
-        conversation.title_source = ConversationTitleSource::Provider;
-        conversation.title_updated_at_ms = now_ms();
-        conversation.revision += 1;
-        self.save_and_emit_conversation(conversation)
+        if let Some(conversation) = self
+            .storage
+            .update_provider_title_if_current(expected, &title)?
+        {
+            self.emit(ServerMessage::ConversationUpserted { conversation });
+        }
+        Ok(())
     }
 
     fn item_id(
@@ -1370,20 +1656,29 @@ impl AppService {
             created_at_ms,
             kind,
         };
-        cache.insert(item_id, item.clone());
-        drop(cache);
-        self.storage.upsert_timeline_item(&item)?;
-        self.emit(ServerMessage::TimelineItemUpserted { item });
-        Ok(())
+        self.save_and_emit_item_locked(&mut cache, item)
     }
 
     fn save_and_emit_item(&self, item: TimelineItem) -> Result<()> {
-        self.storage.upsert_timeline_item(&item)?;
-        self.timeline_cache
-            .lock()
-            .expect("timeline mutex poisoned")
-            .insert(item.id, item.clone());
-        self.emit(ServerMessage::TimelineItemUpserted { item });
+        let mut cache = self.timeline_cache.lock().expect("timeline mutex poisoned");
+        self.save_and_emit_item_locked(&mut cache, item)
+    }
+
+    fn save_and_emit_item_locked(
+        &self,
+        cache: &mut HashMap<TimelineItemId, TimelineItem>,
+        item: TimelineItem,
+    ) -> Result<()> {
+        if cache
+            .get(&item.id)
+            .is_some_and(|existing| existing.revision >= item.revision)
+        {
+            return Ok(());
+        }
+        if self.storage.upsert_timeline_item(&item)? {
+            cache.insert(item.id, item.clone());
+            self.emit(ServerMessage::TimelineItemUpserted { item });
+        }
         Ok(())
     }
 
@@ -1433,6 +1728,7 @@ impl AppService {
 
     fn record_attachment_error(
         &self,
+        project: &Project,
         conversation_id: ConversationId,
         error: anyhow::Error,
     ) -> Result<()> {
@@ -1443,7 +1739,7 @@ impl AppService {
             created_at_ms: now_ms(),
             kind: TimelineItemKind::Error {
                 code: "attachment_error".to_owned(),
-                message: error.to_string(),
+                message: redact_remote_error(&format!("{error:#}"), Some(project)),
             },
         })
     }
@@ -1452,27 +1748,65 @@ impl AppService {
         &self,
         project: &Project,
         mut conversation: Conversation,
+        provider_item_id: Option<String>,
         code: &str,
         message: String,
     ) -> Result<()> {
-        conversation.state = ConversationState::Failed;
-        conversation.revision += 1;
-        conversation.updated_at_ms = now_ms();
-        self.save_and_emit_conversation(&conversation)?;
-        self.save_and_emit_item(TimelineItem {
-            id: TimelineItemId::new(),
-            conversation_id: conversation.id,
-            revision: 1,
-            created_at_ms: now_ms(),
-            kind: TimelineItemKind::Error {
-                code: code.to_owned(),
-                message: redact_project_path(&message, project),
-            },
-        })
+        if conversation.state != ConversationState::Failed {
+            conversation.state = ConversationState::Failed;
+            conversation.revision += 1;
+            conversation.updated_at_ms = now_ms();
+            self.save_and_emit_conversation(&conversation)?;
+        }
+        let kind = TimelineItemKind::Error {
+            code: code.to_owned(),
+            message: redact_remote_error(&message, Some(project)),
+        };
+        if let Some(provider_item_id) = provider_item_id {
+            self.upsert_provider_item(conversation.id, provider_item_id, kind)
+        } else {
+            self.save_and_emit_item(TimelineItem {
+                id: TimelineItemId::new(),
+                conversation_id: conversation.id,
+                revision: 1,
+                created_at_ms: now_ms(),
+                kind,
+            })
+        }
     }
 
     fn emit(&self, message: ServerMessage) {
         let _ = self.updates.send(message);
+    }
+}
+
+fn ordered_conversation_mutation(command: &ClientCommand) -> Option<ConversationId> {
+    match command {
+        ClientCommand::StartConversation {
+            conversation_id, ..
+        }
+        | ClientCommand::SendMessage {
+            conversation_id, ..
+        }
+        | ClientCommand::Steer {
+            conversation_id, ..
+        }
+        | ClientCommand::SetSessionOption {
+            conversation_id, ..
+        }
+        | ClientCommand::RenameConversation {
+            conversation_id, ..
+        } => Some(*conversation_id),
+        ClientCommand::Pair { .. }
+        | ClientCommand::Authenticate { .. }
+        | ClientCommand::GetSnapshot
+        | ClientCommand::RefreshProjects { .. }
+        | ClientCommand::SyncProject { .. }
+        | ClientCommand::CreateConversation { .. }
+        | ClientCommand::Interrupt { .. }
+        | ClientCommand::ResolveApproval { .. }
+        | ClientCommand::GetConversationPage { .. }
+        | ClientCommand::GetAttachment { .. } => None,
     }
 }
 
@@ -1617,15 +1951,154 @@ fn safe_relative_display(project: &Project, raw: &str) -> Option<String> {
     Some(path.to_string_lossy().replace('\\', "/"))
 }
 
+fn sanitize_history_kind(project: &Project, kind: TimelineItemKind) -> Result<TimelineItemKind> {
+    Ok(match kind {
+        TimelineItemKind::Plan { steps } => TimelineItemKind::Plan {
+            steps: redact_plan_steps(steps, project),
+        },
+        TimelineItemKind::Progress {
+            kind,
+            label,
+            status,
+            detail,
+        } => TimelineItemKind::Progress {
+            kind,
+            label: redact_project_path(&label, project),
+            status,
+            detail: detail.map(|value| redact_project_path(&value, project)),
+        },
+        TimelineItemKind::ToolCall {
+            name,
+            status,
+            input_summary,
+            output_summary,
+        } => TimelineItemKind::ToolCall {
+            name,
+            status,
+            input_summary: input_summary.map(|value| redact_project_path(&value, project)),
+            output_summary: output_summary.map(|value| redact_project_path(&value, project)),
+        },
+        TimelineItemKind::Command {
+            command,
+            relative_cwd,
+            status,
+            exit_code,
+            output,
+        } => TimelineItemKind::Command {
+            command: redact_project_path(&command, project),
+            relative_cwd: relative_cwd.and_then(|path| safe_relative_display(project, &path)),
+            status,
+            exit_code,
+            output: output.map(|value| truncate_output(redact_project_path(&value, project))),
+        },
+        TimelineItemKind::FileChange {
+            relative_path,
+            change_kind,
+            status,
+        } => TimelineItemKind::FileChange {
+            relative_path: safe_relative_display(project, &relative_path)
+                .ok_or_else(|| anyhow!("provider history file change was outside the project"))?,
+            change_kind,
+            status,
+        },
+        TimelineItemKind::Approval {
+            approval_id,
+            prompt,
+            options,
+            resolved_option,
+        } => TimelineItemKind::Approval {
+            approval_id,
+            prompt: redact_project_path(&prompt, project),
+            options,
+            resolved_option,
+        },
+        TimelineItemKind::Error { code, message } => TimelineItemKind::Error {
+            code,
+            message: redact_remote_error(&message, Some(project)),
+        },
+        kind => kind,
+    })
+}
+
+fn redact_plan_steps(
+    steps: Vec<agent_remote_protocol::PlanStep>,
+    project: &Project,
+) -> Vec<agent_remote_protocol::PlanStep> {
+    steps
+        .into_iter()
+        .map(|mut step| {
+            step.text = redact_project_path(&step.text, project);
+            step
+        })
+        .collect()
+}
+
 fn redact_project_path(value: &str, project: &Project) -> String {
     let canonical = project.canonical_path.to_string_lossy();
     value.replace(canonical.as_ref(), ".")
 }
 
+fn redact_remote_error(value: &str, project: Option<&Project>) -> String {
+    let value = project.map_or_else(
+        || value.to_owned(),
+        |project| redact_project_path(value, project),
+    );
+    value
+        .split_inclusive(char::is_whitespace)
+        .map(redact_absolute_path_fragment)
+        .collect()
+}
+
+fn redact_absolute_path_fragment(fragment: &str) -> String {
+    let content_len = fragment.trim_end_matches(char::is_whitespace).len();
+    let (content, whitespace) = fragment.split_at(content_len);
+    let Some(start) = absolute_path_start(content) else {
+        return fragment.to_owned();
+    };
+    let path_end = content
+        .trim_end_matches(|character| {
+            matches!(character, '"' | '\'' | ')' | ']' | '}' | ',' | ';' | ':')
+        })
+        .len()
+        .max(start);
+    format!(
+        "{}<host-path>{}{}",
+        &content[..start],
+        &content[path_end..],
+        whitespace
+    )
+}
+
+fn absolute_path_start(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    for index in 0..bytes.len() {
+        let boundary =
+            index == 0 || matches!(bytes[index - 1], b'=' | b'(' | b'[' | b'{' | b'"' | b'\'');
+        if !boundary {
+            continue;
+        }
+        if bytes[index] == b'/'
+            || (bytes[index] == b'\\' && bytes.get(index + 1).is_some_and(|next| *next == b'\\'))
+            || (bytes[index].is_ascii_alphabetic()
+                && bytes.get(index + 1).is_some_and(|next| *next == b':')
+                && bytes
+                    .get(index + 2)
+                    .is_some_and(|next| matches!(*next, b'/' | b'\\')))
+        {
+            return Some(index);
+        }
+    }
+    None
+}
+
 fn truncate_output(mut output: String) -> String {
     const LIMIT: usize = 64 * 1024;
     if output.len() > LIMIT {
-        output.truncate(LIMIT);
+        let mut end = LIMIT;
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.truncate(end);
         output.push_str("\n[output truncated at 64 KiB]");
     }
     output
@@ -1646,8 +2119,8 @@ mod tests {
     use std::{collections::HashMap, sync::Mutex};
 
     use agent_remote_protocol::{
-        AgentMessagePhase, ApprovalOption, CommandId, EffortOption, ModelOption, ProviderHealth,
-        ProviderState, SessionSummary,
+        AgentMessagePhase, ApprovalOption, CommandId, EffortOption, ItemStatus, ModelOption,
+        PlanStep, ProviderHealth, ProviderState, SessionSummary,
     };
     use async_trait::async_trait;
     use tokio::sync::broadcast;
@@ -1670,7 +2143,12 @@ mod tests {
         interruptions: Mutex<Vec<ConversationId>>,
         sessions: Mutex<Vec<SessionSummary>>,
         history: Mutex<HashMap<String, Vec<ProviderHistoryItem>>>,
+        history_read_event: Mutex<Option<ProviderEventKind>>,
         renames: Mutex<Vec<(String, String)>>,
+        session_list_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+        session_list_error: Mutex<Option<String>>,
+        session_list_started: tokio::sync::Notify,
+        session_list_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl MockProvider {
@@ -1699,7 +2177,12 @@ mod tests {
                 interruptions: Mutex::new(Vec::new()),
                 sessions: Mutex::new(Vec::new()),
                 history: Mutex::new(HashMap::new()),
+                history_read_event: Mutex::new(None),
                 renames: Mutex::new(Vec::new()),
+                session_list_gate: Mutex::new(None),
+                session_list_error: Mutex::new(None),
+                session_list_started: tokio::sync::Notify::new(),
+                session_list_calls: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -1749,6 +2232,25 @@ mod tests {
         }
 
         async fn list_sessions(&self, _project: &Project) -> Result<Vec<SessionSummary>> {
+            self.session_list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let gate = self
+                .session_list_gate
+                .lock()
+                .expect("session list gate mutex")
+                .clone();
+            if let Some(gate) = gate {
+                self.session_list_started.notify_one();
+                gate.acquire().await.expect("session list gate").forget();
+            }
+            if let Some(error) = self
+                .session_list_error
+                .lock()
+                .expect("session list error mutex")
+                .clone()
+            {
+                bail!(error);
+            }
             Ok(self.sessions.lock().expect("sessions mutex").clone())
         }
 
@@ -1756,6 +2258,21 @@ mod tests {
             &self,
             request: ReadSessionHistory,
         ) -> Result<ProviderHistoryPage> {
+            if let Some(kind) = self
+                .history_read_event
+                .lock()
+                .expect("history read event mutex")
+                .take()
+            {
+                self.events
+                    .send(ProviderEvent {
+                        provider: ProviderId::Codex,
+                        project_id: request.project.id,
+                        conversation_id: request.conversation_id,
+                        kind,
+                    })
+                    .map_err(|_| anyhow!("mock history event has no active event pump"))?;
+            }
             Ok(ProviderHistoryPage {
                 items: self
                     .history
@@ -1767,6 +2284,25 @@ mod tests {
                 next_cursor: None,
                 full_read_fallback: true,
             })
+        }
+
+        async fn flush_history_events(
+            &self,
+            project_id: ProjectId,
+            conversation_id: ConversationId,
+        ) -> Result<()> {
+            let barrier = Arc::new(crate::providers::ProviderHistoryBarrier::default());
+            self.events
+                .send(ProviderEvent {
+                    provider: ProviderId::Codex,
+                    project_id,
+                    conversation_id,
+                    kind: ProviderEventKind::HistoryBarrier {
+                        barrier: Arc::clone(&barrier),
+                    },
+                })
+                .map_err(|_| anyhow!("mock history barrier has no active event pump"))?;
+            barrier.wait().await
         }
 
         async fn rename_session(&self, request: RenameSession) -> Result<CommandAck> {
@@ -1954,6 +2490,276 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_duplicate_command_replays_the_original_response() {
+        let fixture = fixture();
+        let pairing = fixture
+            .service
+            .storage
+            .create_pairing_token()
+            .expect("pairing token");
+        let device = fixture
+            .service
+            .storage
+            .exchange_pairing_token(&pairing.token, "phone")
+            .expect("paired device");
+        let command_id = CommandId::new();
+        let command = ClientCommand::SyncProject {
+            command_id,
+            project_id: fixture.project_a.id,
+            provider: ProviderId::Codex,
+        };
+
+        let first = fixture
+            .service
+            .execute_command(device.id, command.clone())
+            .await
+            .expect("first command");
+        let duplicate = fixture
+            .service
+            .execute_command(device.id, command)
+            .await
+            .expect("duplicate command");
+
+        assert!(matches!(
+            first,
+            ServerMessage::ProjectSyncCompleted {
+                command_id: completed_id,
+                ..
+            } if completed_id == command_id
+        ));
+        assert_eq!(duplicate, first);
+    }
+
+    #[tokio::test]
+    async fn different_command_ids_execute_while_a_duplicate_waits() {
+        let fixture = fixture();
+        let pairing = fixture
+            .service
+            .storage
+            .create_pairing_token()
+            .expect("pairing token");
+        let device = fixture
+            .service
+            .storage
+            .exchange_pairing_token(&pairing.token, "phone")
+            .expect("paired device");
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *fixture
+            .provider
+            .session_list_gate
+            .lock()
+            .expect("session list gate mutex") = Some(Arc::clone(&gate));
+
+        let sync_id = CommandId::new();
+        let sync = ClientCommand::SyncProject {
+            command_id: sync_id,
+            project_id: fixture.project_a.id,
+            provider: ProviderId::Codex,
+        };
+        let service = Arc::clone(&fixture.service);
+        let first_command = sync.clone();
+        let first =
+            tokio::spawn(async move { service.execute_command(device.id, first_command).await });
+        fixture.provider.session_list_started.notified().await;
+
+        let service = Arc::clone(&fixture.service);
+        let duplicate = tokio::spawn(async move { service.execute_command(device.id, sync).await });
+        tokio::task::yield_now().await;
+
+        let unrelated_id = CommandId::new();
+        let unrelated = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fixture.service.execute_command(
+                device.id,
+                ClientCommand::CreateConversation {
+                    command_id: unrelated_id,
+                    project_id: fixture.project_a.id,
+                    provider: ProviderId::Codex,
+                    native_session_id: None,
+                    model: Some("dynamic-model".to_owned()),
+                    effort: Some("high".to_owned()),
+                },
+            ),
+        )
+        .await
+        .expect("unrelated command was not blocked")
+        .expect("unrelated command");
+        assert_eq!(
+            unrelated,
+            ServerMessage::CommandAccepted {
+                command_id: unrelated_id
+            }
+        );
+
+        gate.add_permits(1);
+        let first = first.await.expect("first task").expect("first response");
+        let duplicate = duplicate
+            .await
+            .expect("duplicate task")
+            .expect("duplicate response");
+        assert!(matches!(
+            first,
+            ServerMessage::ProjectSyncCompleted {
+                command_id: completed_id,
+                ..
+            } if completed_id == sync_id
+        ));
+        assert_eq!(duplicate, first);
+        assert_eq!(
+            fixture
+                .provider
+                .session_list_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            fixture
+                .service
+                .command_execution_locks
+                .lock()
+                .expect("command lock mutex")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_failed_duplicate_replays_the_original_rejection() {
+        let fixture = fixture();
+        let pairing = fixture
+            .service
+            .storage
+            .create_pairing_token()
+            .expect("pairing token");
+        let device = fixture
+            .service
+            .storage
+            .exchange_pairing_token(&pairing.token, "phone")
+            .expect("paired device");
+        let command_id = CommandId::new();
+        let command = ClientCommand::SyncProject {
+            command_id,
+            project_id: ProjectId::new(),
+            provider: ProviderId::Codex,
+        };
+
+        let (first, duplicate) = tokio::join!(
+            fixture.service.execute_command(device.id, command.clone()),
+            fixture.service.execute_command(device.id, command),
+        );
+        let first = first.expect("first response");
+        let duplicate = duplicate.expect("duplicate response");
+
+        assert!(matches!(
+            &first,
+            ServerMessage::CommandRejected {
+                command_id: Some(rejected_id),
+                code,
+                ..
+            } if *rejected_id == command_id && code == "command_failed"
+        ));
+        assert_eq!(duplicate, first);
+    }
+
+    #[tokio::test]
+    async fn command_rejection_redacts_provider_host_path_without_hiding_error() {
+        let fixture = fixture();
+        let hidden_path = fixture.project_b.canonical_path.join("provider.log");
+        *fixture
+            .provider
+            .session_list_error
+            .lock()
+            .expect("session list error mutex") = Some(format!(
+            "provider failed while reading {}",
+            hidden_path.display()
+        ));
+        let pairing = fixture
+            .service
+            .storage
+            .create_pairing_token()
+            .expect("pairing token");
+        let device = fixture
+            .service
+            .storage
+            .exchange_pairing_token(&pairing.token, "phone")
+            .expect("paired device");
+        let command_id = CommandId::new();
+
+        let response = fixture
+            .service
+            .execute_command(
+                device.id,
+                ClientCommand::SyncProject {
+                    command_id,
+                    project_id: fixture.project_a.id,
+                    provider: ProviderId::Codex,
+                },
+            )
+            .await
+            .expect("command response");
+        let ServerMessage::CommandRejected { message, .. } = response else {
+            panic!("expected command rejection");
+        };
+        assert!(message.contains("provider failed while reading"));
+        assert!(message.contains("<host-path>"));
+        assert!(!message.contains(hidden_path.to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn pending_command_is_finalized_as_unknown_without_reexecution() {
+        let fixture = fixture();
+        let pairing = fixture
+            .service
+            .storage
+            .create_pairing_token()
+            .expect("pairing token");
+        let device = fixture
+            .service
+            .storage
+            .exchange_pairing_token(&pairing.token, "phone")
+            .expect("paired device");
+        let command_id = CommandId::new();
+        fixture
+            .service
+            .storage
+            .begin_command(device.id, command_id)
+            .expect("record pending command");
+        let command = ClientCommand::SyncProject {
+            command_id,
+            project_id: fixture.project_a.id,
+            provider: ProviderId::Codex,
+        };
+
+        let first = fixture
+            .service
+            .execute_command(device.id, command.clone())
+            .await
+            .expect("pending response");
+        let duplicate = fixture
+            .service
+            .execute_command(device.id, command)
+            .await
+            .expect("duplicate response");
+
+        assert!(matches!(
+            &first,
+            ServerMessage::CommandRejected {
+                command_id: Some(rejected_id),
+                code,
+                ..
+            } if *rejected_id == command_id && code == "command_outcome_unknown"
+        ));
+        assert_eq!(duplicate, first);
+        assert_eq!(
+            fixture
+                .service
+                .storage
+                .command_state(device.id, command_id)
+                .expect("stored result"),
+            StoredCommand::Complete(Box::new(first))
+        );
+    }
+
+    #[tokio::test]
     async fn streaming_deltas_upsert_one_timeline_item() {
         let fixture = fixture();
         let conversation = create(&fixture.service, fixture.project_a.id).await;
@@ -1979,6 +2785,74 @@ mod tests {
         assert!(
             matches!(&items[0].kind, TimelineItemKind::AgentMessage { text, .. } if text == "hello world")
         );
+    }
+
+    #[tokio::test]
+    async fn stale_timeline_revision_cannot_replace_memory_or_reopened_storage() {
+        let fixture = fixture();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        let item_id = TimelineItemId::new();
+        let newer = TimelineItem {
+            id: item_id,
+            conversation_id: conversation.id,
+            revision: 2,
+            created_at_ms: 20,
+            kind: TimelineItemKind::AgentMessage {
+                phase: AgentMessagePhase::Final,
+                text: "newer".to_owned(),
+            },
+        };
+        let older = TimelineItem {
+            revision: 1,
+            created_at_ms: 10,
+            kind: TimelineItemKind::AgentMessage {
+                phase: AgentMessagePhase::Final,
+                text: "older".to_owned(),
+            },
+            ..newer.clone()
+        };
+        let mut updates = fixture.service.subscribe();
+
+        fixture
+            .service
+            .save_and_emit_item(newer.clone())
+            .expect("save newer revision");
+        assert!(matches!(
+            updates.try_recv().expect("newer update"),
+            ServerMessage::TimelineItemUpserted { item } if item == newer
+        ));
+        assert!(
+            !fixture
+                .service
+                .storage
+                .upsert_timeline_item(&older)
+                .expect("reject stale database write")
+        );
+        fixture
+            .service
+            .save_and_emit_item(older)
+            .expect("ignore stale cache write");
+        assert!(matches!(
+            updates.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            fixture
+                .service
+                .timeline_cache
+                .lock()
+                .expect("timeline mutex")[&item_id],
+            newer
+        );
+
+        let reopened = Storage::open(fixture._temp.path().join("state.db")).expect("reopen");
+        let stored = reopened
+            .list_timeline()
+            .expect("timeline after reopen")
+            .into_iter()
+            .find(|item| item.id == item_id)
+            .expect("stored item");
+        assert_eq!(stored, newer);
     }
 
     #[tokio::test]
@@ -2081,6 +2955,781 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_provider_title_refresh_does_not_block_or_override_manual_title() {
+        let fixture = fixture();
+        fixture.service.start_provider_event_pumps();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        fixture
+            .service
+            .send_message(
+                conversation.id,
+                "first message".to_owned(),
+                Vec::new(),
+                None,
+            )
+            .await
+            .expect("first message");
+        fixture
+            .provider
+            .sessions
+            .lock()
+            .expect("sessions mutex")
+            .push(SessionSummary {
+                native_session_id: conversation.native_session_id.clone(),
+                title: "Provider title".to_owned(),
+                updated_at_ms: 50,
+            });
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *fixture
+            .provider
+            .session_list_gate
+            .lock()
+            .expect("session list gate mutex") = Some(Arc::clone(&gate));
+
+        fixture
+            .provider
+            .event(conversation.id, ProviderEventKind::Completed);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fixture.provider.session_list_started.notified(),
+        )
+        .await
+        .expect("title refresh did not start");
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            fixture
+                .provider
+                .flush_history_events(fixture.project_a.id, conversation.id),
+        )
+        .await
+        .expect("title refresh blocked the provider event pump")
+        .expect("history barrier");
+        fixture
+            .service
+            .rename_conversation(conversation.id, "Manual title".to_owned())
+            .await
+            .expect("manual rename");
+        let mut updates = fixture.service.subscribe();
+        gate.add_permits(1);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), updates.recv())
+                .await
+                .is_err(),
+            "stale provider title refresh emitted an update"
+        );
+        let conversation = fixture
+            .service
+            .storage
+            .conversation(conversation.id)
+            .expect("conversation");
+        assert_eq!(conversation.title, "Manual title");
+        assert_eq!(conversation.title_source, ConversationTitleSource::User);
+        assert_eq!(conversation.state, ConversationState::Completed);
+    }
+
+    #[tokio::test]
+    async fn delayed_provider_title_refresh_preserves_a_new_running_turn() {
+        let fixture = fixture();
+        fixture.service.start_provider_event_pumps();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        fixture
+            .service
+            .send_message(
+                conversation.id,
+                "first message".to_owned(),
+                Vec::new(),
+                None,
+            )
+            .await
+            .expect("first message");
+        fixture
+            .provider
+            .sessions
+            .lock()
+            .expect("sessions mutex")
+            .push(SessionSummary {
+                native_session_id: conversation.native_session_id.clone(),
+                title: "Provider title".to_owned(),
+                updated_at_ms: 50,
+            });
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *fixture
+            .provider
+            .session_list_gate
+            .lock()
+            .expect("session list gate mutex") = Some(Arc::clone(&gate));
+
+        fixture
+            .provider
+            .event(conversation.id, ProviderEventKind::Completed);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fixture.provider.session_list_started.notified(),
+        )
+        .await
+        .expect("title refresh did not start");
+        fixture
+            .service
+            .send_message(
+                conversation.id,
+                "second message".to_owned(),
+                Vec::new(),
+                None,
+            )
+            .await
+            .expect("next turn");
+        let mut updates = fixture.service.subscribe();
+        gate.add_permits(1);
+        let conversation_id = conversation.id;
+
+        let refreshed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let ServerMessage::ConversationUpserted {
+                    conversation: updated,
+                } = updates.recv().await.expect("conversation update")
+                    && updated.id == conversation_id
+                    && updated.title == "Provider title"
+                {
+                    break updated;
+                }
+            }
+        })
+        .await
+        .expect("provider title was not refreshed");
+        assert_eq!(refreshed.state, ConversationState::Running);
+        assert_eq!(refreshed.title_source, ConversationTitleSource::Provider);
+        let stored = fixture
+            .service
+            .storage
+            .conversation(conversation.id)
+            .expect("conversation");
+        assert_eq!(stored.state, ConversationState::Running);
+        assert_eq!(stored.title, "Provider title");
+    }
+
+    #[tokio::test]
+    async fn history_barriers_recover_the_event_pump_after_a_rejected_event() {
+        let fixture = fixture();
+        fixture.service.start_provider_event_pumps();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        let _ = fixture.provider.events.send(ProviderEvent {
+            provider: ProviderId::Codex,
+            project_id: fixture.project_b.id,
+            conversation_id: conversation.id,
+            kind: ProviderEventKind::Completed,
+        });
+
+        fixture.provider.event(
+            conversation.id,
+            ProviderEventKind::HistoryWatermark {
+                remote_updated_at_ms: 120,
+            },
+        );
+
+        assert!(
+            fixture
+                .provider
+                .flush_history_events(fixture.project_a.id, conversation.id)
+                .await
+                .is_err()
+        );
+
+        assert!(
+            fixture
+                .service
+                .storage
+                .remote_history_is_stale(
+                    ProviderId::Codex,
+                    fixture.project_a.id,
+                    &conversation.native_session_id,
+                    120,
+                )
+                .expect("history remains stale")
+        );
+        assert_eq!(
+            fixture
+                .service
+                .storage
+                .conversation(conversation.id)
+                .expect("conversation")
+                .state,
+            ConversationState::Idle
+        );
+
+        fixture.provider.event(
+            conversation.id,
+            ProviderEventKind::HistoryWatermark {
+                remote_updated_at_ms: 120,
+            },
+        );
+        fixture
+            .provider
+            .flush_history_events(fixture.project_a.id, conversation.id)
+            .await
+            .expect("healthy history barrier");
+
+        assert!(
+            !fixture
+                .service
+                .storage
+                .remote_history_is_stale(
+                    ProviderId::Codex,
+                    fixture.project_a.id,
+                    &conversation.native_session_id,
+                    120,
+                )
+                .expect("history watermark advances after recovery")
+        );
+    }
+
+    #[tokio::test]
+    async fn history_lag_is_scoped_to_the_rejected_conversation() {
+        let fixture = fixture();
+        fixture.service.start_provider_event_pumps();
+        let conversation_a = create(&fixture.service, fixture.project_a.id).await;
+        let conversation_b = create(&fixture.service, fixture.project_b.id).await;
+        let _ = fixture.provider.events.send(ProviderEvent {
+            provider: ProviderId::Codex,
+            project_id: fixture.project_b.id,
+            conversation_id: conversation_a.id,
+            kind: ProviderEventKind::Completed,
+        });
+
+        fixture
+            .provider
+            .flush_history_events(fixture.project_b.id, conversation_b.id)
+            .await
+            .expect("conversation B remains healthy");
+        fixture.provider.event(
+            conversation_a.id,
+            ProviderEventKind::HistoryWatermark {
+                remote_updated_at_ms: 120,
+            },
+        );
+        assert!(
+            fixture
+                .provider
+                .flush_history_events(fixture.project_a.id, conversation_a.id)
+                .await
+                .is_err()
+        );
+
+        assert!(
+            fixture
+                .service
+                .storage
+                .remote_history_is_stale(
+                    ProviderId::Codex,
+                    fixture.project_a.id,
+                    &conversation_a.native_session_id,
+                    120,
+                )
+                .expect("conversation A history remains stale")
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_history_id_reuses_a_matching_legacy_provider_item() {
+        let fixture = fixture();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        let legacy_kind = TimelineItemKind::AgentMessage {
+            phase: AgentMessagePhase::Final,
+            text: "do".to_owned(),
+        };
+        fixture
+            .service
+            .upsert_provider_item(conversation.id, "msg_live_1".to_owned(), legacy_kind)
+            .expect("legacy live item");
+        let legacy_item_id = fixture
+            .service
+            .storage
+            .list_timeline()
+            .expect("legacy timeline")
+            .into_iter()
+            .next()
+            .expect("legacy item")
+            .id;
+
+        fixture
+            .service
+            .upsert_history_item(
+                conversation.id,
+                ProviderHistoryItem {
+                    provider_item_id: "codex:v1:turn-1:agent:0".to_owned(),
+                    created_at_ms: 10,
+                    kind: TimelineItemKind::AgentMessage {
+                        phase: AgentMessagePhase::Final,
+                        text: "done".to_owned(),
+                    },
+                },
+            )
+            .expect("canonical history item");
+
+        let timeline = fixture
+            .service
+            .storage
+            .list_timeline()
+            .expect("reconciled timeline");
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].id, legacy_item_id);
+        assert!(matches!(
+            &timeline[0].kind,
+            TimelineItemKind::AgentMessage { text, .. } if text == "done"
+        ));
+        assert_eq!(
+            fixture
+                .service
+                .storage
+                .provider_item_id(conversation.id, "codex:v1:turn-1:agent:0")
+                .expect("canonical alias"),
+            legacy_item_id
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_subitem_aliases_reuse_reasoning_and_file_timeline_items() {
+        let fixture = fixture();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        let provisional_reasoning = "codex:live:turn-1:reasoning:reason-live:summary:0".to_owned();
+        let canonical_reasoning = "codex:v1:turn-1:reasoning:0:summary:0".to_owned();
+        let provisional_file = "codex:live:turn-1:file:file-live:change:0".to_owned();
+        let canonical_file = "codex:v1:turn-1:file:0:change:0".to_owned();
+        fixture
+            .service
+            .upsert_provider_item(
+                conversation.id,
+                provisional_reasoning.clone(),
+                TimelineItemKind::AgentMessage {
+                    phase: AgentMessagePhase::ReasoningSummary,
+                    text: "check".to_owned(),
+                },
+            )
+            .expect("provisional reasoning");
+        fixture
+            .service
+            .upsert_provider_item(
+                conversation.id,
+                provisional_file.clone(),
+                TimelineItemKind::FileChange {
+                    relative_path: "src/lib.rs".to_owned(),
+                    change_kind: "update".to_owned(),
+                    status: ItemStatus::Running,
+                },
+            )
+            .expect("provisional file");
+
+        for (provider_item_id, alias_provider_item_id) in [
+            (canonical_reasoning.clone(), provisional_reasoning),
+            (canonical_file.clone(), provisional_file),
+        ] {
+            fixture
+                .service
+                .apply_provider_event_inner(ProviderEvent {
+                    provider: ProviderId::Codex,
+                    project_id: fixture.project_a.id,
+                    conversation_id: conversation.id,
+                    kind: ProviderEventKind::ProviderItemAlias {
+                        provider_item_id,
+                        alias_provider_item_id,
+                    },
+                })
+                .await
+                .expect("apply canonical alias");
+        }
+        fixture
+            .service
+            .apply_provider_event_inner(ProviderEvent {
+                provider: ProviderId::Codex,
+                project_id: fixture.project_a.id,
+                conversation_id: conversation.id,
+                kind: ProviderEventKind::AgentTextSnapshot {
+                    provider_item_id: canonical_reasoning,
+                    phase: AgentMessagePhase::ReasoningSummary,
+                    text: "check complete".to_owned(),
+                },
+            })
+            .await
+            .expect("final reasoning");
+        fixture
+            .service
+            .apply_provider_event_inner(ProviderEvent {
+                provider: ProviderId::Codex,
+                project_id: fixture.project_a.id,
+                conversation_id: conversation.id,
+                kind: ProviderEventKind::FileChange {
+                    provider_item_id: canonical_file,
+                    relative_path: "src/lib.rs".to_owned(),
+                    change_kind: "update".to_owned(),
+                    status: ItemStatus::Completed,
+                },
+            })
+            .await
+            .expect("final file");
+
+        let timeline = fixture
+            .service
+            .storage
+            .list_timeline()
+            .expect("canonical timeline");
+        assert_eq!(timeline.len(), 2);
+        assert!(timeline.iter().any(|item| matches!(
+            &item.kind,
+            TimelineItemKind::AgentMessage { text, .. } if text == "check complete"
+        )));
+        assert!(timeline.iter().any(|item| matches!(
+            &item.kind,
+            TimelineItemKind::FileChange {
+                status: ItemStatus::Completed,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn history_then_live_text_snapshot_does_not_append_duplicate_text() {
+        let fixture = fixture();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        let provider_item_id = "codex:v1:turn-1:agent:0".to_owned();
+        fixture
+            .service
+            .upsert_history_item(
+                conversation.id,
+                ProviderHistoryItem {
+                    provider_item_id: provider_item_id.clone(),
+                    created_at_ms: 10,
+                    kind: TimelineItemKind::AgentMessage {
+                        phase: AgentMessagePhase::Final,
+                        text: "hello".to_owned(),
+                    },
+                },
+            )
+            .expect("history snapshot");
+        fixture
+            .service
+            .apply_provider_event_inner(ProviderEvent {
+                provider: ProviderId::Codex,
+                project_id: fixture.project_a.id,
+                conversation_id: conversation.id,
+                kind: ProviderEventKind::AgentTextSnapshot {
+                    provider_item_id,
+                    phase: AgentMessagePhase::Final,
+                    text: "hello".to_owned(),
+                },
+            })
+            .await
+            .expect("live snapshot");
+
+        let timeline = fixture.service.storage.list_timeline().expect("timeline");
+        assert_eq!(timeline.len(), 1);
+        assert!(matches!(
+            &timeline[0].kind,
+            TimelineItemKind::AgentMessage { text, .. } if text == "hello"
+        ));
+    }
+
+    #[tokio::test]
+    async fn sync_drains_queued_live_items_before_writing_thread_history() {
+        let fixture = fixture();
+        fixture.service.start_provider_event_pumps();
+        fixture
+            .provider
+            .sessions
+            .lock()
+            .expect("sessions mutex")
+            .push(SessionSummary {
+                native_session_id: "remote-barrier".to_owned(),
+                title: "Barrier".to_owned(),
+                updated_at_ms: 50,
+            });
+        fixture
+            .provider
+            .history
+            .lock()
+            .expect("history mutex")
+            .insert(
+                "remote-barrier".to_owned(),
+                vec![ProviderHistoryItem {
+                    provider_item_id: "codex:v1:turn-1:agent:0".to_owned(),
+                    created_at_ms: 25,
+                    kind: TimelineItemKind::AgentMessage {
+                        phase: AgentMessagePhase::Final,
+                        text: "hello".to_owned(),
+                    },
+                }],
+            );
+        *fixture
+            .provider
+            .history_read_event
+            .lock()
+            .expect("history read event mutex") = Some(ProviderEventKind::AgentTextSnapshot {
+            provider_item_id: "codex:live:turn-1:agent:msg-live".to_owned(),
+            phase: AgentMessagePhase::Final,
+            text: "hel".to_owned(),
+        });
+
+        fixture
+            .service
+            .sync_project(CommandId::new(), fixture.project_a.id, ProviderId::Codex)
+            .await
+            .expect("sync with queued live event");
+        let conversation = fixture
+            .service
+            .storage
+            .conversation_by_native_session(
+                ProviderId::Codex,
+                fixture.project_a.id,
+                "remote-barrier",
+            )
+            .expect("conversation lookup")
+            .expect("synced conversation");
+        let timeline = fixture
+            .service
+            .storage
+            .list_timeline()
+            .expect("reconciled timeline");
+        assert_eq!(timeline.len(), 1);
+        assert!(matches!(
+            &timeline[0].kind,
+            TimelineItemKind::AgentMessage { text, .. } if text == "hello"
+        ));
+        assert_eq!(
+            fixture
+                .service
+                .storage
+                .provider_item_id(conversation.id, "codex:v1:turn-1:agent:0")
+                .expect("canonical item"),
+            fixture
+                .service
+                .storage
+                .provider_item_id(conversation.id, "codex:live:turn-1:agent:msg-live")
+                .expect("live item")
+        );
+    }
+
+    #[tokio::test]
+    async fn history_items_use_live_path_redaction_truncation_and_path_rules() {
+        let fixture = fixture();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        let project_path = fixture.project_a.canonical_path.to_string_lossy();
+        let command_output = format!("{project_path}\n{}", "你".repeat(24 * 1024));
+        fixture
+            .service
+            .apply_provider_event_inner(ProviderEvent {
+                provider: ProviderId::Codex,
+                project_id: fixture.project_a.id,
+                conversation_id: conversation.id,
+                kind: ProviderEventKind::HistoryItem {
+                    provider_item_id: "history-command".to_owned(),
+                    kind: TimelineItemKind::Command {
+                        command: format!("cat {project_path}/src/lib.rs"),
+                        relative_cwd: Some(format!("{project_path}/src")),
+                        status: ItemStatus::Completed,
+                        exit_code: Some(0),
+                        output: Some(command_output),
+                    },
+                },
+            })
+            .await
+            .expect("sanitized history command");
+        fixture
+            .service
+            .upsert_history_item(
+                conversation.id,
+                ProviderHistoryItem {
+                    provider_item_id: "history-file".to_owned(),
+                    created_at_ms: 10,
+                    kind: TimelineItemKind::FileChange {
+                        relative_path: format!("{project_path}/src/lib.rs"),
+                        change_kind: "update".to_owned(),
+                        status: ItemStatus::Completed,
+                    },
+                },
+            )
+            .expect("sanitized history file");
+        fixture
+            .service
+            .apply_provider_event_inner(ProviderEvent {
+                provider: ProviderId::Codex,
+                project_id: fixture.project_a.id,
+                conversation_id: conversation.id,
+                kind: ProviderEventKind::Plan {
+                    provider_item_id: "live-plan".to_owned(),
+                    steps: vec![PlanStep {
+                        text: format!("inspect {project_path}/src/live.rs"),
+                        status: ItemStatus::Running,
+                    }],
+                },
+            })
+            .await
+            .expect("sanitized live plan");
+        fixture
+            .service
+            .upsert_history_item(
+                conversation.id,
+                ProviderHistoryItem {
+                    provider_item_id: "history-plan".to_owned(),
+                    created_at_ms: 11,
+                    kind: TimelineItemKind::Plan {
+                        steps: vec![PlanStep {
+                            text: format!("test {project_path}/src/history.rs"),
+                            status: ItemStatus::Completed,
+                        }],
+                    },
+                },
+            )
+            .expect("sanitized history plan");
+
+        let timeline = fixture
+            .service
+            .storage
+            .list_timeline()
+            .expect("sanitized timeline");
+        assert_eq!(timeline.len(), 4);
+        assert!(timeline.iter().any(|item| matches!(
+            &item.kind,
+            TimelineItemKind::Command {
+                command,
+                relative_cwd: Some(relative_cwd),
+                output: Some(output),
+                ..
+            } if command == "cat ./src/lib.rs"
+                && relative_cwd == "src"
+                && !output.contains(project_path.as_ref())
+                && output.ends_with("[output truncated at 64 KiB]")
+        )));
+        assert!(timeline.iter().any(|item| matches!(
+            &item.kind,
+            TimelineItemKind::FileChange { relative_path, .. }
+                if relative_path == "src/lib.rs"
+        )));
+        assert!(timeline.iter().any(|item| matches!(
+            &item.kind,
+            TimelineItemKind::Plan { steps }
+                if steps[0].text == "inspect ./src/live.rs"
+        )));
+        assert!(timeline.iter().any(|item| matches!(
+            &item.kind,
+            TimelineItemKind::Plan { steps }
+                if steps[0].text == "test ./src/history.rs"
+        )));
+
+        let outside = fixture.project_b.canonical_path.join("outside.rs");
+        let result = fixture
+            .service
+            .apply_provider_event_inner(ProviderEvent {
+                provider: ProviderId::Codex,
+                project_id: fixture.project_a.id,
+                conversation_id: conversation.id,
+                kind: ProviderEventKind::HistoryItem {
+                    provider_item_id: "history-outside-file".to_owned(),
+                    kind: TimelineItemKind::FileChange {
+                        relative_path: outside.to_string_lossy().into_owned(),
+                        change_kind: "update".to_owned(),
+                        status: ItemStatus::Completed,
+                    },
+                },
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            fixture
+                .service
+                .storage
+                .list_timeline()
+                .expect("outside path was not stored")
+                .len(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_error_redacts_host_path_without_hiding_cause() {
+        let fixture = fixture();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        let hidden_path = fixture.project_b.canonical_path.join("missing image.png");
+
+        fixture
+            .service
+            .apply_provider_event_inner(ProviderEvent {
+                provider: ProviderId::Codex,
+                project_id: fixture.project_a.id,
+                conversation_id: conversation.id,
+                kind: ProviderEventKind::ImagePath {
+                    provider_item_id: Some("missing-image".to_owned()),
+                    path: hidden_path.clone(),
+                    controlled_temp_roots: Vec::new(),
+                    alt: "missing".to_owned(),
+                },
+            })
+            .await
+            .expect("record attachment error");
+
+        let error = fixture
+            .service
+            .storage
+            .list_timeline()
+            .expect("timeline")
+            .into_iter()
+            .find_map(|item| match item.kind {
+                TimelineItemKind::Error { code, message } if code == "attachment_error" => {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .expect("attachment error");
+        assert!(error.contains("image path does not exist"));
+        assert!(error.contains("<host-path>"));
+        assert!(!error.contains(hidden_path.to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn repeated_stable_failure_updates_one_error_item() {
+        let fixture = fixture();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        for (code, message) in [
+            ("codex_error", "early failure"),
+            ("codex_turn_failed", "terminal failure"),
+        ] {
+            fixture
+                .service
+                .apply_provider_event_inner(ProviderEvent {
+                    provider: ProviderId::Codex,
+                    project_id: fixture.project_a.id,
+                    conversation_id: conversation.id,
+                    kind: ProviderEventKind::Failed {
+                        provider_item_id: Some("codex:v1:turn-1:failure".to_owned()),
+                        code: code.to_owned(),
+                        message: message.to_owned(),
+                    },
+                })
+                .await
+                .expect("apply failure");
+        }
+
+        let timeline = fixture
+            .service
+            .storage
+            .list_timeline()
+            .expect("failure timeline");
+        assert_eq!(timeline.len(), 1);
+        assert!(matches!(
+            &timeline[0].kind,
+            TimelineItemKind::Error { code, message }
+                if code == "codex_turn_failed" && message == "terminal failure"
+        ));
+        assert_eq!(
+            fixture
+                .service
+                .storage
+                .conversation(conversation.id)
+                .expect("failed conversation")
+                .state,
+            ConversationState::Failed
+        );
+    }
+
+    #[tokio::test]
     async fn first_send_creates_once_and_client_message_id_is_idempotent() {
         let fixture = fixture();
         let conversation_id = ConversationId::new();
@@ -2143,6 +3792,7 @@ mod tests {
     #[tokio::test]
     async fn remote_history_is_deduplicated_and_manual_title_is_locked() {
         let fixture = fixture();
+        fixture.service.start_provider_event_pumps();
         fixture
             .provider
             .sessions

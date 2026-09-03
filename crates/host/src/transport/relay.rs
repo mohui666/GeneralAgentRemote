@@ -5,6 +5,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use agent_remote_protocol::{RelayFrame, decode, encode};
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest},
@@ -13,7 +14,9 @@ use uuid::Uuid;
 
 use crate::{
     app::AppService,
-    transport::session::{ApplicationSession, AuthRateLimiter},
+    transport::session::{
+        ApplicationSession, AuthRateLimiter, AuthenticatedSession, CommandSchedule,
+    },
 };
 
 const RELAY_SUBPROTOCOL: &str = "agent-remote-relay.cbor.v1";
@@ -23,6 +26,18 @@ pub struct RelayClientConfig {
     pub url: String,
     pub access_token: String,
     pub dev_insecure: bool,
+}
+
+struct RelayApplicationClient {
+    generation: u64,
+    session: ApplicationSession,
+    ordered_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+}
+
+struct RelayCommandResponse {
+    connection_id: Uuid,
+    generation: u64,
+    payload: Vec<u8>,
 }
 
 pub async fn run_reconnecting(service: Arc<AppService>, config: RelayClientConfig) -> ! {
@@ -77,7 +92,9 @@ pub async fn run_once(service: Arc<AppService>, config: &RelayClientConfig) -> R
     tracing::info!(relay = %config.url, host_id = %service.host_id(), "Host registered with relay");
 
     let limiter = Arc::new(AuthRateLimiter::default());
-    let mut clients: HashMap<Uuid, ApplicationSession> = HashMap::new();
+    let mut clients: HashMap<Uuid, RelayApplicationClient> = HashMap::new();
+    let mut next_client_generation = 0_u64;
+    let (response_tx, mut response_rx) = mpsc::unbounded_channel();
     let mut updates = service.subscribe();
     loop {
         tokio::select! {
@@ -88,17 +105,52 @@ pub async fn run_once(service: Arc<AppService>, config: &RelayClientConfig) -> R
                         let frame = decode::<RelayFrame>(&bytes)?;
                         match frame {
                             RelayFrame::OpenClient { host_id, connection_id } if host_id == service.host_id() => {
-                                clients.insert(connection_id, ApplicationSession::new(
-                                    Arc::clone(&service),
-                                    Arc::clone(&limiter),
-                                    format!("relay:{connection_id}"),
-                                ));
+                                next_client_generation += 1;
+                                clients.insert(connection_id, RelayApplicationClient {
+                                    generation: next_client_generation,
+                                    session: ApplicationSession::new(
+                                        Arc::clone(&service),
+                                        Arc::clone(&limiter),
+                                        format!("relay:{connection_id}"),
+                                    ),
+                                    ordered_tx: None,
+                                });
                                 send_frame(&mut sink, RelayFrame::ClientOpened { connection_id }).await?;
                             }
                             RelayFrame::Payload { connection_id, payload } => {
-                                if let Some(session) = clients.get_mut(&connection_id) {
-                                    let response = session.process(&payload).await;
-                                    send_frame(&mut sink, RelayFrame::Payload { connection_id, payload: response }).await?;
+                                if let Some(client) = clients.get_mut(&connection_id) {
+                                    if let Some(authenticated) = client.session.authenticated() {
+                                        let generation = client.generation;
+                                        match AuthenticatedSession::schedule(&payload) {
+                                            CommandSchedule::Concurrent => {
+                                                let response_tx = response_tx.clone();
+                                                tokio::spawn(async move {
+                                                    let payload = authenticated.process(&payload).await;
+                                                    let _ = response_tx.send(RelayCommandResponse {
+                                                        connection_id,
+                                                        generation,
+                                                        payload,
+                                                    });
+                                                });
+                                            }
+                                            CommandSchedule::Ordered => {
+                                                let ordered_tx = client.ordered_tx.get_or_insert_with(|| {
+                                                    spawn_ordered_worker(
+                                                        authenticated,
+                                                        connection_id,
+                                                        generation,
+                                                        response_tx.clone(),
+                                                    )
+                                                });
+                                                if ordered_tx.send(payload).is_err() {
+                                                    clients.remove(&connection_id);
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        let response = client.session.process(&payload).await;
+                                        send_frame(&mut sink, RelayFrame::Payload { connection_id, payload: response }).await?;
+                                    }
                                 } else {
                                     send_frame(&mut sink, RelayFrame::Close {
                                         connection_id,
@@ -124,13 +176,25 @@ pub async fn run_once(service: Arc<AppService>, config: &RelayClientConfig) -> R
                     Message::Text(_) | Message::Frame(_) => bail!("relay sent a non-binary protocol frame"),
                 }
             }
+            response = response_rx.recv() => {
+                let Some(response) = response else { bail!("relay command response channel closed") };
+                let is_current = clients
+                    .get(&response.connection_id)
+                    .is_some_and(|client| client.generation == response.generation);
+                if is_current {
+                    send_frame(&mut sink, RelayFrame::Payload {
+                        connection_id: response.connection_id,
+                        payload: response.payload,
+                    }).await?;
+                }
+            }
             update = updates.recv() => {
                 match update {
                     Ok(update) => {
                         let payload = encode(&update)?;
                         let authenticated = clients
                             .iter()
-                            .filter_map(|(id, session)| session.is_authenticated().then_some(*id))
+                            .filter_map(|(id, client)| client.session.is_authenticated().then_some(*id))
                             .collect::<Vec<_>>();
                         for connection_id in authenticated {
                             send_frame(&mut sink, RelayFrame::Payload {
@@ -153,6 +217,26 @@ pub async fn run_once(service: Arc<AppService>, config: &RelayClientConfig) -> R
             }
         }
     }
+}
+
+fn spawn_ordered_worker(
+    session: AuthenticatedSession,
+    connection_id: Uuid,
+    generation: u64,
+    response_tx: mpsc::UnboundedSender<RelayCommandResponse>,
+) -> mpsc::UnboundedSender<Vec<u8>> {
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        while let Some(payload) = command_rx.recv().await {
+            let payload = session.process(&payload).await;
+            let _ = response_tx.send(RelayCommandResponse {
+                connection_id,
+                generation,
+                payload,
+            });
+        }
+    });
+    command_tx
 }
 
 fn validate_url(url: &str, dev_insecure: bool) -> Result<()> {

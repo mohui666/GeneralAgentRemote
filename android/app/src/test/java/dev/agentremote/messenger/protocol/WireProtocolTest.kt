@@ -3,11 +3,27 @@ package dev.agentremote.messenger.protocol
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory
+import dev.agentremote.messenger.model.ApprovalOption
+import dev.agentremote.messenger.model.AttachmentCapability
 import dev.agentremote.messenger.model.ConnectionTarget
+import dev.agentremote.messenger.model.Conversation
+import dev.agentremote.messenger.model.EffortOption
+import dev.agentremote.messenger.model.ModelOption
+import dev.agentremote.messenger.model.PermissionModeOption
+import dev.agentremote.messenger.model.PermissionRisk
+import dev.agentremote.messenger.model.PlanStep
 import dev.agentremote.messenger.model.PromptAttachment
+import dev.agentremote.messenger.model.ProjectSummary
+import dev.agentremote.messenger.model.ProviderCapability
 import dev.agentremote.messenger.model.ProviderId
 import dev.agentremote.messenger.model.ServerEvent
+import dev.agentremote.messenger.model.SessionOption
+import dev.agentremote.messenger.model.SessionOptionValue
+import dev.agentremote.messenger.model.SessionSummary
+import dev.agentremote.messenger.model.Snapshot
 import dev.agentremote.messenger.model.StoredCredential
+import dev.agentremote.messenger.model.TimelineContent
+import dev.agentremote.messenger.model.TimelineItem
 import dev.agentremote.messenger.model.TimelinePageCursor
 import java.nio.ByteBuffer
 import java.util.UUID
@@ -121,8 +137,173 @@ class WireProtocolTest {
         assertEquals(100, message["limit"].asInt())
     }
 
+    @Test
+    fun snapshotEncodingRoundTripsEveryFieldAndTimelineVariant() {
+        val hostId = uuid(1)
+        val projectId = uuid(2)
+        val conversationId = uuid(3)
+        var itemIndex = 10
+        fun item(content: TimelineContent) = TimelineItem(
+            id = uuid(itemIndex++),
+            conversationId = conversationId,
+            revision = itemIndex.toLong(),
+            createdAtMs = 1_000L + itemIndex,
+            content = content,
+        )
+        val snapshot = Snapshot(
+            hostId = hostId,
+            hostName = "Test Host",
+            projects = listOf(
+                ProjectSummary(
+                    id = projectId,
+                    displayName = "GeneralAgentRemote",
+                    shortPath = "~/GeneralAgentRemote",
+                    enabledProviders = listOf(ProviderId.CODEX, ProviderId.GROK),
+                    valid = true,
+                    lastActivityAtMs = 9_001L,
+                    conversationCount = 1,
+                ),
+                ProjectSummary(
+                    id = uuid(4),
+                    displayName = "Unavailable",
+                    shortPath = "~/Unavailable",
+                    enabledProviders = emptyList(),
+                    valid = false,
+                    lastActivityAtMs = null,
+                    conversationCount = 0,
+                ),
+            ),
+            providerCapabilities = listOf(
+                ProviderCapability(
+                    provider = ProviderId.CODEX,
+                    projectId = projectId,
+                    state = "ready",
+                    version = "1.2.3",
+                    detail = "connected",
+                    models = listOf(
+                        ModelOption(
+                            id = "gpt-test",
+                            displayName = "GPT Test",
+                            effortOptions = listOf(
+                                EffortOption("low", "Low"),
+                                EffortOption("high", "High"),
+                            ),
+                            defaultEffort = "high",
+                        ),
+                        ModelOption(
+                            id = "gpt-no-effort",
+                            displayName = "GPT No Effort",
+                            effortOptions = emptyList(),
+                            defaultEffort = null,
+                        ),
+                    ),
+                    supportsSessionList = true,
+                    supportsHistory = true,
+                    supportsIncrementalSync = true,
+                    supportsRename = true,
+                    supportsSteer = false,
+                    permissionModes = listOf(
+                        PermissionModeOption(
+                            id = "ask",
+                            displayName = "Ask",
+                            description = "Ask before elevated actions",
+                            risk = PermissionRisk.STANDARD,
+                        ),
+                        PermissionModeOption(
+                            id = "full",
+                            displayName = "Full",
+                            description = "Allow elevated actions",
+                            risk = PermissionRisk.ELEVATED,
+                        ),
+                    ),
+                    defaultPermissionMode = "ask",
+                    attachments = AttachmentCapability(
+                        allowedMimeTypes = listOf("image/png", "text/plain"),
+                        maxCount = 4,
+                        maxBytes = 5_000_000,
+                        maxTotalBytes = 10_000_000,
+                    ),
+                    sessions = listOf(SessionSummary("native-1", "Existing", 8_001L)),
+                    limitation = "No mid-turn model switch",
+                ),
+            ),
+            conversations = listOf(
+                Conversation(
+                    id = conversationId,
+                    revision = 7,
+                    provider = ProviderId.CODEX,
+                    projectId = projectId,
+                    nativeSessionId = "native-1",
+                    title = "Round trip",
+                    titleSource = "user",
+                    titleUpdatedAtMs = 7_001L,
+                    selectedModel = "gpt-test",
+                    selectedEffort = "high",
+                    state = "needs_approval",
+                    sessionOptions = listOf(
+                        SessionOption(
+                            id = "permission",
+                            displayName = "Permission",
+                            category = "security",
+                            currentValue = "ask",
+                            values = listOf(
+                                SessionOptionValue("ask", "Ask"),
+                                SessionOptionValue("full", "Full"),
+                            ),
+                        ),
+                        SessionOption(
+                            id = "mode",
+                            displayName = "Mode",
+                            category = null,
+                            currentValue = "chat",
+                            values = emptyList(),
+                        ),
+                    ),
+                    updatedAtMs = 9_001L,
+                ),
+            ),
+            timeline = listOf(
+                item(TimelineContent.UserMessage("hello")),
+                item(TimelineContent.AgentMessage("reasoning_summary", "summary")),
+                item(TimelineContent.Progress("test", "Tests", "completed", null)),
+                item(TimelineContent.Progress("custom_progress", "Custom", "running", "details")),
+                item(TimelineContent.Plan(listOf(PlanStep("Inspect", "completed")))),
+                item(TimelineContent.ToolCall("read_file", "completed", "input", "output")),
+                item(TimelineContent.Command("cargo test", "crates/host", "completed", 0, "ok")),
+                item(TimelineContent.FileChange("src/main.rs", "modified", "completed")),
+                item(
+                    TimelineContent.Approval(
+                        approvalId = uuid(5),
+                        prompt = "Allow?",
+                        options = listOf(ApprovalOption("yes", "Allow"), ApprovalOption("no", "Deny")),
+                        resolvedOption = "yes",
+                    ),
+                ),
+                item(TimelineContent.Image(uuid(6), "preview")),
+                item(TimelineContent.Error("provider_error", "failed")),
+            ),
+        )
+
+        val encoded = WireProtocol.encodeSnapshot(snapshot)
+        val root: JsonNode = mapper.readTree(encoded)
+        val decoded = WireProtocol.decodeServer(
+            encoded,
+            ConnectionTarget(hostId, "https://relay.example.com", relay = true, pairToken = "token"),
+        ) as ServerEvent.SnapshotReceived
+
+        assertEquals("snapshot", root["message"]["type"].asText())
+        assertEquals("test", root["message"]["snapshot"]["timeline"][2]["kind"]["kind"].asText())
+        assertEquals(
+            "custom_progress",
+            root["message"]["snapshot"]["timeline"][3]["kind"]["kind"]["other"].asText(),
+        )
+        assertEquals(snapshot, decoded.snapshot)
+    }
+
     private fun uuidBytes(uuid: UUID): ByteArray = ByteBuffer.allocate(16)
         .putLong(uuid.mostSignificantBits)
         .putLong(uuid.leastSignificantBits)
         .array()
+
+    private fun uuid(value: Int): UUID = UUID(0, value.toLong())
 }

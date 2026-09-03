@@ -51,6 +51,10 @@ object WireProtocol {
 
     fun getSnapshot(): ByteArray = command("get_snapshot")
 
+    fun encodeSnapshot(snapshot: Snapshot): ByteArray = command("snapshot") {
+        set<ObjectNode>("snapshot", snapshotNode(snapshot))
+    }
+
     fun refreshProjects(provider: ProviderId): ByteArray = command("refresh_projects") {
         put("provider", provider.wire)
     }
@@ -302,6 +306,223 @@ object WireProtocol {
         return mapper.writeValueAsBytes(envelope)
     }
 
+    private fun snapshotNode(snapshot: Snapshot) = mapper.createObjectNode().apply {
+        setUuid("host_id", snapshot.hostId)
+        put("host_name", snapshot.hostName)
+        putArray("projects").apply {
+            snapshot.projects.forEach { add(projectNode(it)) }
+        }
+        putArray("provider_capabilities").apply {
+            snapshot.providerCapabilities.forEach { add(capabilityNode(it)) }
+        }
+        putArray("conversations").apply {
+            snapshot.conversations.forEach { add(conversationNode(it)) }
+        }
+        putArray("timeline").apply {
+            snapshot.timeline.forEach { add(timelineItemNode(it)) }
+        }
+    }
+
+    private fun projectNode(project: ProjectSummary) = mapper.createObjectNode().apply {
+        setUuid("id", project.id)
+        put("display_name", project.displayName)
+        put("short_path", project.shortPath)
+        putArray("enabled_providers").apply {
+            project.enabledProviders.forEach { add(it.wire) }
+        }
+        put("valid", project.valid)
+        if (project.lastActivityAtMs == null) {
+            putNull("last_activity_at_ms")
+        } else {
+            put("last_activity_at_ms", project.lastActivityAtMs)
+        }
+        put("conversation_count", project.conversationCount)
+    }
+
+    private fun capabilityNode(capability: ProviderCapability) = mapper.createObjectNode().apply {
+        put("provider", capability.provider.wire)
+        setUuid("project_id", capability.projectId)
+        set<ObjectNode>("health", mapper.createObjectNode().apply {
+            put("provider", capability.provider.wire)
+            put("state", capability.state)
+            putNullable("version", capability.version)
+            putNullable("detail", capability.detail)
+        })
+        putArray("models").apply {
+            capability.models.forEach { model ->
+                addObject().apply {
+                    put("id", model.id)
+                    put("display_name", model.displayName)
+                    putArray("effort_options").apply {
+                        model.effortOptions.forEach { effort ->
+                            addObject().apply {
+                                put("id", effort.id)
+                                put("display_name", effort.displayName)
+                            }
+                        }
+                    }
+                    putNullable("default_effort", model.defaultEffort)
+                }
+            }
+        }
+        put("supports_session_list", capability.supportsSessionList)
+        put("supports_history", capability.supportsHistory)
+        put("supports_incremental_sync", capability.supportsIncrementalSync)
+        put("supports_rename", capability.supportsRename)
+        put("supports_steer", capability.supportsSteer)
+        putArray("permission_modes").apply {
+            capability.permissionModes.forEach { permission ->
+                addObject().apply {
+                    put("id", permission.id)
+                    put("display_name", permission.displayName)
+                    put("description", permission.description)
+                    put("risk", permission.risk.wire)
+                }
+            }
+        }
+        putNullable("default_permission_mode", capability.defaultPermissionMode)
+        set<ObjectNode>("attachments", mapper.createObjectNode().apply {
+            putArray("allowed_mime_types").apply {
+                capability.attachments.allowedMimeTypes.forEach(::add)
+            }
+            put("max_count", capability.attachments.maxCount)
+            put("max_bytes", capability.attachments.maxBytes)
+            put("max_total_bytes", capability.attachments.maxTotalBytes)
+        })
+        putArray("sessions").apply {
+            capability.sessions.forEach { session ->
+                addObject().apply {
+                    put("native_session_id", session.nativeSessionId)
+                    put("title", session.title)
+                    put("updated_at_ms", session.updatedAtMs)
+                }
+            }
+        }
+        putNullable("limitation", capability.limitation)
+    }
+
+    private fun conversationNode(conversation: Conversation) = mapper.createObjectNode().apply {
+        setUuid("id", conversation.id)
+        put("revision", conversation.revision)
+        put("provider", conversation.provider.wire)
+        setUuid("project_id", conversation.projectId)
+        put("native_session_id", conversation.nativeSessionId)
+        put("title", conversation.title)
+        put("title_source", conversation.titleSource)
+        put("title_updated_at_ms", conversation.titleUpdatedAtMs)
+        putNullable("selected_model", conversation.selectedModel)
+        putNullable("selected_effort", conversation.selectedEffort)
+        put("state", conversation.state)
+        putArray("session_options").apply {
+            conversation.sessionOptions.forEach { option ->
+                addObject().apply {
+                    put("id", option.id)
+                    put("display_name", option.displayName)
+                    putNullable("category", option.category)
+                    put("current_value", option.currentValue)
+                    putArray("values").apply {
+                        option.values.forEach { value ->
+                            addObject().apply {
+                                put("value", value.value)
+                                put("display_name", value.displayName)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        put("updated_at_ms", conversation.updatedAtMs)
+    }
+
+    private fun timelineItemNode(item: TimelineItem) = mapper.createObjectNode().apply {
+        setUuid("id", item.id)
+        setUuid("conversation_id", item.conversationId)
+        put("revision", item.revision)
+        put("created_at_ms", item.createdAtMs)
+        set<ObjectNode>("kind", timelineContentNode(item.content))
+    }
+
+    private fun timelineContentNode(content: TimelineContent): ObjectNode = mapper.createObjectNode().apply {
+        when (content) {
+            is TimelineContent.UserMessage -> {
+                put("type", "user_message")
+                put("text", content.text)
+            }
+            is TimelineContent.AgentMessage -> {
+                put("type", "agent_message")
+                put("phase", content.phase)
+                put("text", content.text)
+            }
+            is TimelineContent.Progress -> {
+                put("type", "progress")
+                if (content.kind in STANDARD_PROGRESS_KINDS) {
+                    put("kind", content.kind)
+                } else {
+                    set<ObjectNode>("kind", mapper.createObjectNode().put("other", content.kind))
+                }
+                put("label", content.label)
+                put("status", content.status)
+                putNullable("detail", content.detail)
+            }
+            is TimelineContent.Plan -> {
+                put("type", "plan")
+                putArray("steps").apply {
+                    content.steps.forEach { step ->
+                        addObject().apply {
+                            put("text", step.text)
+                            put("status", step.status)
+                        }
+                    }
+                }
+            }
+            is TimelineContent.ToolCall -> {
+                put("type", "tool_call")
+                put("name", content.name)
+                put("status", content.status)
+                putNullable("input_summary", content.inputSummary)
+                putNullable("output_summary", content.outputSummary)
+            }
+            is TimelineContent.Command -> {
+                put("type", "command")
+                put("command", content.command)
+                putNullable("relative_cwd", content.relativeCwd)
+                put("status", content.status)
+                if (content.exitCode == null) putNull("exit_code") else put("exit_code", content.exitCode)
+                putNullable("output", content.output)
+            }
+            is TimelineContent.FileChange -> {
+                put("type", "file_change")
+                put("relative_path", content.relativePath)
+                put("change_kind", content.changeKind)
+                put("status", content.status)
+            }
+            is TimelineContent.Approval -> {
+                put("type", "approval")
+                setUuid("approval_id", content.approvalId)
+                put("prompt", content.prompt)
+                putArray("options").apply {
+                    content.options.forEach { option ->
+                        addObject().apply {
+                            put("id", option.id)
+                            put("label", option.label)
+                        }
+                    }
+                }
+                putNullable("resolved_option", content.resolvedOption)
+            }
+            is TimelineContent.Image -> {
+                put("type", "image")
+                setUuid("attachment_id", content.attachmentId)
+                put("alt", content.alt)
+            }
+            is TimelineContent.Error -> {
+                put("type", "error")
+                put("code", content.code)
+                put("message", content.message)
+            }
+        }
+    }
+
     private fun parseSnapshot(node: JsonNode) = Snapshot(
         hostId = node.requiredUuid("host_id"),
         hostName = node.requiredText("host_name"),
@@ -510,4 +731,6 @@ object WireProtocol {
         val buffer = ByteBuffer.wrap(bytes)
         return UUID(buffer.long, buffer.long)
     }
+
+    private val STANDARD_PROGRESS_KINDS = setOf("command", "tool", "web_search", "test", "file")
 }

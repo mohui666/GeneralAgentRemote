@@ -13,12 +13,14 @@ use axum::{
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::mpsc};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
     app::AppService,
-    transport::session::{ApplicationSession, AuthRateLimiter},
+    transport::session::{
+        ApplicationSession, AuthRateLimiter, AuthenticatedSession, CommandSchedule,
+    },
 };
 
 pub const WS_SUBPROTOCOL: &str = "agent-remote.cbor.v1";
@@ -82,15 +84,41 @@ async fn run_socket(socket: WebSocket, state: DirectState, peer: SocketAddr) {
         peer.ip().to_string(),
     );
     let mut updates = state.service.subscribe();
+    let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+    let mut ordered_tx = None;
     loop {
         tokio::select! {
             incoming = receiver.next() => {
                 let Some(incoming) = incoming else { break };
                 match incoming {
                     Ok(Message::Binary(bytes)) => {
-                        let response = session.process(&bytes).await;
-                        if sender.send(Message::Binary(response.into())).await.is_err() {
-                            break;
+                        if let Some(authenticated) = session.authenticated() {
+                            let payload = bytes.to_vec();
+                            match AuthenticatedSession::schedule(&payload) {
+                                CommandSchedule::Concurrent => {
+                                    let response_tx = response_tx.clone();
+                                    tokio::spawn(async move {
+                                        let response = authenticated.process(&payload).await;
+                                        let _ = response_tx.send(response);
+                                    });
+                                }
+                                CommandSchedule::Ordered => {
+                                    let ordered_tx = ordered_tx.get_or_insert_with(|| {
+                                        spawn_ordered_worker(
+                                            authenticated,
+                                            response_tx.clone(),
+                                        )
+                                    });
+                                    if ordered_tx.send(payload).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            let response = session.process(&bytes).await;
+                            if sender.send(Message::Binary(response.into())).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     Ok(Message::Close(_)) | Err(_) => break,
@@ -107,6 +135,12 @@ async fn run_socket(socket: WebSocket, state: DirectState, peer: SocketAddr) {
                         }))).await;
                         break;
                     }
+                }
+            }
+            response = response_rx.recv() => {
+                let Some(response) = response else { break };
+                if sender.send(Message::Binary(response.into())).await.is_err() {
+                    break;
                 }
             }
             update = updates.recv(), if session.is_authenticated() => {
@@ -129,6 +163,20 @@ async fn run_socket(socket: WebSocket, state: DirectState, peer: SocketAddr) {
             }
         }
     }
+}
+
+fn spawn_ordered_worker(
+    session: AuthenticatedSession,
+    response_tx: mpsc::UnboundedSender<Vec<u8>>,
+) -> mpsc::UnboundedSender<Vec<u8>> {
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        while let Some(payload) = command_rx.recv().await {
+            let response = session.process(&payload).await;
+            let _ = response_tx.send(response);
+        }
+    });
+    command_tx
 }
 
 pub async fn bind(address: SocketAddr) -> Result<TcpListener> {
@@ -160,9 +208,10 @@ mod tests {
     };
 
     use agent_remote_protocol::{
-        AgentMessagePhase, ClientCommand, CommandId, ConversationState, EffortOption, HostId,
-        ModelOption, ProviderHealth, ProviderId, ProviderState, ServerMessage, SessionSummary,
-        TimelineItemKind, decode, encode,
+        AgentMessagePhase, ClientCommand, CommandId, ConversationId, ConversationState, DeviceId,
+        EffortOption, HostId, ModelOption, ProjectId, ProviderHealth, ProviderId, ProviderState,
+        ServerMessage, SessionOption, SessionOptionValue, SessionSummary, TimelineItemKind, decode,
+        encode,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -185,11 +234,33 @@ mod tests {
         storage::Storage,
     };
 
+    type TestSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    struct DirectHarness {
+        _temp: tempfile::TempDir,
+        address: SocketAddr,
+        host_id: HostId,
+        device_id: DeviceId,
+        device_token: String,
+        project_id: ProjectId,
+        provider: Arc<LoopProvider>,
+        task: tokio::task::JoinHandle<Result<()>>,
+    }
+
     struct LoopProvider {
         events: broadcast::Sender<ProviderEvent>,
         projects:
             Mutex<HashMap<agent_remote_protocol::ConversationId, agent_remote_protocol::ProjectId>>,
         sends: AtomicUsize,
+        interruptions: AtomicUsize,
+        session_list_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+        session_list_started: tokio::sync::Notify,
+        session_list_calls: AtomicUsize,
+        option_calls: Mutex<Vec<(String, String)>>,
+        option_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+        option_started: tokio::sync::Notify,
     }
 
     impl LoopProvider {
@@ -199,6 +270,13 @@ mod tests {
                 events,
                 projects: Mutex::new(HashMap::new()),
                 sends: AtomicUsize::new(0),
+                interruptions: AtomicUsize::new(0),
+                session_list_gate: Mutex::new(None),
+                session_list_started: tokio::sync::Notify::new(),
+                session_list_calls: AtomicUsize::new(0),
+                option_calls: Mutex::new(Vec::new()),
+                option_gate: Mutex::new(None),
+                option_started: tokio::sync::Notify::new(),
             })
         }
     }
@@ -239,6 +317,16 @@ mod tests {
             }])
         }
         async fn list_sessions(&self, _project: &crate::Project) -> Result<Vec<SessionSummary>> {
+            self.session_list_calls.fetch_add(1, Ordering::SeqCst);
+            let gate = self
+                .session_list_gate
+                .lock()
+                .expect("session list gate mutex")
+                .clone();
+            if let Some(gate) = gate {
+                self.session_list_started.notify_one();
+                gate.acquire().await.expect("session list gate").forget();
+            }
             Ok(Vec::new())
         }
         async fn create_session(&self, request: CreateSession) -> Result<NativeSession> {
@@ -251,7 +339,40 @@ mod tests {
                 title: "Direct loop".to_owned(),
                 selected_model: request.model,
                 selected_effort: request.effort,
-                session_options: Vec::new(),
+                session_options: vec![
+                    SessionOption {
+                        id: "alpha".to_owned(),
+                        display_name: "Alpha".to_owned(),
+                        category: None,
+                        current_value: "a0".to_owned(),
+                        values: vec![
+                            SessionOptionValue {
+                                value: "a0".to_owned(),
+                                display_name: "A0".to_owned(),
+                            },
+                            SessionOptionValue {
+                                value: "a1".to_owned(),
+                                display_name: "A1".to_owned(),
+                            },
+                        ],
+                    },
+                    SessionOption {
+                        id: "beta".to_owned(),
+                        display_name: "Beta".to_owned(),
+                        category: None,
+                        current_value: "b0".to_owned(),
+                        values: vec![
+                            SessionOptionValue {
+                                value: "b0".to_owned(),
+                                display_name: "B0".to_owned(),
+                            },
+                            SessionOptionValue {
+                                value: "b1".to_owned(),
+                                display_name: "B1".to_owned(),
+                            },
+                        ],
+                    },
+                ],
             })
         }
         async fn resume_session(&self, request: ResumeSession) -> Result<NativeSession> {
@@ -292,21 +413,29 @@ mod tests {
             Ok(CommandAck)
         }
         async fn interrupt(&self, _request: InterruptSession) -> Result<CommandAck> {
+            self.interruptions.fetch_add(1, Ordering::SeqCst);
             Ok(CommandAck)
         }
         async fn resolve_approval(&self, _request: ResolveApproval) -> Result<CommandAck> {
             Ok(CommandAck)
         }
-        async fn set_session_option(&self, _request: SetSessionOption) -> Result<CommandAck> {
+        async fn set_session_option(&self, request: SetSessionOption) -> Result<CommandAck> {
+            self.option_calls
+                .lock()
+                .expect("option calls mutex")
+                .push((request.option_id.clone(), request.value));
+            let gate = (request.option_id == "alpha")
+                .then(|| self.option_gate.lock().expect("option gate mutex").clone())
+                .flatten();
+            if let Some(gate) = gate {
+                self.option_started.notify_one();
+                gate.acquire().await.expect("option gate").forget();
+            }
             Ok(CommandAck)
         }
     }
 
-    async fn receive_server(
-        socket: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    ) -> ServerMessage {
+    async fn receive_server(socket: &mut TestSocket) -> ServerMessage {
         loop {
             match socket
                 .next()
@@ -325,12 +454,7 @@ mod tests {
         }
     }
 
-    async fn send_client(
-        socket: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        command: &ClientCommand,
-    ) {
+    async fn send_client(socket: &mut TestSocket, command: &ClientCommand) {
         socket
             .send(ClientMessage::Binary(
                 encode(command).expect("encode command").into(),
@@ -339,8 +463,18 @@ mod tests {
             .expect("send command");
     }
 
-    #[tokio::test]
-    async fn authenticated_direct_websocket_completes_a_message_loop_once() {
+    async fn connect_direct(address: SocketAddr) -> TestSocket {
+        let mut request = format!("ws://{address}/ws")
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            WS_SUBPROTOCOL.parse().expect("protocol"),
+        );
+        connect_async(request).await.expect("connect").0
+    }
+
+    async fn authenticated_direct() -> (DirectHarness, TestSocket) {
         let temp = tempfile::tempdir().expect("temp dir");
         let project_root = temp.path().join("project");
         fs::create_dir(&project_root).expect("project dir");
@@ -367,14 +501,7 @@ mod tests {
         let address = listener.local_addr().expect("address");
         let task = tokio::spawn(serve(listener, service, web));
 
-        let mut request = format!("ws://{address}/ws")
-            .into_client_request()
-            .expect("request");
-        request.headers_mut().insert(
-            "Sec-WebSocket-Protocol",
-            WS_SUBPROTOCOL.parse().expect("protocol"),
-        );
-        let (mut socket, _) = connect_async(request).await.expect("connect");
+        let mut socket = connect_direct(address).await;
         send_client(
             &mut socket,
             &ClientCommand::Pair {
@@ -384,17 +511,62 @@ mod tests {
             },
         )
         .await;
+        send_client(&mut socket, &ClientCommand::GetSnapshot).await;
+        let (device_id, device_token) = match receive_server(&mut socket).await {
+            ServerMessage::Paired {
+                device_id,
+                device_token,
+                ..
+            } => (device_id, device_token),
+            other => panic!("expected Paired, got {other:?}"),
+        };
         assert!(matches!(
             receive_server(&mut socket).await,
-            ServerMessage::Paired { .. }
+            ServerMessage::Snapshot { .. }
         ));
+        (
+            DirectHarness {
+                _temp: temp,
+                address,
+                host_id,
+                device_id,
+                device_token,
+                project_id: project.id,
+                provider,
+                task,
+            },
+            socket,
+        )
+    }
 
-        let create_id = CommandId::new();
+    async fn reconnect_direct(harness: &DirectHarness) -> TestSocket {
+        let mut socket = connect_direct(harness.address).await;
         send_client(
             &mut socket,
+            &ClientCommand::Authenticate {
+                host_id: harness.host_id,
+                device_id: harness.device_id,
+                device_token: harness.device_token.clone(),
+            },
+        )
+        .await;
+        assert_eq!(
+            receive_server(&mut socket).await,
+            ServerMessage::Authenticated {
+                host_id: harness.host_id,
+                device_id: harness.device_id,
+            }
+        );
+        socket
+    }
+
+    async fn create_conversation(socket: &mut TestSocket, project_id: ProjectId) -> ConversationId {
+        let command_id = CommandId::new();
+        send_client(
+            socket,
             &ClientCommand::CreateConversation {
-                command_id: create_id,
-                project_id: project.id,
+                command_id,
+                project_id,
                 provider: ProviderId::Codex,
                 native_session_id: None,
                 model: Some("mock-model".to_owned()),
@@ -402,19 +574,26 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(
-            receive_server(&mut socket).await,
-            ServerMessage::CommandAccepted {
-                command_id: create_id
+        let mut accepted = false;
+        let mut conversation_id = None;
+        while !accepted || conversation_id.is_none() {
+            match receive_server(socket).await {
+                ServerMessage::CommandAccepted {
+                    command_id: accepted_id,
+                } if accepted_id == command_id => accepted = true,
+                ServerMessage::ConversationUpserted { conversation } => {
+                    conversation_id = Some(conversation.id);
+                }
+                _ => {}
             }
-        );
-        let conversation_id = loop {
-            if let ServerMessage::ConversationUpserted { conversation } =
-                receive_server(&mut socket).await
-            {
-                break conversation.id;
-            }
-        };
+        }
+        conversation_id.expect("created conversation")
+    }
+
+    #[tokio::test]
+    async fn authenticated_direct_websocket_completes_a_message_loop_once() {
+        let (harness, mut socket) = authenticated_direct().await;
+        let conversation_id = create_conversation(&mut socket, harness.project_id).await;
 
         let send_id = CommandId::new();
         let send = ClientCommand::SendMessage {
@@ -450,7 +629,281 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(provider.sends.load(Ordering::SeqCst), 1);
-        task.abort();
+        assert_eq!(harness.provider.sends.load(Ordering::SeqCst), 1);
+        harness.task.abort();
+    }
+
+    #[tokio::test]
+    async fn slow_direct_command_does_not_block_other_commands_or_updates() {
+        let (harness, mut socket) = authenticated_direct().await;
+        let conversation_id = create_conversation(&mut socket, harness.project_id).await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *harness
+            .provider
+            .session_list_gate
+            .lock()
+            .expect("session list gate mutex") = Some(Arc::clone(&gate));
+
+        let sync_id = CommandId::new();
+        send_client(
+            &mut socket,
+            &ClientCommand::SyncProject {
+                command_id: sync_id,
+                project_id: harness.project_id,
+                provider: ProviderId::Codex,
+            },
+        )
+        .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            harness.provider.session_list_started.notified(),
+        )
+        .await
+        .expect("sync command did not reach provider");
+
+        let interrupt_id = CommandId::new();
+        send_client(
+            &mut socket,
+            &ClientCommand::Interrupt {
+                command_id: interrupt_id,
+                conversation_id,
+            },
+        )
+        .await;
+        let _ = harness.provider.events.send(ProviderEvent {
+            provider: ProviderId::Codex,
+            project_id: harness.project_id,
+            conversation_id,
+            kind: ProviderEventKind::AgentTextDelta {
+                provider_item_id: "during-sync".to_owned(),
+                phase: AgentMessagePhase::Final,
+                delta: "update during sync".to_owned(),
+            },
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut interrupt_accepted = false;
+            let mut update_received = false;
+            while !interrupt_accepted || !update_received {
+                match receive_server(&mut socket).await {
+                    ServerMessage::CommandAccepted { command_id } if command_id == interrupt_id => {
+                        interrupt_accepted = true;
+                    }
+                    ServerMessage::TimelineItemUpserted { item }
+                        if item.conversation_id == conversation_id
+                            && matches!(
+                                item.kind,
+                                TimelineItemKind::AgentMessage { ref text, .. }
+                                    if text == "update during sync"
+                            ) =>
+                    {
+                        update_received = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("slow command blocked an independent response or update");
+        assert_eq!(harness.provider.interruptions.load(Ordering::SeqCst), 1);
+
+        gate.add_permits(1);
+        loop {
+            if matches!(
+                receive_server(&mut socket).await,
+                ServerMessage::ProjectSyncCompleted { command_id, .. } if command_id == sync_id
+            ) {
+                break;
+            }
+        }
+        harness.task.abort();
+    }
+
+    #[tokio::test]
+    async fn authenticated_sessions_apply_conversation_mutations_in_arrival_order() {
+        let (harness, mut first_socket) = authenticated_direct().await;
+        let conversation_id = create_conversation(&mut first_socket, harness.project_id).await;
+        let mut second_socket = reconnect_direct(&harness).await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *harness
+            .provider
+            .option_gate
+            .lock()
+            .expect("option gate mutex") = Some(Arc::clone(&gate));
+        let alpha_id = CommandId::new();
+        let beta_id = CommandId::new();
+
+        send_client(
+            &mut first_socket,
+            &ClientCommand::SetSessionOption {
+                command_id: alpha_id,
+                conversation_id,
+                option_id: "alpha".to_owned(),
+                value: "a1".to_owned(),
+            },
+        )
+        .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            harness.provider.option_started.notified(),
+        )
+        .await
+        .expect("first option did not reach provider");
+        send_client(
+            &mut second_socket,
+            &ClientCommand::SetSessionOption {
+                command_id: beta_id,
+                conversation_id,
+                option_id: "beta".to_owned(),
+                value: "b1".to_owned(),
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert_eq!(
+            harness
+                .provider
+                .option_calls
+                .lock()
+                .expect("option calls mutex")
+                .as_slice(),
+            &[("alpha".to_owned(), "a1".to_owned())]
+        );
+        let interrupt_id = CommandId::new();
+        send_client(
+            &mut second_socket,
+            &ClientCommand::Interrupt {
+                command_id: interrupt_id,
+                conversation_id,
+            },
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    receive_server(&mut second_socket).await,
+                    ServerMessage::CommandAccepted { command_id } if command_id == interrupt_id
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("interrupt was blocked by a conversation mutation");
+        assert_eq!(harness.provider.interruptions.load(Ordering::SeqCst), 1);
+
+        gate.add_permits(1);
+        loop {
+            if matches!(
+                receive_server(&mut first_socket).await,
+                ServerMessage::CommandAccepted { command_id } if command_id == alpha_id
+            ) {
+                break;
+            }
+        }
+        loop {
+            if matches!(
+                receive_server(&mut second_socket).await,
+                ServerMessage::CommandAccepted { command_id } if command_id == beta_id
+            ) {
+                break;
+            }
+        }
+        assert_eq!(
+            harness
+                .provider
+                .option_calls
+                .lock()
+                .expect("option calls mutex")
+                .as_slice(),
+            &[
+                ("alpha".to_owned(), "a1".to_owned()),
+                ("beta".to_owned(), "b1".to_owned()),
+            ]
+        );
+
+        send_client(&mut first_socket, &ClientCommand::GetSnapshot).await;
+        let conversation = loop {
+            if let ServerMessage::Snapshot { snapshot } = receive_server(&mut first_socket).await {
+                break snapshot
+                    .conversations
+                    .into_iter()
+                    .find(|conversation| conversation.id == conversation_id)
+                    .expect("conversation in snapshot");
+            }
+        };
+        assert!(
+            conversation
+                .session_options
+                .iter()
+                .any(|option| { option.id == "alpha" && option.current_value == "a1" })
+        );
+        assert!(
+            conversation
+                .session_options
+                .iter()
+                .any(|option| { option.id == "beta" && option.current_value == "b1" })
+        );
+        harness.task.abort();
+    }
+
+    #[tokio::test]
+    async fn direct_disconnect_keeps_command_running_for_exact_replay() {
+        let (harness, mut socket) = authenticated_direct().await;
+        let baseline_calls = harness.provider.session_list_calls.load(Ordering::SeqCst);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *harness
+            .provider
+            .session_list_gate
+            .lock()
+            .expect("session list gate mutex") = Some(Arc::clone(&gate));
+        let command_id = CommandId::new();
+        let command = ClientCommand::SyncProject {
+            command_id,
+            project_id: harness.project_id,
+            provider: ProviderId::Codex,
+        };
+
+        send_client(&mut socket, &command).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            harness.provider.session_list_started.notified(),
+        )
+        .await
+        .expect("sync command did not reach provider");
+        socket.close(None).await.expect("close direct client");
+        drop(socket);
+        gate.add_permits(1);
+
+        let mut socket = reconnect_direct(&harness).await;
+        send_client(&mut socket, &command).await;
+        let replay = loop {
+            match receive_server(&mut socket).await {
+                response @ ServerMessage::ProjectSyncCompleted {
+                    command_id: replayed_id,
+                    ..
+                } if replayed_id == command_id => break response,
+                ServerMessage::CommandRejected {
+                    command_id: Some(rejected_id),
+                    code,
+                    message,
+                } if rejected_id == command_id => {
+                    panic!("command was not completed after disconnect: {code}: {message}")
+                }
+                _ => {}
+            }
+        };
+        assert!(matches!(
+            replay,
+            ServerMessage::ProjectSyncCompleted {
+                command_id: replayed_id,
+                ..
+            } if replayed_id == command_id
+        ));
+        assert_eq!(
+            harness.provider.session_list_calls.load(Ordering::SeqCst),
+            baseline_calls + 1
+        );
+        harness.task.abort();
     }
 }

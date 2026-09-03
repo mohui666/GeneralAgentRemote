@@ -56,6 +56,18 @@ pub struct ApplicationSession {
     authenticated_device: Option<DeviceId>,
 }
 
+#[derive(Clone)]
+pub struct AuthenticatedSession {
+    service: Arc<AppService>,
+    device_id: DeviceId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandSchedule {
+    Concurrent,
+    Ordered,
+}
+
 impl ApplicationSession {
     pub fn new(
         service: Arc<AppService>,
@@ -74,46 +86,23 @@ impl ApplicationSession {
         self.authenticated_device.is_some()
     }
 
-    pub async fn process(&mut self, bytes: &[u8]) -> Vec<u8> {
-        let response = match decode::<ClientCommand>(bytes) {
-            Ok(command) => self.process_command(command).await,
-            Err(ProtocolError::Version { .. }) => ServerMessage::ProtocolError {
-                supported_version: agent_remote_protocol::PROTOCOL_VERSION,
-                message: "Client protocol version is not supported".to_owned(),
-            },
-            Err(error) => ServerMessage::CommandRejected {
-                command_id: None,
-                code: "invalid_message".to_owned(),
-                message: error.to_string(),
-            },
-        };
-        encode(&response).expect("server messages are serializable")
+    pub fn authenticated(&self) -> Option<AuthenticatedSession> {
+        self.authenticated_device
+            .map(|device_id| AuthenticatedSession {
+                service: Arc::clone(&self.service),
+                device_id,
+            })
     }
 
-    async fn process_command(&mut self, command: ClientCommand) -> ServerMessage {
-        if self.authenticated_device.is_none() {
-            return self.authenticate(command).await;
-        }
-        if matches!(
-            command,
-            ClientCommand::Authenticate { .. } | ClientCommand::Pair { .. }
-        ) {
-            return ServerMessage::CommandRejected {
-                command_id: None,
-                code: "already_authenticated".to_owned(),
-                message: "This connection is already authenticated".to_owned(),
-            };
-        }
-        let device_id = self.authenticated_device.expect("checked above");
-        let command_id = command.command_id();
-        match self.service.execute_command(device_id, command).await {
-            Ok(response) => response,
-            Err(error) => ServerMessage::CommandRejected {
-                command_id,
-                code: "command_failed".to_owned(),
-                message: error.to_string(),
+    pub async fn process(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let response = match decode::<ClientCommand>(bytes) {
+            Ok(command) => match self.authenticated() {
+                Some(session) => session.process_command(command).await,
+                None => self.authenticate(command).await,
             },
-        }
+            Err(error) => decode_rejected(error),
+        };
+        encode(&response).expect("server messages are serializable")
     }
 
     async fn authenticate(&mut self, command: ClientCommand) -> ServerMessage {
@@ -173,6 +162,67 @@ impl ApplicationSession {
             }
             _ => auth_rejected("Authenticate or pair before sending commands".to_owned()),
         }
+    }
+}
+
+impl AuthenticatedSession {
+    pub fn schedule(bytes: &[u8]) -> CommandSchedule {
+        match decode::<ClientCommand>(bytes) {
+            Ok(
+                ClientCommand::SyncProject { .. }
+                | ClientCommand::CreateConversation { .. }
+                | ClientCommand::StartConversation { .. }
+                | ClientCommand::SendMessage { .. }
+                | ClientCommand::Steer { .. }
+                | ClientCommand::SetSessionOption { .. }
+                | ClientCommand::RenameConversation { .. },
+            ) => CommandSchedule::Ordered,
+            _ => CommandSchedule::Concurrent,
+        }
+    }
+
+    pub async fn process(&self, bytes: &[u8]) -> Vec<u8> {
+        let response = match decode::<ClientCommand>(bytes) {
+            Ok(command) => self.process_command(command).await,
+            Err(error) => decode_rejected(error),
+        };
+        encode(&response).expect("server messages are serializable")
+    }
+
+    async fn process_command(&self, command: ClientCommand) -> ServerMessage {
+        if matches!(
+            command,
+            ClientCommand::Authenticate { .. } | ClientCommand::Pair { .. }
+        ) {
+            return ServerMessage::CommandRejected {
+                command_id: None,
+                code: "already_authenticated".to_owned(),
+                message: "This connection is already authenticated".to_owned(),
+            };
+        }
+        let command_id = command.command_id();
+        match self.service.execute_command(self.device_id, command).await {
+            Ok(response) => response,
+            Err(error) => ServerMessage::CommandRejected {
+                command_id,
+                code: "command_failed".to_owned(),
+                message: error.to_string(),
+            },
+        }
+    }
+}
+
+fn decode_rejected(error: ProtocolError) -> ServerMessage {
+    match error {
+        ProtocolError::Version { .. } => ServerMessage::ProtocolError {
+            supported_version: agent_remote_protocol::PROTOCOL_VERSION,
+            message: "Client protocol version is not supported".to_owned(),
+        },
+        error => ServerMessage::CommandRejected {
+            command_id: None,
+            code: "invalid_message".to_owned(),
+            message: error.to_string(),
+        },
     }
 }
 

@@ -33,9 +33,9 @@ use tokio::{
 
 use super::{
     AgentProvider, CommandAck, CreateSession, InterruptSession, NativeSession,
-    ProviderCapabilities, ProviderEvent, ProviderEventKind, ProviderHistoryItem,
-    ProviderHistoryPage, ReadSessionHistory, RenameSession, ResolveApproval, ResumeSession,
-    SendMessage, SetSessionOption, SteerMessage,
+    ProviderCapabilities, ProviderEvent, ProviderEventKind, ProviderHistoryBarrier,
+    ProviderHistoryItem, ProviderHistoryPage, ReadSessionHistory, RenameSession, ResolveApproval,
+    ResumeSession, SendMessage, SetSessionOption, SteerMessage,
 };
 use crate::storage::Project;
 
@@ -43,6 +43,7 @@ const CLIENT_NAME: &str = "agent_remote_messenger";
 const CLIENT_TITLE: &str = "Agent Remote Messenger";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const APP_SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CANONICAL_ITEM_PREFIX: &str = "codex:v1:";
 
 type DynWriter = Box<dyn AsyncWrite + Send + Unpin>;
 
@@ -64,6 +65,7 @@ impl CodexProvider {
                 events,
                 connection: AsyncMutex::new(None),
                 generation: AtomicU64::new(0),
+                installed_generation: RwLock::new(0),
                 sessions: RwLock::new(HashMap::new()),
                 active_turns: Mutex::new(HashMap::new()),
                 pending_approvals: Mutex::new(HashMap::new()),
@@ -71,7 +73,7 @@ impl CodexProvider {
                 reasoning_states: Mutex::new(HashMap::new()),
                 command_states: Mutex::new(HashMap::new()),
                 emitted_images: Mutex::new(HashSet::new()),
-                failed_turns: Mutex::new(HashSet::new()),
+                canonical_item_ids: Mutex::new(CanonicalItemIds::default()),
                 model_cache: RwLock::new(Vec::new()),
             }),
         }
@@ -388,6 +390,26 @@ impl AgentProvider for CodexProvider {
         })
     }
 
+    async fn flush_history_events(
+        &self,
+        project_id: ProjectId,
+        conversation_id: ConversationId,
+    ) -> Result<()> {
+        let barrier = Arc::new(ProviderHistoryBarrier::default());
+        self.shared
+            .events
+            .send(ProviderEvent {
+                provider: ProviderId::Codex,
+                project_id,
+                conversation_id,
+                kind: ProviderEventKind::HistoryBarrier {
+                    barrier: Arc::clone(&barrier),
+                },
+            })
+            .map_err(|_| anyhow!("Codex history barrier has no active event pump"))?;
+        barrier.wait().await
+    }
+
     async fn rename_session(&self, request: RenameSession) -> Result<CommandAck> {
         let wire = self.connection().await?;
         let _: EmptyResponse = wire
@@ -551,10 +573,7 @@ impl AgentProvider for CodexProvider {
             )
             .await?;
         self.shared
-            .active_turns
-            .lock()
-            .expect("Codex active turn state poisoned")
-            .insert(request.native_session_id, response.turn.id);
+            .set_active_turn(request.native_session_id, response.turn.id, wire.generation);
         Ok(CommandAck)
     }
 
@@ -564,11 +583,7 @@ impl AgentProvider for CodexProvider {
             .await?;
         let active_turn = self
             .shared
-            .active_turns
-            .lock()
-            .expect("Codex active turn state poisoned")
-            .get(&request.native_session_id)
-            .cloned()
+            .active_turn(&request.native_session_id, wire.generation)
             .ok_or_else(|| anyhow!("Codex thread has no active steerable turn"))?;
         let response: TurnSteerResponse = wire
             .request(
@@ -593,11 +608,7 @@ impl AgentProvider for CodexProvider {
             .await?;
         let turn_id = self
             .shared
-            .active_turns
-            .lock()
-            .expect("Codex active turn state poisoned")
-            .get(&request.native_session_id)
-            .cloned()
+            .active_turn(&request.native_session_id, wire.generation)
             .ok_or_else(|| anyhow!("Codex thread has no active turn"))?;
         let _: EmptyResponse = wire
             .request(
@@ -681,15 +692,22 @@ struct Shared {
     events: broadcast::Sender<ProviderEvent>,
     connection: AsyncMutex<Option<Arc<RpcWire>>>,
     generation: AtomicU64,
+    installed_generation: RwLock<u64>,
     sessions: RwLock<HashMap<String, SessionContext>>,
-    active_turns: Mutex<HashMap<String, String>>,
+    active_turns: Mutex<HashMap<String, ActiveTurn>>,
     pending_approvals: Mutex<HashMap<String, PendingApproval>>,
     message_states: Mutex<HashMap<ItemKey, MessageState>>,
     reasoning_states: Mutex<HashMap<ReasoningKey, String>>,
     command_states: Mutex<HashMap<ItemKey, CommandState>>,
     emitted_images: Mutex<HashSet<ItemKey>>,
-    failed_turns: Mutex<HashSet<(String, String)>>,
+    canonical_item_ids: Mutex<CanonicalItemIds>,
     model_cache: RwLock<Vec<ModelOption>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveTurn {
+    id: String,
+    generation: u64,
 }
 
 impl Shared {
@@ -723,6 +741,10 @@ impl Shared {
             .context("initialize Codex app-server")?;
         wire.notify_initialized().await?;
         *slot = Some(Arc::clone(&wire));
+        *self
+            .installed_generation
+            .write()
+            .expect("Codex installed generation state poisoned") = wire.generation;
         Ok(wire)
     }
 
@@ -790,12 +812,16 @@ impl Shared {
                 .is_some_and(|current| current.generation == wire.generation)
             {
                 *slot = None;
+                *self
+                    .installed_generation
+                    .write()
+                    .expect("Codex installed generation state poisoned") = 0;
             }
         }
         self.active_turns
             .lock()
             .expect("Codex active turn state poisoned")
-            .clear();
+            .retain(|_, turn| turn.generation != wire.generation);
         self.pending_approvals
             .lock()
             .expect("Codex approval state poisoned")
@@ -840,7 +866,8 @@ impl Shared {
                 .active_turns
                 .lock()
                 .expect("Codex active turn state poisoned")
-                .is_empty()
+                .values()
+                .all(|turn| turn.generation != wire.generation)
             || !self
                 .pending_approvals
                 .lock()
@@ -858,6 +885,10 @@ impl Shared {
         }
 
         *slot = None;
+        *self
+            .installed_generation
+            .write()
+            .expect("Codex installed generation state poisoned") = 0;
         for context in self
             .sessions
             .write()
@@ -889,6 +920,34 @@ impl Shared {
             .insert(thread_id, context);
     }
 
+    fn set_active_turn(&self, thread_id: String, turn_id: String, generation: u64) {
+        let mut turns = self
+            .active_turns
+            .lock()
+            .expect("Codex active turn state poisoned");
+        if turns
+            .get(&thread_id)
+            .is_none_or(|current| generation >= current.generation)
+        {
+            turns.insert(
+                thread_id,
+                ActiveTurn {
+                    id: turn_id,
+                    generation,
+                },
+            );
+        }
+    }
+
+    fn active_turn(&self, thread_id: &str, generation: u64) -> Option<String> {
+        self.active_turns
+            .lock()
+            .expect("Codex active turn state poisoned")
+            .get(thread_id)
+            .filter(|turn| turn.generation == generation)
+            .map(|turn| turn.id.clone())
+    }
+
     fn emit(&self, thread_id: &str, kind: ProviderEventKind) {
         if let Some(context) = self.session(thread_id) {
             self.emit_context(&context, kind);
@@ -902,6 +961,71 @@ impl Shared {
             conversation_id: context.conversation_id,
             kind,
         });
+    }
+
+    fn canonical_live_item_id(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        kind: CanonicalItemKind,
+        raw_item_id: &str,
+    ) -> String {
+        let item_key = LiveCanonicalItemKey {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            kind,
+            raw_item_id: raw_item_id.to_owned(),
+        };
+        let mut ids = self
+            .canonical_item_ids
+            .lock()
+            .expect("Codex canonical item state poisoned");
+        if let Some(provider_item_id) = ids.live_ids.get(&item_key) {
+            return provider_item_id.clone();
+        }
+        let provider_item_id = provisional_provider_item_id(turn_id, kind, raw_item_id);
+        ids.live_ids.insert(item_key, provider_item_id.clone());
+        provider_item_id
+    }
+
+    fn canonicalize_turn_items(&self, thread_id: &str, turn_id: &str, items: &[Value]) {
+        let mut ordinals = HashMap::new();
+        for item in items {
+            let Some(kind) = canonical_item_kind(item) else {
+                continue;
+            };
+            let Some(raw_item_id) = item.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let provider_item_id = next_history_provider_item_id(&mut ordinals, turn_id, kind);
+            let item_key = LiveCanonicalItemKey {
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                kind,
+                raw_item_id: raw_item_id.to_owned(),
+            };
+            let alias_provider_item_id = self
+                .canonical_item_ids
+                .lock()
+                .expect("Codex canonical item state poisoned")
+                .live_ids
+                .insert(item_key, provider_item_id.clone());
+            if let Some(alias_provider_item_id) = alias_provider_item_id
+                && alias_provider_item_id != provider_item_id
+            {
+                for (provider_item_id, alias_provider_item_id) in
+                    canonical_item_aliases(item, kind, &provider_item_id, &alias_provider_item_id)
+                {
+                    self.emit(
+                        thread_id,
+                        ProviderEventKind::ProviderItemAlias {
+                            provider_item_id,
+                            alias_provider_item_id,
+                        },
+                    );
+                }
+            }
+        }
     }
 
     async fn handle_server_request(
@@ -1023,60 +1147,77 @@ impl Shared {
         );
     }
 
-    fn handle_notification(&self, method: &str, params: Value) {
+    fn handle_notification(&self, generation: u64, method: &str, params: Value) {
+        let installed_generation = self
+            .installed_generation
+            .read()
+            .expect("Codex installed generation state poisoned");
+        if *installed_generation != generation {
+            return;
+        }
         match method {
             "turn/started" => {
                 if let Ok(event) = serde_json::from_value::<TurnNotification>(params) {
-                    self.active_turns
-                        .lock()
-                        .expect("Codex active turn state poisoned")
-                        .insert(event.thread_id, event.turn.id);
+                    self.set_active_turn(event.thread_id, event.turn.id, generation);
                 }
             }
             "turn/completed" => {
                 if let Ok(event) = serde_json::from_value::<TurnNotification>(params) {
+                    self.canonicalize_turn_items(
+                        &event.thread_id,
+                        &event.turn.id,
+                        &event.turn.items,
+                    );
                     for item in event.turn.items {
                         self.handle_item(&event.thread_id, &event.turn.id, item, true);
                     }
-                    let active_matches = self
-                        .active_turns
-                        .lock()
-                        .expect("Codex active turn state poisoned")
-                        .get(&event.thread_id)
-                        .is_some_and(|turn| turn == &event.turn.id);
-                    if active_matches {
-                        self.active_turns
+                    {
+                        let mut active_turns = self
+                            .active_turns
                             .lock()
-                            .expect("Codex active turn state poisoned")
-                            .remove(&event.thread_id);
+                            .expect("Codex active turn state poisoned");
+                        if active_turns.get(&event.thread_id).is_some_and(|turn| {
+                            turn.generation == generation && turn.id == event.turn.id
+                        }) {
+                            active_turns.remove(&event.thread_id);
+                        }
                     }
-                    match event.turn.status.as_str() {
-                        "completed" => self.emit(&event.thread_id, ProviderEventKind::Completed),
+                    let status = event.turn.status.clone();
+                    let completed_at = event.turn.completed_at;
+                    match status.as_str() {
+                        "completed" => {
+                            self.emit(&event.thread_id, ProviderEventKind::Completed);
+                        }
                         "interrupted" => {
                             self.emit(&event.thread_id, ProviderEventKind::Interrupted)
                         }
                         "failed" => {
-                            let key = (event.thread_id.clone(), event.turn.id.clone());
-                            if self
-                                .failed_turns
-                                .lock()
-                                .expect("Codex failed turn state poisoned")
-                                .insert(key)
-                            {
-                                self.emit(
-                                    &event.thread_id,
-                                    ProviderEventKind::Failed {
-                                        code: "codex_turn_failed".to_owned(),
-                                        message: event
-                                            .turn
-                                            .error
-                                            .and_then(|error| error.message)
-                                            .unwrap_or_else(|| "Codex turn failed".to_owned()),
-                                    },
-                                );
-                            }
+                            self.emit(
+                                &event.thread_id,
+                                ProviderEventKind::Failed {
+                                    provider_item_id: Some(failure_provider_item_id(
+                                        &event.turn.id,
+                                    )),
+                                    code: "codex_turn_failed".to_owned(),
+                                    message: event
+                                        .turn
+                                        .error
+                                        .and_then(|error| error.message)
+                                        .unwrap_or_else(|| "Codex turn failed".to_owned()),
+                                },
+                            );
                         }
                         _ => {}
+                    }
+                    if matches!(status.as_str(), "completed" | "interrupted" | "failed")
+                        && let Some(completed_at) = completed_at
+                    {
+                        self.emit(
+                            &event.thread_id,
+                            ProviderEventKind::HistoryWatermark {
+                                remote_updated_at_ms: completed_at.saturating_mul(1_000),
+                            },
+                        );
                     }
                 }
             }
@@ -1093,7 +1234,7 @@ impl Shared {
             "item/agentMessage/delta" => {
                 if let Ok(event) = serde_json::from_value::<TextDeltaNotification>(params) {
                     let key = ItemKey::new(&event.thread_id, &event.item_id);
-                    let phase = {
+                    let (phase, text) = {
                         let mut states = self
                             .message_states
                             .lock()
@@ -1103,39 +1244,54 @@ impl Shared {
                             text: String::new(),
                         });
                         state.text.push_str(&event.delta);
-                        state.phase
+                        (state.phase, state.text.clone())
                     };
                     self.emit(
                         &event.thread_id,
-                        ProviderEventKind::AgentTextDelta {
-                            provider_item_id: event.item_id,
+                        ProviderEventKind::AgentTextSnapshot {
+                            provider_item_id: self.canonical_live_item_id(
+                                &event.thread_id,
+                                &event.turn_id,
+                                CanonicalItemKind::AgentMessage,
+                                &event.item_id,
+                            ),
                             phase,
-                            delta: event.delta,
+                            text,
                         },
                     );
                 }
             }
             "item/reasoning/summaryTextDelta" => {
                 if let Ok(event) = serde_json::from_value::<ReasoningDeltaNotification>(params) {
-                    self.reasoning_states
-                        .lock()
-                        .expect("Codex reasoning state poisoned")
-                        .entry(ReasoningKey::new(
-                            &event.thread_id,
-                            &event.item_id,
-                            event.summary_index,
-                        ))
-                        .or_default()
-                        .push_str(&event.delta);
+                    let text = {
+                        let mut states = self
+                            .reasoning_states
+                            .lock()
+                            .expect("Codex reasoning state poisoned");
+                        let state = states
+                            .entry(ReasoningKey::new(
+                                &event.thread_id,
+                                &event.item_id,
+                                event.summary_index,
+                            ))
+                            .or_default();
+                        state.push_str(&event.delta);
+                        state.clone()
+                    };
                     self.emit(
                         &event.thread_id,
-                        ProviderEventKind::AgentTextDelta {
-                            provider_item_id: format!(
-                                "reasoning:{}:{}",
-                                event.item_id, event.summary_index
+                        ProviderEventKind::AgentTextSnapshot {
+                            provider_item_id: reasoning_provider_item_id(
+                                &self.canonical_live_item_id(
+                                    &event.thread_id,
+                                    &event.turn_id,
+                                    CanonicalItemKind::Reasoning,
+                                    &event.item_id,
+                                ),
+                                event.summary_index as usize,
                             ),
                             phase: AgentMessagePhase::ReasoningSummary,
-                            delta: event.delta,
+                            text,
                         },
                     );
                 }
@@ -1147,7 +1303,7 @@ impl Shared {
                     self.emit(
                         &event.thread_id,
                         ProviderEventKind::Plan {
-                            provider_item_id: format!("plan:{}", event.turn_id),
+                            provider_item_id: plan_provider_item_id(&event.turn_id),
                             steps: event
                                 .plan
                                 .into_iter()
@@ -1174,13 +1330,24 @@ impl Shared {
                         state.output.push_str(&event.delta);
                         state.clone()
                     };
-                    self.emit_command(&event.thread_id, &event.item_id, state, ItemStatus::Running);
+                    self.emit_command(
+                        &event.thread_id,
+                        self.canonical_live_item_id(
+                            &event.thread_id,
+                            &event.turn_id,
+                            CanonicalItemKind::Command,
+                            &event.item_id,
+                        ),
+                        state,
+                        ItemStatus::Running,
+                    );
                 }
             }
             "item/fileChange/patchUpdated" => {
                 if let Ok(event) = serde_json::from_value::<FilePatchNotification>(params) {
                     self.emit_file_changes(
                         &event.thread_id,
+                        &event.turn_id,
                         &event.item_id,
                         &event.changes,
                         ItemStatus::Running,
@@ -1192,7 +1359,12 @@ impl Shared {
                     self.emit(
                         &event.thread_id,
                         ProviderEventKind::ToolCall {
-                            provider_item_id: event.item_id,
+                            provider_item_id: self.canonical_live_item_id(
+                                &event.thread_id,
+                                &event.turn_id,
+                                CanonicalItemKind::ToolCall,
+                                &event.item_id,
+                            ),
                             name: "MCP tool".to_owned(),
                             status: ItemStatus::Running,
                             input_summary: None,
@@ -1205,21 +1377,14 @@ impl Shared {
                 if let Ok(event) = serde_json::from_value::<ErrorNotification>(params)
                     && !event.will_retry
                 {
-                    let key = (event.thread_id.clone(), event.turn_id.clone());
-                    if self
-                        .failed_turns
-                        .lock()
-                        .expect("Codex failed turn state poisoned")
-                        .insert(key)
-                    {
-                        self.emit(
-                            &event.thread_id,
-                            ProviderEventKind::Failed {
-                                code: "codex_error".to_owned(),
-                                message: event.error.message,
-                            },
-                        );
-                    }
+                    self.emit(
+                        &event.thread_id,
+                        ProviderEventKind::Failed {
+                            provider_item_id: Some(failure_provider_item_id(&event.turn_id)),
+                            code: "codex_error".to_owned(),
+                            message: event.error.message,
+                        },
+                    );
                 }
             }
             "serverRequest/resolved" => {
@@ -1233,6 +1398,7 @@ impl Shared {
             // Unknown stable additions and experimental notifications are ignored.
             _ => {}
         }
+        drop(installed_generation);
     }
 
     fn handle_item(&self, thread_id: &str, turn_id: &str, item: Value, completed: bool) {
@@ -1240,9 +1406,15 @@ impl Shared {
         match kind {
             "agentMessage" => {
                 if let Ok(item) = serde_json::from_value::<AgentMessageItem>(item) {
+                    let provider_item_id = self.canonical_live_item_id(
+                        thread_id,
+                        turn_id,
+                        CanonicalItemKind::AgentMessage,
+                        &item.id,
+                    );
                     let key = ItemKey::new(thread_id, &item.id);
                     let item_phase = map_phase(item.phase.as_deref());
-                    let delta = {
+                    let snapshot = {
                         let mut states = self
                             .message_states
                             .lock()
@@ -1254,27 +1426,18 @@ impl Shared {
                         if state.text.is_empty() {
                             state.phase = item_phase;
                         }
-                        if completed && item.text.starts_with(&state.text) {
-                            let suffix = item.text[state.text.len()..].to_owned();
+                        if completed || (state.text.is_empty() && !item.text.is_empty()) {
                             state.text = item.text;
-                            suffix
-                        } else {
-                            String::new()
                         }
+                        (!state.text.is_empty()).then(|| (state.phase, state.text.clone()))
                     };
-                    if !delta.is_empty() {
-                        let phase = self
-                            .message_states
-                            .lock()
-                            .expect("Codex message state poisoned")
-                            .get(&ItemKey::new(thread_id, &item.id))
-                            .map_or(item_phase, |state| state.phase);
+                    if let Some((phase, text)) = snapshot {
                         self.emit(
                             thread_id,
-                            ProviderEventKind::AgentTextDelta {
-                                provider_item_id: item.id,
+                            ProviderEventKind::AgentTextSnapshot {
+                                provider_item_id,
                                 phase,
-                                delta,
+                                text,
                             },
                         );
                     }
@@ -1282,29 +1445,33 @@ impl Shared {
             }
             "reasoning" if completed => {
                 if let Ok(item) = serde_json::from_value::<ReasoningItem>(item) {
+                    let provider_item_id = self.canonical_live_item_id(
+                        thread_id,
+                        turn_id,
+                        CanonicalItemKind::Reasoning,
+                        &item.id,
+                    );
                     for (index, summary) in item.summary.into_iter().enumerate() {
                         let key = ReasoningKey::new(thread_id, &item.id, index as u64);
-                        let suffix = {
+                        let text = {
                             let mut states = self
                                 .reasoning_states
                                 .lock()
                                 .expect("Codex reasoning state poisoned");
                             let state = states.entry(key).or_default();
-                            if summary.starts_with(state.as_str()) {
-                                let suffix = summary[state.len()..].to_owned();
-                                *state = summary;
-                                suffix
-                            } else {
-                                String::new()
-                            }
+                            *state = summary;
+                            state.clone()
                         };
-                        if !suffix.is_empty() {
+                        if !text.is_empty() {
                             self.emit(
                                 thread_id,
-                                ProviderEventKind::AgentTextDelta {
-                                    provider_item_id: format!("reasoning:{}:{index}", item.id),
+                                ProviderEventKind::AgentTextSnapshot {
+                                    provider_item_id: reasoning_provider_item_id(
+                                        &provider_item_id,
+                                        index,
+                                    ),
                                     phase: AgentMessagePhase::ReasoningSummary,
-                                    delta: suffix,
+                                    text,
                                 },
                             );
                         }
@@ -1313,6 +1480,12 @@ impl Shared {
             }
             "commandExecution" => {
                 if let Ok(item) = serde_json::from_value::<CommandItem>(item) {
+                    let provider_item_id = self.canonical_live_item_id(
+                        thread_id,
+                        turn_id,
+                        CanonicalItemKind::Command,
+                        &item.id,
+                    );
                     let status = map_status(
                         item.status.as_deref().unwrap_or(if completed {
                             "completed"
@@ -1335,7 +1508,7 @@ impl Shared {
                         .lock()
                         .expect("Codex command state poisoned")
                         .insert(ItemKey::new(thread_id, &item.id), state.clone());
-                    self.emit_command(thread_id, &item.id, state, status);
+                    self.emit_command(thread_id, provider_item_id, state, status);
                 }
             }
             "fileChange" => {
@@ -1348,11 +1521,17 @@ impl Shared {
                             ItemStatus::Running
                         },
                     );
-                    self.emit_file_changes(thread_id, &item.id, &item.changes, status);
+                    self.emit_file_changes(thread_id, turn_id, &item.id, &item.changes, status);
                 }
             }
             "mcpToolCall" | "dynamicToolCall" | "collabAgentToolCall" => {
                 if let Ok(item) = serde_json::from_value::<GenericToolItem>(item) {
+                    let provider_item_id = self.canonical_live_item_id(
+                        thread_id,
+                        turn_id,
+                        CanonicalItemKind::ToolCall,
+                        &item.id,
+                    );
                     let name = match (item.server, item.tool) {
                         (Some(server), Some(tool)) => format!("{server}/{tool}"),
                         (_, Some(tool)) => tool,
@@ -1361,7 +1540,7 @@ impl Shared {
                     self.emit(
                         thread_id,
                         ProviderEventKind::ToolCall {
-                            provider_item_id: item.id,
+                            provider_item_id,
                             name,
                             status: map_status(
                                 item.status.as_deref().unwrap_or(if completed {
@@ -1502,14 +1681,14 @@ impl Shared {
     fn emit_command(
         &self,
         thread_id: &str,
-        item_id: &str,
+        provider_item_id: String,
         state: CommandState,
         status: ItemStatus,
     ) {
         self.emit(
             thread_id,
             ProviderEventKind::Command {
-                provider_item_id: item_id.to_owned(),
+                provider_item_id,
                 command: state.command,
                 relative_cwd: Some(state.cwd),
                 status,
@@ -1522,15 +1701,22 @@ impl Shared {
     fn emit_file_changes(
         &self,
         thread_id: &str,
-        item_id: &str,
+        turn_id: &str,
+        raw_item_id: &str,
         changes: &[FileUpdateChange],
         status: ItemStatus,
     ) {
+        let provider_item_id = self.canonical_live_item_id(
+            thread_id,
+            turn_id,
+            CanonicalItemKind::FileChange,
+            raw_item_id,
+        );
         for (index, change) in changes.iter().enumerate() {
             self.emit(
                 thread_id,
                 ProviderEventKind::FileChange {
-                    provider_item_id: format!("{item_id}:{index}:{}", change.path),
+                    provider_item_id: file_change_provider_item_id(&provider_item_id, index),
                     relative_path: change.path.clone(),
                     change_kind: file_change_kind(&change.kind),
                     status,
@@ -1609,7 +1795,7 @@ impl RpcWire {
                                 .await;
                         } else {
                             let turn_completed = method == "turn/completed";
-                            shared.handle_notification(&method, params);
+                            shared.handle_notification(wire.generation, &method, params);
                             if turn_completed {
                                 wire.schedule_idle_shutdown();
                             }
@@ -1852,6 +2038,40 @@ enum PendingApprovalKind {
     Permissions { requested: Value },
     LegacyCommand,
     LegacyPatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CanonicalItemKind {
+    AgentMessage,
+    Reasoning,
+    Command,
+    FileChange,
+    ToolCall,
+}
+
+impl CanonicalItemKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AgentMessage => "agent",
+            Self::Reasoning => "reasoning",
+            Self::Command => "command",
+            Self::FileChange => "file",
+            Self::ToolCall => "tool",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LiveCanonicalItemKey {
+    thread_id: String,
+    turn_id: String,
+    kind: CanonicalItemKind,
+    raw_item_id: String,
+}
+
+#[derive(Default)]
+struct CanonicalItemIds {
+    live_ids: HashMap<LiveCanonicalItemKey, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2150,6 +2370,8 @@ struct CodexTurn {
     #[serde(default)]
     status: String,
     #[serde(default)]
+    completed_at: Option<i64>,
+    #[serde(default)]
     error: Option<TurnError>,
 }
 
@@ -2423,6 +2645,7 @@ fn validate_thread_project(thread: &CodexThread, project: &Path) -> Result<()> {
 fn history_items(thread: &CodexThread) -> Vec<ProviderHistoryItem> {
     let mut history = Vec::new();
     for turn in &thread.turns {
+        let mut ordinals = HashMap::new();
         let turn_timestamp = turn
             .started_at
             .unwrap_or(thread.created_at)
@@ -2449,6 +2672,11 @@ fn history_items(thread: &CodexThread) -> Vec<ProviderHistoryItem> {
                         .collect::<Vec<_>>()
                         .join("\n");
                     if !text.trim().is_empty() {
+                        let item_id = value
+                            .get("clientId")
+                            .and_then(Value::as_str)
+                            .filter(|client_id| !client_id.is_empty())
+                            .map_or(item_id, |client_id| format!("client:{client_id}"));
                         history.push(ProviderHistoryItem {
                             provider_item_id: item_id,
                             created_at_ms: timestamp,
@@ -2457,11 +2685,16 @@ fn history_items(thread: &CodexThread) -> Vec<ProviderHistoryItem> {
                     }
                 }
                 Some("agentMessage") => {
+                    let provider_item_id = next_history_provider_item_id(
+                        &mut ordinals,
+                        &turn.id,
+                        CanonicalItemKind::AgentMessage,
+                    );
                     if let Ok(item) = serde_json::from_value::<AgentMessageItem>(value.clone())
                         && !item.text.is_empty()
                     {
                         history.push(ProviderHistoryItem {
-                            provider_item_id: item.id,
+                            provider_item_id,
                             created_at_ms: timestamp,
                             kind: TimelineItemKind::AgentMessage {
                                 phase: map_phase(item.phase.as_deref()),
@@ -2471,13 +2704,18 @@ fn history_items(thread: &CodexThread) -> Vec<ProviderHistoryItem> {
                     }
                 }
                 Some("reasoning") => {
+                    let provider_item_id = next_history_provider_item_id(
+                        &mut ordinals,
+                        &turn.id,
+                        CanonicalItemKind::Reasoning,
+                    );
                     if let Ok(item) = serde_json::from_value::<ReasoningItem>(value.clone()) {
                         for (summary_index, summary) in item.summary.into_iter().enumerate() {
                             if !summary.is_empty() {
                                 history.push(ProviderHistoryItem {
-                                    provider_item_id: format!(
-                                        "reasoning:{}:{summary_index}",
-                                        item.id
+                                    provider_item_id: reasoning_provider_item_id(
+                                        &provider_item_id,
+                                        summary_index,
                                     ),
                                     created_at_ms: timestamp.saturating_add(summary_index as i64),
                                     kind: TimelineItemKind::AgentMessage {
@@ -2490,9 +2728,14 @@ fn history_items(thread: &CodexThread) -> Vec<ProviderHistoryItem> {
                     }
                 }
                 Some("commandExecution") => {
+                    let provider_item_id = next_history_provider_item_id(
+                        &mut ordinals,
+                        &turn.id,
+                        CanonicalItemKind::Command,
+                    );
                     if let Ok(item) = serde_json::from_value::<CommandItem>(value.clone()) {
                         history.push(ProviderHistoryItem {
-                            provider_item_id: item.id,
+                            provider_item_id,
                             created_at_ms: timestamp,
                             kind: TimelineItemKind::Command {
                                 command: item.command,
@@ -2508,12 +2751,20 @@ fn history_items(thread: &CodexThread) -> Vec<ProviderHistoryItem> {
                     }
                 }
                 Some("fileChange") => {
+                    let provider_item_id = next_history_provider_item_id(
+                        &mut ordinals,
+                        &turn.id,
+                        CanonicalItemKind::FileChange,
+                    );
                     if let Ok(item) = serde_json::from_value::<FileChangeItem>(value.clone()) {
                         for (change_index, change) in item.changes.into_iter().enumerate() {
                             if let Some(relative_path) = history_relative_path(thread, &change.path)
                             {
                                 history.push(ProviderHistoryItem {
-                                    provider_item_id: format!("{}:{change_index}", item.id),
+                                    provider_item_id: file_change_provider_item_id(
+                                        &provider_item_id,
+                                        change_index,
+                                    ),
                                     created_at_ms: timestamp.saturating_add(change_index as i64),
                                     kind: TimelineItemKind::FileChange {
                                         relative_path,
@@ -2526,6 +2777,11 @@ fn history_items(thread: &CodexThread) -> Vec<ProviderHistoryItem> {
                     }
                 }
                 Some("mcpToolCall" | "dynamicToolCall" | "collabAgentToolCall") => {
+                    let provider_item_id = next_history_provider_item_id(
+                        &mut ordinals,
+                        &turn.id,
+                        CanonicalItemKind::ToolCall,
+                    );
                     if let Ok(item) = serde_json::from_value::<GenericToolItem>(value.clone()) {
                         let name = match (item.server, item.tool) {
                             (Some(server), Some(tool)) => format!("{server}/{tool}"),
@@ -2533,7 +2789,7 @@ fn history_items(thread: &CodexThread) -> Vec<ProviderHistoryItem> {
                             _ => "Codex tool".to_owned(),
                         };
                         history.push(ProviderHistoryItem {
-                            provider_item_id: item.id,
+                            provider_item_id,
                             created_at_ms: timestamp,
                             kind: TimelineItemKind::ToolCall {
                                 name,
@@ -2556,7 +2812,7 @@ fn history_items(thread: &CodexThread) -> Vec<ProviderHistoryItem> {
                         && !text.trim().is_empty()
                     {
                         history.push(ProviderHistoryItem {
-                            provider_item_id: item_id,
+                            provider_item_id: plan_provider_item_id(&turn.id),
                             created_at_ms: timestamp,
                             kind: TimelineItemKind::Plan {
                                 steps: vec![PlanStep {
@@ -2593,10 +2849,105 @@ fn history_relative_path(thread: &CodexThread, raw: &str) -> Option<String> {
 fn truncate_history_output(mut output: String) -> String {
     const LIMIT: usize = 64 * 1024;
     if output.len() > LIMIT {
-        output.truncate(LIMIT);
+        let mut end = LIMIT;
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.truncate(end);
         output.push_str("\n[output truncated at 64 KiB]");
     }
     output
+}
+
+fn canonical_provider_item_id(turn_id: &str, kind: CanonicalItemKind, ordinal: usize) -> String {
+    format!(
+        "{CANONICAL_ITEM_PREFIX}{turn_id}:{}:{ordinal}",
+        kind.label()
+    )
+}
+
+fn provisional_provider_item_id(
+    turn_id: &str,
+    kind: CanonicalItemKind,
+    raw_item_id: &str,
+) -> String {
+    format!("codex:live:{turn_id}:{}:{raw_item_id}", kind.label())
+}
+
+fn canonical_item_kind(item: &Value) -> Option<CanonicalItemKind> {
+    match item.get("type").and_then(Value::as_str)? {
+        "agentMessage" => Some(CanonicalItemKind::AgentMessage),
+        "reasoning" => Some(CanonicalItemKind::Reasoning),
+        "commandExecution" => Some(CanonicalItemKind::Command),
+        "fileChange" => Some(CanonicalItemKind::FileChange),
+        "mcpToolCall" | "dynamicToolCall" | "collabAgentToolCall" => {
+            Some(CanonicalItemKind::ToolCall)
+        }
+        _ => None,
+    }
+}
+
+fn canonical_item_aliases(
+    item: &Value,
+    kind: CanonicalItemKind,
+    provider_item_id: &str,
+    alias_provider_item_id: &str,
+) -> Vec<(String, String)> {
+    match kind {
+        CanonicalItemKind::Reasoning => (0..item
+            .get("summary")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len))
+            .map(|index| {
+                (
+                    reasoning_provider_item_id(provider_item_id, index),
+                    reasoning_provider_item_id(alias_provider_item_id, index),
+                )
+            })
+            .collect(),
+        CanonicalItemKind::FileChange => (0..item
+            .get("changes")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len))
+            .map(|index| {
+                (
+                    file_change_provider_item_id(provider_item_id, index),
+                    file_change_provider_item_id(alias_provider_item_id, index),
+                )
+            })
+            .collect(),
+        _ => vec![(
+            provider_item_id.to_owned(),
+            alias_provider_item_id.to_owned(),
+        )],
+    }
+}
+
+fn next_history_provider_item_id(
+    ordinals: &mut HashMap<CanonicalItemKind, usize>,
+    turn_id: &str,
+    kind: CanonicalItemKind,
+) -> String {
+    let ordinal = ordinals.entry(kind).or_default();
+    let provider_item_id = canonical_provider_item_id(turn_id, kind, *ordinal);
+    *ordinal += 1;
+    provider_item_id
+}
+
+fn reasoning_provider_item_id(item_id: &str, summary_index: usize) -> String {
+    format!("{item_id}:summary:{summary_index}")
+}
+
+fn file_change_provider_item_id(item_id: &str, change_index: usize) -> String {
+    format!("{item_id}:change:{change_index}")
+}
+
+fn plan_provider_item_id(turn_id: &str) -> String {
+    format!("plan:{turn_id}")
+}
+
+fn failure_provider_item_id(turn_id: &str) -> String {
+    format!("{CANONICAL_ITEM_PREFIX}{turn_id}:failure")
 }
 
 fn permission_mode_from_response(
@@ -2621,7 +2972,7 @@ fn permission_turn_config(
         json!({
             "type":"workspaceWrite",
             "writableRoots":[path_string(project_path)],
-            "networkAccess":"restricted",
+            "networkAccess":false,
             "excludeTmpdirEnvVar":false,
             "excludeSlashTmp":false
         })
@@ -2809,7 +3160,13 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex, split};
 
     fn test_provider() -> CodexProvider {
-        CodexProvider::with_executable("unused-in-duplex-tests")
+        let provider = CodexProvider::with_executable("unused-in-duplex-tests");
+        *provider
+            .shared
+            .installed_generation
+            .write()
+            .expect("Codex installed generation state poisoned") = 1;
+        provider
     }
 
     fn test_project() -> Project {
@@ -2831,11 +3188,520 @@ mod tests {
         assert!(!summary.contains('{'));
     }
 
+    #[test]
+    fn workspace_permission_uses_boolean_network_access() {
+        let (_, _, sandbox) = permission_turn_config("request_approval", Path::new("/project"))
+            .expect("workspace permission");
+
+        assert_eq!(sandbox["type"], "workspaceWrite");
+        assert_eq!(sandbox["networkAccess"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn history_user_message_uses_client_id_for_optimistic_reconciliation() {
+        let thread: CodexThread = serde_json::from_value(json!({
+            "id": "thread-1",
+            "cwd": "/project",
+            "createdAt": 10,
+            "turns": [{
+                "id": "turn-1",
+                "startedAt": 11,
+                "items": [{
+                    "type": "userMessage",
+                    "id": "item-1",
+                    "clientId": "start:command-1",
+                    "content": [{"type": "text", "text": "hello"}]
+                }]
+            }]
+        }))
+        .expect("Codex thread");
+
+        let history = history_items(&thread);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].provider_item_id, "client:start:command-1");
+    }
+
+    #[tokio::test]
+    async fn completed_turn_emits_provider_history_watermark() {
+        let provider = test_provider();
+        let mut events = provider.subscribe();
+        let project = test_project();
+        provider.shared.register_session(
+            "thread-watermark".to_owned(),
+            SessionContext {
+                project_id: project.id,
+                conversation_id: ConversationId::new(),
+                project_path: project.canonical_path,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                loaded_generation: 1,
+            },
+        );
+
+        provider.shared.handle_notification(
+            1,
+            "turn/completed",
+            json!({
+                "threadId": "thread-watermark",
+                "turn": {
+                    "id": "turn-1",
+                    "items": [],
+                    "status": "completed",
+                    "completedAt": 123
+                }
+            }),
+        );
+
+        assert!(matches!(
+            events.recv().await.expect("completion").kind,
+            ProviderEventKind::Completed
+        ));
+        assert!(matches!(
+            events.recv().await.expect("history watermark").kind,
+            ProviderEventKind::HistoryWatermark {
+                remote_updated_at_ms: 123_000
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_and_interrupted_turns_emit_provider_history_watermarks() {
+        for status in ["failed", "interrupted"] {
+            let provider = test_provider();
+            let mut events = provider.subscribe();
+            let project = test_project();
+            let thread_id = format!("thread-{status}");
+            provider.shared.register_session(
+                thread_id.clone(),
+                SessionContext {
+                    project_id: project.id,
+                    conversation_id: ConversationId::new(),
+                    project_path: project.canonical_path,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    loaded_generation: 1,
+                },
+            );
+
+            provider.shared.handle_notification(
+                1,
+                "turn/completed",
+                json!({
+                    "threadId": thread_id,
+                    "turn": {
+                        "id": "turn-1",
+                        "items": [],
+                        "status": status,
+                        "completedAt": 456,
+                        "error": if status == "failed" {
+                            json!({"message": "failed"})
+                        } else {
+                            Value::Null
+                        }
+                    }
+                }),
+            );
+
+            let terminal = events.recv().await.expect("terminal event").kind;
+            assert!(matches!(
+                (status, terminal),
+                ("failed", ProviderEventKind::Failed { .. })
+                    | ("interrupted", ProviderEventKind::Interrupted)
+            ));
+            assert!(matches!(
+                events.recv().await.expect("history watermark").kind,
+                ProviderEventKind::HistoryWatermark {
+                    remote_updated_at_ms: 456_000
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_failure_resends_the_stable_failure_after_an_error_event() {
+        let provider = test_provider();
+        let mut events = provider.subscribe();
+        let project = test_project();
+        provider.shared.register_session(
+            "thread-failure".to_owned(),
+            SessionContext {
+                project_id: project.id,
+                conversation_id: ConversationId::new(),
+                project_path: project.canonical_path,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                loaded_generation: 1,
+            },
+        );
+
+        provider.shared.handle_notification(
+            1,
+            "error",
+            json!({
+                "threadId": "thread-failure",
+                "turnId": "turn-1",
+                "willRetry": false,
+                "error": {"message": "early failure"}
+            }),
+        );
+        provider.shared.handle_notification(
+            1,
+            "turn/completed",
+            json!({
+                "threadId": "thread-failure",
+                "turn": {
+                    "id": "turn-1",
+                    "items": [],
+                    "status": "failed",
+                    "completedAt": 456,
+                    "error": {"message": "terminal failure"}
+                }
+            }),
+        );
+
+        let first_failure = events.recv().await.expect("early failure").kind;
+        let terminal_failure = events.recv().await.expect("terminal failure").kind;
+        let (
+            ProviderEventKind::Failed {
+                provider_item_id: first_id,
+                ..
+            },
+            ProviderEventKind::Failed {
+                provider_item_id: terminal_id,
+                ..
+            },
+        ) = (first_failure, terminal_failure)
+        else {
+            panic!("expected two failure events");
+        };
+        assert_eq!(first_id, terminal_id);
+        assert_eq!(first_id.as_deref(), Some("codex:v1:turn-1:failure"));
+        assert!(matches!(
+            events.recv().await.expect("history watermark").kind,
+            ProviderEventKind::HistoryWatermark {
+                remote_updated_at_ms: 456_000
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_message_live_and_history_ids_match_across_raw_id_namespaces() {
+        let provider = test_provider();
+        let mut events = provider.subscribe();
+        let project = test_project();
+        provider.shared.register_session(
+            "thread-agent".to_owned(),
+            SessionContext {
+                project_id: project.id,
+                conversation_id: ConversationId::new(),
+                project_path: project.canonical_path.clone(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                loaded_generation: 1,
+            },
+        );
+        let mut provisional_ids = Vec::new();
+        for (raw_id, text) in [("msg-live-b", "second"), ("msg-live-a", "first")] {
+            provider.shared.handle_notification(
+                1,
+                "item/started",
+                json!({
+                    "threadId": "thread-agent",
+                    "turnId": "turn-1",
+                    "item": {"type": "agentMessage", "id": raw_id, "text": "", "phase": "commentary"}
+                }),
+            );
+            provider.shared.handle_notification(
+                1,
+                "item/agentMessage/delta",
+                json!({
+                    "threadId": "thread-agent",
+                    "turnId": "turn-1",
+                    "itemId": raw_id,
+                    "delta": text
+                }),
+            );
+            let event = events.recv().await.expect("live agent message");
+            let ProviderEventKind::AgentTextSnapshot {
+                provider_item_id, ..
+            } = event.kind
+            else {
+                panic!("expected live agent message");
+            };
+            provisional_ids.push(provider_item_id);
+        }
+
+        let ordered_live_items = vec![
+            json!({"type": "agentMessage", "id": "msg-live-a", "text": "first", "phase": "commentary"}),
+            json!({"type": "agentMessage", "id": "msg-live-b", "text": "second", "phase": "commentary"}),
+        ];
+        provider
+            .shared
+            .canonicalize_turn_items("thread-agent", "turn-1", &ordered_live_items);
+        let live_ids = ["msg-live-a", "msg-live-b"]
+            .into_iter()
+            .map(|raw_item_id| {
+                provider.shared.canonical_live_item_id(
+                    "thread-agent",
+                    "turn-1",
+                    CanonicalItemKind::AgentMessage,
+                    raw_item_id,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (canonical_id, provisional_id) in live_ids.iter().zip(provisional_ids.iter().rev()) {
+            let ProviderEventKind::ProviderItemAlias {
+                provider_item_id,
+                alias_provider_item_id,
+            } = events.recv().await.expect("canonical agent alias").kind
+            else {
+                panic!("expected canonical agent alias");
+            };
+            assert_eq!(&provider_item_id, canonical_id);
+            assert_eq!(&alias_provider_item_id, provisional_id);
+        }
+
+        let thread: CodexThread = serde_json::from_value(json!({
+            "id": "thread-agent",
+            "cwd": path_string(&project.canonical_path),
+            "createdAt": 10,
+            "turns": [{
+                "id": "turn-1",
+                "startedAt": 11,
+                "items": [
+                    {"type": "agentMessage", "id": "item-history-a", "text": "first", "phase": "commentary"},
+                    {"type": "agentMessage", "id": "item-history-b", "text": "second", "phase": "commentary"}
+                ]
+            }]
+        }))
+        .expect("Codex thread");
+        let history_ids = history_items(&thread)
+            .into_iter()
+            .map(|item| item.provider_item_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(history_ids, live_ids);
+        assert_ne!(live_ids[0], live_ids[1]);
+        assert!(
+            provisional_ids
+                .iter()
+                .all(|provider_item_id| provider_item_id.starts_with("codex:live:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn file_change_live_and_history_ids_match_across_raw_id_namespaces() {
+        let provider = test_provider();
+        let mut events = provider.subscribe();
+        let project = test_project();
+        let conversation_id = ConversationId::new();
+        provider.shared.register_session(
+            "thread-file".to_owned(),
+            SessionContext {
+                project_id: project.id,
+                conversation_id,
+                project_path: project.canonical_path.clone(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                loaded_generation: 1,
+            },
+        );
+        let paths = [
+            path_string(&project.canonical_path.join("src").join("lib.rs")),
+            path_string(&project.canonical_path.join("src").join("main.rs")),
+        ];
+        let live_items = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                json!({
+                    "type": "fileChange",
+                    "id": format!("file-live-{index}"),
+                    "changes": [{"path": path, "kind": "update"}],
+                    "status": "completed"
+                })
+            })
+            .collect::<Vec<_>>();
+        for item in &live_items {
+            provider
+                .shared
+                .handle_item("thread-file", "turn-1", item.clone(), true);
+            let ProviderEventKind::FileChange {
+                provider_item_id, ..
+            } = events.recv().await.expect("live file change").kind
+            else {
+                panic!("expected live file change");
+            };
+            assert!(provider_item_id.starts_with("codex:live:"));
+        }
+        provider
+            .shared
+            .canonicalize_turn_items("thread-file", "turn-1", &live_items);
+        let live_ids = (0..2)
+            .map(|index| {
+                provider.shared.canonical_live_item_id(
+                    "thread-file",
+                    "turn-1",
+                    CanonicalItemKind::FileChange,
+                    &format!("file-live-{index}"),
+                )
+            })
+            .map(|provider_item_id| file_change_provider_item_id(&provider_item_id, 0))
+            .collect::<Vec<_>>();
+        for (index, canonical_id) in live_ids.iter().enumerate() {
+            let ProviderEventKind::ProviderItemAlias {
+                provider_item_id,
+                alias_provider_item_id,
+            } = events.recv().await.expect("canonical file alias").kind
+            else {
+                panic!("expected canonical file alias");
+            };
+            assert_eq!(&provider_item_id, canonical_id);
+            assert_eq!(
+                alias_provider_item_id,
+                format!("codex:live:turn-1:file:file-live-{index}:change:0")
+            );
+        }
+
+        let thread: CodexThread = serde_json::from_value(json!({
+            "id": "thread-file",
+            "cwd": path_string(&project.canonical_path),
+            "createdAt": 10,
+            "turns": [{
+                "id": "turn-1",
+                "startedAt": 11,
+                "items": [
+                    {
+                        "type": "fileChange",
+                        "id": "file-history-a",
+                        "changes": [{"path": paths[0], "kind": "update"}],
+                        "status": "completed"
+                    },
+                    {
+                        "type": "fileChange",
+                        "id": "file-history-b",
+                        "changes": [{"path": paths[1], "kind": "update"}],
+                        "status": "completed"
+                    }
+                ]
+            }]
+        }))
+        .expect("Codex thread");
+        let history_ids = history_items(&thread)
+            .into_iter()
+            .map(|item| item.provider_item_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(history_ids, live_ids);
+        assert_ne!(live_ids[0], live_ids[1]);
+    }
+
+    #[tokio::test]
+    async fn plan_live_and_history_ids_match() {
+        let provider = test_provider();
+        let mut events = provider.subscribe();
+        let project = test_project();
+        provider.shared.register_session(
+            "thread-plan".to_owned(),
+            SessionContext {
+                project_id: project.id,
+                conversation_id: ConversationId::new(),
+                project_path: project.canonical_path.clone(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                loaded_generation: 1,
+            },
+        );
+        provider.shared.handle_notification(
+            1,
+            "turn/plan/updated",
+            json!({
+                "threadId": "thread-plan",
+                "turnId": "turn-1",
+                "plan": [{"step": "Run tests", "status": "completed"}]
+            }),
+        );
+        let live_id = match events.recv().await.expect("live plan").kind {
+            ProviderEventKind::Plan {
+                provider_item_id, ..
+            } => provider_item_id,
+            _ => panic!("expected live plan"),
+        };
+
+        let thread: CodexThread = serde_json::from_value(json!({
+            "id": "thread-plan",
+            "cwd": path_string(&project.canonical_path),
+            "createdAt": 10,
+            "turns": [{
+                "id": "turn-1",
+                "startedAt": 11,
+                "items": [{"type": "plan", "id": "plan-item", "text": "Run tests"}]
+            }]
+        }))
+        .expect("Codex thread");
+        let history = history_items(&thread);
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].provider_item_id, live_id);
+    }
+
+    #[tokio::test]
+    async fn flush_history_events_waits_for_the_event_pump_barrier() {
+        let provider = test_provider();
+        let mut events = provider.subscribe();
+        let project_id = ProjectId::new();
+        let conversation_id = ConversationId::new();
+        let flushing = tokio::spawn({
+            let provider = provider.clone();
+            async move {
+                provider
+                    .flush_history_events(project_id, conversation_id)
+                    .await
+            }
+        });
+
+        let event = events.recv().await.expect("history barrier");
+        assert_eq!(event.provider, ProviderId::Codex);
+        assert_eq!(event.project_id, project_id);
+        assert_eq!(event.conversation_id, conversation_id);
+        let ProviderEventKind::HistoryBarrier { barrier } = event.kind else {
+            panic!("expected history barrier");
+        };
+        barrier.complete();
+
+        flushing.await.expect("flush task").expect("flush history");
+    }
+
+    #[tokio::test]
+    async fn flush_history_events_fails_without_an_event_pump() {
+        let provider = test_provider();
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            provider.flush_history_events(ProjectId::new(), ConversationId::new()),
+        )
+        .await
+        .expect("flush failed immediately")
+        .expect_err("flush requires an event pump");
+
+        assert!(error.to_string().contains("no active event pump"));
+    }
+
     async fn install_duplex(provider: &CodexProvider) -> DuplexStream {
         let (client, server) = duplex(128 * 1024);
         let (reader, writer) = split(client);
         let wire = RpcWire::start(reader, writer, Arc::downgrade(&provider.shared), 1);
         *provider.shared.connection.lock().await = Some(wire);
+        *provider
+            .shared
+            .installed_generation
+            .write()
+            .expect("Codex installed generation state poisoned") = 1;
         server
     }
 
@@ -2956,6 +3822,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_disconnect_preserves_the_new_generation_active_turn() {
+        let provider = test_provider();
+        let project = test_project();
+        let conversation_id = ConversationId::new();
+        provider.shared.register_session(
+            "thread-generation".to_owned(),
+            SessionContext {
+                project_id: project.id,
+                conversation_id,
+                project_path: project.canonical_path,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                loaded_generation: 2,
+            },
+        );
+        let (old_client, _old_server) = duplex(1024);
+        let (old_reader, old_writer) = split(old_client);
+        let old_wire = RpcWire::start(old_reader, old_writer, Arc::downgrade(&provider.shared), 1);
+        let (new_client, new_server) = duplex(1024);
+        let (new_reader, new_writer) = split(new_client);
+        let new_wire = RpcWire::start(new_reader, new_writer, Arc::downgrade(&provider.shared), 2);
+        *provider.shared.connection.lock().await = Some(Arc::clone(&old_wire));
+
+        let mut connection_slot = provider.shared.connection.lock().await;
+        let cleanup = tokio::spawn({
+            let shared = Arc::clone(&provider.shared);
+            let old_wire = Arc::clone(&old_wire);
+            async move {
+                shared
+                    .disconnect(old_wire, "old generation stopped".to_owned())
+                    .await;
+            }
+        });
+        while !old_wire.closed.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+
+        *connection_slot = Some(Arc::clone(&new_wire));
+        *provider
+            .shared
+            .installed_generation
+            .write()
+            .expect("Codex installed generation state poisoned") = 2;
+        provider.shared.handle_notification(
+            2,
+            "turn/started",
+            json!({
+                "threadId": "thread-generation",
+                "turn": {"id": "turn-new", "items": [], "status": "inProgress"}
+            }),
+        );
+        drop(connection_slot);
+        tokio::time::timeout(Duration::from_secs(1), cleanup)
+            .await
+            .expect("old disconnect remained blocked")
+            .expect("old disconnect task");
+
+        assert_eq!(
+            provider.shared.active_turn("thread-generation", 2),
+            Some("turn-new".to_owned())
+        );
+        assert_eq!(provider.shared.active_turn("thread-generation", 1), None);
+        assert_eq!(
+            provider
+                .shared
+                .session("thread-generation")
+                .expect("new session context")
+                .loaded_generation,
+            2
+        );
+        let mut events = provider.subscribe();
+        provider.shared.handle_notification(
+            1,
+            "item/agentMessage/delta",
+            json!({
+                "threadId": "thread-generation",
+                "turnId": "turn-old",
+                "itemId": "message-old",
+                "delta": "stale delta"
+            }),
+        );
+        provider.shared.handle_notification(
+            1,
+            "turn/plan/updated",
+            json!({
+                "threadId": "thread-generation",
+                "turnId": "turn-old",
+                "plan": [{"step": "stale plan", "status": "completed"}]
+            }),
+        );
+        provider.shared.handle_notification(
+            1,
+            "error",
+            json!({
+                "threadId": "thread-generation",
+                "turnId": "turn-old",
+                "willRetry": false,
+                "error": {"message": "stale error"}
+            }),
+        );
+        provider.shared.handle_notification(
+            1,
+            "turn/completed",
+            json!({
+                "threadId": "thread-generation",
+                "turn": {
+                    "id": "turn-old",
+                    "items": [],
+                    "status": "completed",
+                    "completedAt": 123
+                }
+            }),
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            provider.shared.active_turn("thread-generation", 2),
+            Some("turn-new".to_owned())
+        );
+
+        let (new_server_read, mut new_server_write) = split(new_server);
+        let mut new_server_read = BufReader::new(new_server_read);
+        let (release_server, hold_server) = oneshot::channel();
+        let interrupt_response = tokio::spawn(async move {
+            let request = read_json(&mut new_server_read).await;
+            assert_eq!(request["method"], "turn/interrupt");
+            assert_eq!(request["params"]["threadId"], "thread-generation");
+            assert_eq!(request["params"]["turnId"], "turn-new");
+            new_server_write
+                .write_all(format!("{}\n", json!({"id": request["id"], "result": {}})).as_bytes())
+                .await
+                .expect("write interrupt response");
+            let _ = hold_server.await;
+        });
+        provider
+            .interrupt(InterruptSession {
+                conversation_id,
+                native_session_id: "thread-generation".to_owned(),
+            })
+            .await
+            .expect("new generation interrupt");
+
+        provider
+            .shared
+            .retire_idle_connection(&new_wire, new_wire.idle_epoch.load(Ordering::Acquire))
+            .await;
+        assert!(!new_wire.closed.load(Ordering::Acquire));
+        assert_eq!(
+            provider
+                .shared
+                .connection
+                .lock()
+                .await
+                .as_ref()
+                .map(|wire| wire.generation),
+            Some(2)
+        );
+        let _ = release_server.send(());
+        interrupt_response.await.expect("interrupt response task");
+    }
+
+    #[tokio::test]
     async fn paginated_models_keep_dynamic_effort_order() {
         let provider = test_provider();
         let server = install_duplex(&provider).await;
@@ -3036,6 +4068,7 @@ mod tests {
             },
         );
         provider.shared.handle_notification(
+            1,
             "item/started",
             json!({
                 "threadId":"thread-1","turnId":"turn-1","startedAtMs":1,
@@ -3043,42 +4076,46 @@ mod tests {
             }),
         );
         provider.shared.handle_notification(
+            1,
             "item/agentMessage/delta",
             json!({"threadId":"thread-1","turnId":"turn-1","itemId":"message-1","delta":"done"}),
         );
         provider.shared.handle_notification(
+            1,
             "item/reasoning/textDelta",
             json!({"threadId":"thread-1","turnId":"turn-1","itemId":"reason-1","delta":"secret","contentIndex":0}),
         );
         provider.shared.handle_notification(
+            1,
             "item/reasoning/summaryTextDelta",
             json!({"threadId":"thread-1","turnId":"turn-1","itemId":"reason-1","delta":"checked tests","summaryIndex":0}),
         );
         provider.shared.handle_notification(
+            1,
             "turn/plan/updated",
             json!({"threadId":"thread-1","turnId":"turn-1","explanation":null,"plan":[{"step":"Run tests","status":"inProgress"}]}),
         );
         provider
             .shared
-            .handle_notification("future/event", json!({"unexpected":true}));
+            .handle_notification(1, "future/event", json!({"unexpected":true}));
 
-        let first = events.recv().await.expect("agent delta");
+        let first = events.recv().await.expect("agent snapshot");
         assert!(matches!(
             first.kind,
-            ProviderEventKind::AgentTextDelta {
+            ProviderEventKind::AgentTextSnapshot {
                 phase: AgentMessagePhase::Final,
-                ref delta,
+                ref text,
                 ..
-            } if delta == "done"
+            } if text == "done"
         ));
         let second = events.recv().await.expect("reasoning summary");
         assert!(matches!(
             second.kind,
-            ProviderEventKind::AgentTextDelta {
+            ProviderEventKind::AgentTextSnapshot {
                 phase: AgentMessagePhase::ReasoningSummary,
-                ref delta,
+                ref text,
                 ..
-            } if delta == "checked tests"
+            } if text == "checked tests"
         ));
         let third = events.recv().await.expect("plan");
         assert!(matches!(
@@ -3169,6 +4206,7 @@ mod tests {
             },
         );
         provider.shared.handle_notification(
+            1,
             "item/completed",
             json!({
                 "threadId":"thread-images","turnId":"turn-1","completedAtMs":1,
@@ -3176,6 +4214,7 @@ mod tests {
             }),
         );
         provider.shared.handle_notification(
+            1,
             "item/completed",
             json!({
                 "threadId":"thread-images","turnId":"turn-1","completedAtMs":2,

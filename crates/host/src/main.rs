@@ -373,6 +373,11 @@ async fn smoke_one(provider: Arc<dyn AgentProvider>, project: &Project) -> Resul
                     delta,
                     ..
                 } => final_text.push_str(&delta),
+                ProviderEventKind::AgentTextSnapshot {
+                    phase: agent_remote_protocol::AgentMessagePhase::Final,
+                    text,
+                    ..
+                } => final_text = text,
                 ProviderEventKind::Approval {
                     provider_request_id,
                     options,
@@ -396,7 +401,7 @@ async fn smoke_one(provider: Arc<dyn AgentProvider>, project: &Project) -> Resul
                         .await?;
                 }
                 ProviderEventKind::Completed => return Ok::<_, anyhow::Error>(final_text),
-                ProviderEventKind::Failed { code, message } => bail!("{code}: {message}"),
+                ProviderEventKind::Failed { code, message, .. } => bail!("{code}: {message}"),
                 ProviderEventKind::Crashed { message } => bail!("Provider crashed: {message}"),
                 ProviderEventKind::Interrupted => bail!("smoke was interrupted"),
                 _ => {}

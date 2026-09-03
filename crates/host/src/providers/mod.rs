@@ -7,6 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use agent_remote_protocol::{
@@ -165,7 +166,13 @@ impl ProviderHistoryBarrier {
     }
 
     pub async fn wait(&self) -> Result<()> {
-        self.completion.notified().await;
+        self.wait_for(Duration::from_secs(5)).await
+    }
+
+    async fn wait_for(&self, timeout: Duration) -> Result<()> {
+        tokio::time::timeout(timeout, self.completion.notified())
+            .await
+            .map_err(|_| anyhow!("provider history event barrier timed out"))?;
         if self.lagged.load(Ordering::Acquire) {
             Err(anyhow!(
                 "provider history event stream lagged; sync must be retried"
@@ -181,9 +188,16 @@ pub enum ProviderEventKind {
     HistoryBarrier {
         barrier: Arc<ProviderHistoryBarrier>,
     },
+    HistoryWatermark {
+        remote_updated_at_ms: i64,
+    },
     HistoryItem {
         provider_item_id: String,
         kind: TimelineItemKind,
+    },
+    ProviderItemAlias {
+        provider_item_id: String,
+        alias_provider_item_id: String,
     },
     UserMessageDelta {
         provider_item_id: String,
@@ -193,6 +207,11 @@ pub enum ProviderEventKind {
         provider_item_id: String,
         phase: agent_remote_protocol::AgentMessagePhase,
         delta: String,
+    },
+    AgentTextSnapshot {
+        provider_item_id: String,
+        phase: agent_remote_protocol::AgentMessagePhase,
+        text: String,
     },
     Plan {
         provider_item_id: String,
@@ -238,6 +257,7 @@ pub enum ProviderEventKind {
     },
     Completed,
     Failed {
+        provider_item_id: Option<String>,
         code: String,
         message: String,
     },
@@ -328,6 +348,8 @@ pub fn effort_options(values: impl IntoIterator<Item = String>) -> Vec<EffortOpt
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::ProviderHistoryBarrier;
 
     #[tokio::test]
@@ -336,5 +358,15 @@ mod tests {
         barrier.mark_lagged();
         barrier.complete();
         assert!(barrier.wait().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn history_barrier_times_out_when_the_event_pump_drops_it() {
+        let barrier = ProviderHistoryBarrier::default();
+        let error = barrier
+            .wait_for(Duration::from_millis(10))
+            .await
+            .expect_err("barrier timeout");
+        assert!(error.to_string().contains("timed out"));
     }
 }

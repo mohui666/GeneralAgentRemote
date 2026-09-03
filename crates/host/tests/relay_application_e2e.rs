@@ -20,7 +20,7 @@ use agent_remote_host::{
     },
     transport::{
         direct::WS_SUBPROTOCOL,
-        relay::{RelayClientConfig, run_once},
+        relay::{RelayClientConfig, run_once, run_reconnecting},
     },
 };
 use agent_remote_protocol::{
@@ -44,6 +44,10 @@ struct LoopProvider {
     events: broadcast::Sender<ProviderEvent>,
     projects: Mutex<HashMap<ConversationId, ProjectId>>,
     sends: AtomicUsize,
+    interruptions: AtomicUsize,
+    session_list_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    session_list_started: tokio::sync::Notify,
+    session_list_calls: AtomicUsize,
 }
 
 impl LoopProvider {
@@ -53,6 +57,10 @@ impl LoopProvider {
             events,
             projects: Mutex::new(HashMap::new()),
             sends: AtomicUsize::new(0),
+            interruptions: AtomicUsize::new(0),
+            session_list_gate: Mutex::new(None),
+            session_list_started: tokio::sync::Notify::new(),
+            session_list_calls: AtomicUsize::new(0),
         })
     }
 }
@@ -98,6 +106,16 @@ impl AgentProvider for LoopProvider {
     }
 
     async fn list_sessions(&self, _project: &Project) -> Result<Vec<SessionSummary>> {
+        self.session_list_calls.fetch_add(1, Ordering::SeqCst);
+        let gate = self
+            .session_list_gate
+            .lock()
+            .expect("session list gate mutex")
+            .clone();
+        if let Some(gate) = gate {
+            self.session_list_started.notify_one();
+            gate.acquire().await.expect("session list gate").forget();
+        }
         Ok(Vec::new())
     }
 
@@ -155,6 +173,7 @@ impl AgentProvider for LoopProvider {
     }
 
     async fn interrupt(&self, _request: InterruptSession) -> Result<CommandAck> {
+        self.interruptions.fetch_add(1, Ordering::SeqCst);
         Ok(CommandAck)
     }
 
@@ -287,7 +306,8 @@ async fn relay_websocket_runs_the_authenticated_application_flow_once() {
         access_token: RELAY_TOKEN.to_owned(),
         dev_insecure: true,
     };
-    let host_task = tokio::spawn(async move { run_once(host_service, &host_config).await });
+    let running_host_config = host_config.clone();
+    let host_task = tokio::spawn(async move { run_once(host_service, &running_host_config).await });
 
     let mut pairing_client = connect_online(relay_address, host_id).await;
     send_client(
@@ -321,7 +341,7 @@ async fn relay_websocket_runs_the_authenticated_application_flow_once() {
         &ClientCommand::Authenticate {
             host_id,
             device_id,
-            device_token,
+            device_token: device_token.clone(),
         },
     )
     .await;
@@ -421,6 +441,172 @@ async fn relay_websocket_runs_the_authenticated_application_flow_once() {
     }
     assert_eq!(provider.sends.load(Ordering::SeqCst), 1);
 
+    let mut observer = connect_online(relay_address, host_id).await;
+    send_client(
+        &mut observer,
+        &ClientCommand::Authenticate {
+            host_id,
+            device_id,
+            device_token: device_token.clone(),
+        },
+    )
+    .await;
+    assert_eq!(
+        receive_server(&mut observer).await,
+        ServerMessage::Authenticated { host_id, device_id }
+    );
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *provider
+        .session_list_gate
+        .lock()
+        .expect("session list gate mutex") = Some(Arc::clone(&gate));
+    let sync_id = CommandId::new();
+    send_client(
+        &mut client,
+        &ClientCommand::SyncProject {
+            command_id: sync_id,
+            project_id: project.id,
+            provider: ProviderId::Codex,
+        },
+    )
+    .await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        provider.session_list_started.notified(),
+    )
+    .await
+    .expect("sync command did not reach provider");
+
+    let interrupt_id = CommandId::new();
+    send_client(
+        &mut client,
+        &ClientCommand::Interrupt {
+            command_id: interrupt_id,
+            conversation_id,
+        },
+    )
+    .await;
+    let _ = provider.events.send(ProviderEvent {
+        provider: ProviderId::Codex,
+        project_id: project.id,
+        conversation_id,
+        kind: ProviderEventKind::AgentTextDelta {
+            provider_item_id: "relay-during-sync".to_owned(),
+            phase: AgentMessagePhase::Final,
+            delta: "relay update during sync".to_owned(),
+        },
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let mut interrupt_accepted = false;
+        let mut update_received = false;
+        while !interrupt_accepted || !update_received {
+            match receive_server(&mut client).await {
+                ServerMessage::CommandAccepted { command_id } if command_id == interrupt_id => {
+                    interrupt_accepted = true;
+                }
+                ServerMessage::TimelineItemUpserted { item }
+                    if item.conversation_id == conversation_id
+                        && matches!(
+                            item.kind,
+                            TimelineItemKind::AgentMessage { ref text, .. }
+                                if text == "relay update during sync"
+                        ) =>
+                {
+                    update_received = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("slow relay command blocked an independent response or update");
+    assert_eq!(provider.interruptions.load(Ordering::SeqCst), 1);
+
+    loop {
+        match receive_server(&mut observer).await {
+            ServerMessage::TimelineItemUpserted { item }
+                if item.conversation_id == conversation_id
+                    && matches!(
+                        item.kind,
+                        TimelineItemKind::AgentMessage { ref text, .. }
+                            if text == "relay update during sync"
+                    ) =>
+            {
+                break;
+            }
+            ServerMessage::CommandAccepted { command_id } if command_id == interrupt_id => {
+                panic!("command response was routed to the wrong logical client")
+            }
+            _ => {}
+        }
+    }
+
+    gate.add_permits(1);
+    loop {
+        if matches!(
+            receive_server(&mut client).await,
+            ServerMessage::ProjectSyncCompleted { command_id, .. } if command_id == sync_id
+        ) {
+            break;
+        }
+    }
+
+    let baseline_calls = provider.session_list_calls.load(Ordering::SeqCst);
+    let disconnect_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *provider
+        .session_list_gate
+        .lock()
+        .expect("session list gate mutex") = Some(Arc::clone(&disconnect_gate));
+    let reconnect_id = CommandId::new();
+    let reconnect_command = ClientCommand::SyncProject {
+        command_id: reconnect_id,
+        project_id: project.id,
+        provider: ProviderId::Codex,
+    };
+    send_client(&mut client, &reconnect_command).await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        provider.session_list_started.notified(),
+    )
+    .await
+    .expect("disconnect sync did not reach provider");
+
     host_task.abort();
+    let _ = host_task.await;
+    drop(client);
+    drop(observer);
+    disconnect_gate.add_permits(1);
+
+    let restarted_service = Arc::clone(&service);
+    let restarted_host_task = tokio::spawn(run_reconnecting(restarted_service, host_config));
+    let mut reconnected = connect_online(relay_address, host_id).await;
+    send_client(
+        &mut reconnected,
+        &ClientCommand::Authenticate {
+            host_id,
+            device_id,
+            device_token,
+        },
+    )
+    .await;
+    assert_eq!(
+        receive_server(&mut reconnected).await,
+        ServerMessage::Authenticated { host_id, device_id }
+    );
+    send_client(&mut reconnected, &reconnect_command).await;
+    match receive_server(&mut reconnected).await {
+        ServerMessage::ProjectSyncCompleted { command_id, .. } => {
+            assert_eq!(command_id, reconnect_id)
+        }
+        other => panic!("expected exact completed replay after relay reconnect, got {other:?}"),
+    }
+    assert_eq!(
+        provider.session_list_calls.load(Ordering::SeqCst),
+        baseline_calls + 1
+    );
+
+    restarted_host_task.abort();
     relay_task.abort();
 }

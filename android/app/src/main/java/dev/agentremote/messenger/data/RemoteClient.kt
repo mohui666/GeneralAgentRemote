@@ -3,6 +3,7 @@ package dev.agentremote.messenger.data
 import android.os.Build
 import dev.agentremote.messenger.model.ConnectionTarget
 import dev.agentremote.messenger.model.ServerEvent
+import dev.agentremote.messenger.model.StoredCredential
 import dev.agentremote.messenger.protocol.WireProtocol
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
@@ -17,13 +18,14 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 
-class RemoteClient(
+internal class RemoteClient(
     private val listener: Listener,
+    private val socketOpener: WebSocketOpener? = null,
 ) {
     interface Listener {
         fun onConnecting(target: ConnectionTarget)
         fun onConnected(target: ConnectionTarget)
-        fun onEvent(event: ServerEvent)
+        fun onEvent(event: ServerEvent, connectionGeneration: Long)
         fun onDisconnected(message: String)
         fun onRetryScheduled(attempt: Int, delayMillis: Long)
         fun onRetryStopped(message: String)
@@ -59,6 +61,14 @@ class RemoteClient(
     }
 
     fun disconnect() {
+        disconnect(clearTarget = false)
+    }
+
+    fun forgetTarget() {
+        disconnect(clearTarget = true)
+    }
+
+    private fun disconnect(clearTarget: Boolean) {
         synchronized(lock) {
             closedByUser = true
             retryEnabled = false
@@ -66,7 +76,7 @@ class RemoteClient(
             generation += 1
             socket?.close(1000, "user disconnected")
             socket = null
-            target = null
+            if (clearTarget) target = null
             reconnectAttempt = 0
         }
     }
@@ -119,13 +129,22 @@ class RemoteClient(
         socket?.send(bytes.toByteString()) ?: false
     }
 
+    fun isCurrent(connectionGeneration: Long): Boolean = current(connectionGeneration)
+
+    fun isConnected(connectionGeneration: Long): Boolean = synchronized(lock) {
+        generation == connectionGeneration && !closedByUser && socket != null
+    }
+
+    fun targets(credential: StoredCredential): Boolean =
+        synchronized(lock) { target?.credential == credential }
+
     private fun openLocked(connectionGeneration: Long, connectionTarget: ConnectionTarget) {
         listener.onConnecting(connectionTarget)
         val request = Request.Builder()
             .url(connectionTarget.webSocketUrl)
             .header("Sec-WebSocket-Protocol", WireProtocol.SUBPROTOCOL)
             .build()
-        socket = http.newWebSocket(
+        socket = (socketOpener ?: WebSocketOpener(http::newWebSocket)).open(
             request,
             object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
@@ -176,7 +195,7 @@ class RemoteClient(
                         }
                         webSocket.send(WireProtocol.getSnapshot().toByteString())
                     }
-                    listener.onEvent(event)
+                    listener.onEvent(event, connectionGeneration)
                 }
 
                 override fun onMessage(webSocket: WebSocket, text: String) {
@@ -187,23 +206,21 @@ class RemoteClient(
                 }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    if (current(connectionGeneration)) handleDisconnect(connectionGeneration, reason)
+                    handleDisconnect(connectionGeneration, reason)
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    if (current(connectionGeneration)) {
-                        handleDisconnect(connectionGeneration, t.message ?: "WebSocket 连接失败")
-                    }
+                    handleDisconnect(connectionGeneration, t.message ?: "WebSocket 连接失败")
                 }
             },
         )
     }
 
     private fun handleDisconnect(connectionGeneration: Long, message: String) {
-        listener.onDisconnected(message.ifBlank { "连接已关闭" })
         val scheduled = synchronized(lock) {
+            if (closedByUser || generation != connectionGeneration) return
             socket = null
-            if (closedByUser || !retryEnabled || generation != connectionGeneration || reconnectFuture != null) {
+            if (!retryEnabled || reconnectFuture != null) {
                 return@synchronized null
             }
             val reconnectTarget = target?.takeIf { it.credential != null } ?: return@synchronized null
@@ -225,6 +242,7 @@ class RemoteClient(
             }, delayMillis, TimeUnit.MILLISECONDS)
             RetrySchedule.Pending(attempt, delayMillis)
         }
+        listener.onDisconnected(message.ifBlank { "连接已关闭" })
         when (scheduled) {
             is RetrySchedule.Pending -> listener.onRetryScheduled(scheduled.attempt, scheduled.delayMillis)
             RetrySchedule.Stopped -> listener.onRetryStopped("已达到自动重连上限")
@@ -253,4 +271,8 @@ class RemoteClient(
     companion object {
         private const val MAX_RECONNECT_ATTEMPTS = 6
     }
+}
+
+internal fun interface WebSocketOpener {
+    fun open(request: Request, listener: WebSocketListener): WebSocket
 }

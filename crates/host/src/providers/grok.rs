@@ -164,6 +164,7 @@ struct SessionBinding {
     conversation_id: ConversationId,
     model: Option<String>,
     effort: Option<String>,
+    prompt_in_flight: bool,
     replaying: bool,
     turn_index: u64,
     user_item_id: String,
@@ -483,23 +484,45 @@ impl GrokProvider {
         replay: bool,
     ) -> Result<NativeSession> {
         let connection = self.connection_for_project(&request.project).await?;
+        let existing_binding = self
+            .shared
+            .session_binding(request.project.id, &request.native_session_id);
+        if let Some(binding) = &existing_binding
+            && binding.conversation_id != request.conversation_id
+        {
+            bail!(
+                "Grok session {} is already bound to another conversation",
+                request.native_session_id
+            );
+        }
         let (model, effort) = select_model_and_effort(
             &connection.negotiated,
-            request.model.as_deref(),
-            request.effort.as_deref(),
+            request.model.as_deref().or(existing_binding
+                .as_ref()
+                .and_then(|binding| binding.model.as_deref())),
+            request.effort.as_deref().or(existing_binding
+                .as_ref()
+                .and_then(|binding| binding.effort.as_deref())),
         )?;
         let session_id = SessionId::new(request.native_session_id.clone());
-        self.shared.bind_session(
-            request.project.id,
-            &request.native_session_id,
-            request.conversation_id,
-            model.clone(),
-            effort.clone(),
-        );
-        if replay {
-            self.shared
-                .set_replaying(request.project.id, &request.native_session_id, true);
-        }
+        let replay_previous = if replay {
+            self.shared.prepare_history_replay(
+                request.project.id,
+                &request.native_session_id,
+                request.conversation_id,
+                model.clone(),
+                effort.clone(),
+            )?
+        } else {
+            self.shared.bind_session(
+                request.project.id,
+                &request.native_session_id,
+                request.conversation_id,
+                model.clone(),
+                effort.clone(),
+            );
+            None
+        };
 
         let meta = selection_meta(model.as_deref(), effort.as_deref());
         let result = if replay {
@@ -540,15 +563,25 @@ impl GrokProvider {
         };
 
         if let Err(error) = result {
-            self.shared
-                .sessions
-                .write()
-                .expect("Grok session map poisoned")
-                .remove(&(request.project.id, request.native_session_id.clone()));
+            if replay {
+                self.shared.restore_history_binding(
+                    request.project.id,
+                    &request.native_session_id,
+                    replay_previous,
+                );
+            } else {
+                self.shared
+                    .sessions
+                    .write()
+                    .expect("Grok session map poisoned")
+                    .remove(&(request.project.id, request.native_session_id.clone()));
+            }
             return Err(anyhow!(error));
         }
-        self.shared
-            .set_replaying(request.project.id, &request.native_session_id, false);
+        if replay {
+            self.shared
+                .set_replaying(request.project.id, &request.native_session_id, false);
+        }
 
         Ok(native_session(
             request.native_session_id,
@@ -685,6 +718,23 @@ impl AgentProvider for GrokProvider {
         &self,
         request: ReadSessionHistory,
     ) -> Result<ProviderHistoryPage> {
+        if let Some(binding) = self
+            .shared
+            .session_binding(request.project.id, &request.native_session_id)
+        {
+            if binding.conversation_id != request.conversation_id {
+                bail!(
+                    "Grok session {} is already bound to another conversation",
+                    request.native_session_id
+                );
+            }
+            if binding.prompt_in_flight {
+                bail!(
+                    "Grok session {} has an active turn; history sync must be retried",
+                    request.native_session_id
+                );
+            }
+        }
         self.load_session(ResumeSession {
             conversation_id: request.conversation_id,
             project: request.project,
@@ -706,13 +756,17 @@ impl AgentProvider for GrokProvider {
         conversation_id: ConversationId,
     ) -> Result<()> {
         let barrier = Arc::new(ProviderHistoryBarrier::default());
-        self.shared.emit(
-            project_id,
-            conversation_id,
-            ProviderEventKind::HistoryBarrier {
-                barrier: Arc::clone(&barrier),
-            },
-        );
+        self.shared
+            .events
+            .send(ProviderEvent {
+                provider: ProviderId::Grok,
+                project_id,
+                conversation_id,
+                kind: ProviderEventKind::HistoryBarrier {
+                    barrier: Arc::clone(&barrier),
+                },
+            })
+            .map_err(|_| anyhow!("Grok history barrier has no active event pump"))?;
         barrier.wait().await
     }
 
@@ -792,8 +846,12 @@ impl AgentProvider for GrokProvider {
                 .update_selection(project_id, &request.native_session_id, model, effort);
         }
 
-        self.shared
-            .start_turn(project_id, &request.native_session_id);
+        if !self
+            .shared
+            .start_turn(project_id, &request.native_session_id)
+        {
+            bail!("Grok session {} is busy", request.native_session_id);
+        }
         let connection_to_agent = connection.connection.clone();
         let shared = Arc::clone(&self.shared);
         let session_id = request.native_session_id.clone();
@@ -810,6 +868,7 @@ impl AgentProvider for GrokProvider {
             let kind = match result {
                 Ok(response) => stop_reason_event(response.stop_reason),
                 Err(error) => ProviderEventKind::Failed {
+                    provider_item_id: None,
                     code: "grok_prompt_failed".to_owned(),
                     message: error.to_string(),
                 },
@@ -1165,6 +1224,86 @@ impl Shared {
         }))
     }
 
+    fn session_binding(&self, project_id: ProjectId, session_id: &str) -> Option<SessionBinding> {
+        self.sessions
+            .read()
+            .expect("Grok session map poisoned")
+            .get(&(project_id, session_id.to_owned()))
+            .cloned()
+    }
+
+    fn prepare_history_replay(
+        &self,
+        project_id: ProjectId,
+        session_id: &str,
+        conversation_id: ConversationId,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Result<Option<SessionBinding>> {
+        let key = (project_id, session_id.to_owned());
+        let mut sessions = self.sessions.write().expect("Grok session map poisoned");
+        if let Some(binding) = sessions.get_mut(&key) {
+            if binding.conversation_id != conversation_id {
+                bail!("Grok session {session_id} is already bound to another conversation");
+            }
+            if binding.prompt_in_flight {
+                bail!("Grok session {session_id} has an active turn; history sync must be retried");
+            }
+            if binding.replaying {
+                bail!("Grok session {session_id} history replay is already in progress");
+            }
+
+            let previous_binding = binding.clone();
+            binding.model = model;
+            binding.effort = effort;
+            binding.replaying = true;
+            binding.turn_index = 0;
+            binding.replay_user_text.clear();
+            binding.replay_agent_text.clear();
+            binding.replay_thought_text.clear();
+            binding.replay_has_response = false;
+            binding.replay_image_index = 0;
+            return Ok(Some(previous_binding));
+        }
+
+        let prefix = format!("history:{session_id}:0");
+        sessions.insert(
+            key,
+            SessionBinding {
+                conversation_id,
+                model,
+                effort,
+                prompt_in_flight: false,
+                replaying: true,
+                turn_index: 0,
+                user_item_id: format!("{prefix}:user"),
+                agent_item_id: format!("{prefix}:agent"),
+                thought_item_id: format!("{prefix}:thought"),
+                replay_user_text: String::new(),
+                replay_agent_text: String::new(),
+                replay_thought_text: String::new(),
+                replay_has_response: false,
+                replay_image_index: 0,
+            },
+        );
+        Ok(None)
+    }
+
+    fn restore_history_binding(
+        &self,
+        project_id: ProjectId,
+        session_id: &str,
+        previous_binding: Option<SessionBinding>,
+    ) {
+        let key = (project_id, session_id.to_owned());
+        let mut sessions = self.sessions.write().expect("Grok session map poisoned");
+        if let Some(binding) = previous_binding {
+            sessions.insert(key, binding);
+        } else {
+            sessions.remove(&key);
+        }
+    }
+
     fn bind_session(
         &self,
         project_id: ProjectId,
@@ -1183,6 +1322,7 @@ impl Shared {
                     conversation_id,
                     model,
                     effort,
+                    prompt_in_flight: false,
                     replaying: false,
                     turn_index: 0,
                     user_item_id: format!("{prefix}:user"),
@@ -1221,13 +1361,17 @@ impl Shared {
         }
     }
 
-    fn start_turn(&self, project_id: ProjectId, session_id: &str) {
+    fn start_turn(&self, project_id: ProjectId, session_id: &str) -> bool {
         if let Some(binding) = self
             .sessions
             .write()
             .expect("Grok session map poisoned")
             .get_mut(&(project_id, session_id.to_owned()))
         {
+            if binding.replaying || binding.prompt_in_flight {
+                return false;
+            }
+            binding.prompt_in_flight = true;
             binding.turn_index += 1;
             let prefix = format!("history:{session_id}:{}", binding.turn_index);
             binding.user_item_id = format!("{prefix}:user");
@@ -1237,10 +1381,21 @@ impl Shared {
             binding.replay_agent_text.clear();
             binding.replay_thought_text.clear();
             binding.replay_has_response = false;
+            return true;
         }
+        false
     }
 
-    fn finish_turn(&self, _project_id: ProjectId, _session_id: &str) {}
+    fn finish_turn(&self, project_id: ProjectId, session_id: &str) {
+        if let Some(binding) = self
+            .sessions
+            .write()
+            .expect("Grok session map poisoned")
+            .get_mut(&(project_id, session_id.to_owned()))
+        {
+            binding.prompt_in_flight = false;
+        }
+    }
 
     fn update_selection(
         &self,
@@ -2291,6 +2446,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_read_keeps_active_turn_chunks_live() {
+        let project_root = tempfile::tempdir().expect("project tempdir");
+        let project = project(project_root.path());
+        let provider = GrokProvider::new();
+        let conversation_id = ConversationId::new();
+        let session_id = "active-session";
+        provider.shared.bind_session(
+            project.id,
+            session_id,
+            conversation_id,
+            Some("grok-4.6".to_owned()),
+            Some("high".to_owned()),
+        );
+        assert!(provider.shared.start_turn(project.id, session_id));
+        let live_item_id = provider
+            .shared
+            .session_binding(project.id, session_id)
+            .expect("active binding")
+            .agent_item_id;
+        let mut events = provider.subscribe();
+
+        let error = provider
+            .read_session_history(ReadSessionHistory {
+                conversation_id,
+                project: project.clone(),
+                native_session_id: session_id.to_owned(),
+                cursor: None,
+                limit: 200,
+            })
+            .await
+            .expect_err("active history sync must be retried");
+        assert!(error.to_string().contains("must be retried"));
+        let binding = provider
+            .shared
+            .session_binding(project.id, session_id)
+            .expect("active binding remains");
+        assert!(binding.prompt_in_flight);
+        assert!(!binding.replaying);
+        assert_eq!(binding.agent_item_id, live_item_id);
+
+        provider.shared.handle_session_update(
+            project.id,
+            RawSessionNotification {
+                session_id: SessionId::new(session_id),
+                update: serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "still live"}
+                }),
+                meta: None,
+            },
+        );
+        let event = events.try_recv().expect("live agent chunk");
+        assert!(matches!(
+            event.kind,
+            ProviderEventKind::AgentTextDelta {
+                provider_item_id,
+                phase: AgentMessagePhase::Final,
+                delta,
+            } if provider_item_id == live_item_id && delta == "still live"
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn duplex_permission_resolution_and_cancel_notification() {
         let provider = GrokProvider::new();
         let project_id = ProjectId::new();
@@ -2733,6 +2955,7 @@ impl Shared {
                     project_id,
                     conversation_id,
                     ProviderEventKind::Failed {
+                        provider_item_id: None,
                         code: "grok_invalid_image".to_owned(),
                         message: error.to_string(),
                     },
@@ -2761,6 +2984,7 @@ impl Shared {
                             project_id,
                             conversation_id,
                             ProviderEventKind::Failed {
+                                provider_item_id: None,
                                 code: "grok_invalid_image".to_owned(),
                                 message: error.to_string(),
                             },
