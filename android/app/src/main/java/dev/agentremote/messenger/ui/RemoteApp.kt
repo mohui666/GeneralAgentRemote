@@ -404,9 +404,10 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
         drawerContent = {
             RemoteDrawer(
                 state = state,
-                onProject = { projectId ->
-                    viewModel.selectProject(projectId)
-                    viewModel.showConversationList()
+                onProject = viewModel::selectProject,
+                onConversation = { projectId, conversationId ->
+                    if (state.selectedProjectId != projectId) viewModel.selectProject(projectId)
+                    viewModel.selectConversation(conversationId)
                     scope.launch { drawerState.close() }
                 },
                 onProvider = viewModel::selectProvider,
@@ -470,6 +471,7 @@ private enum class HomeSort { AGENT, RECENT, ACTIVE }
 private fun RemoteDrawer(
     state: RemoteUiState,
     onProject: (UUID) -> Unit,
+    onConversation: (UUID, UUID) -> Unit,
     onProvider: (ProviderId) -> Unit,
     onProjectSearch: (String) -> Unit,
     onPinProject: (UUID) -> Unit,
@@ -479,44 +481,48 @@ private fun RemoteDrawer(
     onDisconnect: () -> Unit,
 ) {
     val snapshot = requireNotNull(state.snapshot)
+    var expandedProjectId by rememberSaveable(state.selectedProvider) {
+        mutableStateOf(state.selectedProjectId?.toString())
+    }
     ModalDrawerSheet(
-        modifier = Modifier.fillMaxHeight().widthIn(max = 330.dp),
+        modifier = Modifier.fillMaxHeight().widthIn(max = 286.dp),
         drawerContainerColor = RemoteSurface,
         drawerContentColor = RemoteText,
     ) {
-        Column(Modifier.statusBarsPadding().padding(horizontal = 18.dp, vertical = 14.dp)) {
-            Text("Agent Remote", style = MaterialTheme.typography.titleLarge)
+        Column(Modifier.statusBarsPadding().padding(horizontal = 14.dp, vertical = 11.dp)) {
+            Text("Agent Remote", style = MaterialTheme.typography.titleMedium)
             Row(
-                Modifier.padding(top = 6.dp),
+                Modifier.padding(top = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 OnlineDot(state.online)
-                Spacer(Modifier.width(8.dp))
+                Spacer(Modifier.width(7.dp))
                 Text(snapshot.hostName, color = RemoteMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            Spacer(Modifier.height(10.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 ProviderId.entries.forEach { provider ->
                     OutlinedButton(
                         onClick = { onProvider(provider) },
-                        modifier = Modifier.weight(1f).height(40.dp),
-                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.weight(1f).height(36.dp),
+                        shape = RoundedCornerShape(11.dp),
                         border = BorderStroke(
                             1.dp,
                             if (state.selectedProvider == provider) RemotePurple else RemoteBorder,
                         ),
+                        contentPadding = PaddingValues(horizontal = 8.dp),
                     ) { Text(provider.label, style = MaterialTheme.typography.labelMedium) }
                 }
             }
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(7.dp))
             Button(
                 onClick = onNewConversation,
                 enabled = state.selectedProjectId != null && state.selectedProvider != null,
-                modifier = Modifier.fillMaxWidth().height(50.dp),
-                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth().height(44.dp),
+                shape = RoundedCornerShape(14.dp),
             ) {
-                RemoteIcon(RemoteGlyph.Compose, null, Modifier.size(20.dp))
-                Spacer(Modifier.width(8.dp))
+                RemoteIcon(RemoteGlyph.Compose, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(7.dp))
                 Text("新建对话")
             }
         }
@@ -524,18 +530,24 @@ private fun RemoteDrawer(
         OutlinedTextField(
             value = state.projectSearch,
             onValueChange = onProjectSearch,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp),
             singleLine = true,
-            label = { Text("搜索项目") },
-            leadingIcon = { RemoteIcon(RemoteGlyph.Search, null, Modifier.size(18.dp), RemoteMuted) },
-            shape = RoundedCornerShape(14.dp),
+            label = { Text("搜索项目或对话") },
+            leadingIcon = { RemoteIcon(RemoteGlyph.Search, null, Modifier.size(17.dp), RemoteMuted) },
+            shape = RoundedCornerShape(12.dp),
         )
+        val query = state.projectSearch.trim()
         val matchingProjects = snapshot.projects
-            .filter {
-                it.valid && state.selectedProvider in it.enabledProviders &&
-                    (state.projectSearch.isBlank() ||
-                        it.displayName.contains(state.projectSearch, ignoreCase = true) ||
-                        it.shortPath.contains(state.projectSearch, ignoreCase = true))
+            .filter { project ->
+                project.valid && state.selectedProvider in project.enabledProviders &&
+                    (query.isBlank() ||
+                        project.displayName.contains(query, ignoreCase = true) ||
+                        project.shortPath.contains(query, ignoreCase = true) ||
+                        snapshot.conversations.any { conversation ->
+                            conversation.projectId == project.id &&
+                                conversation.provider == state.selectedProvider &&
+                                conversation.title.contains(query, ignoreCase = true)
+                        })
             }
             .sortedByDescending { it.lastActivityAtMs }
         val pinnedProjects = matchingProjects.filter { it.id in state.pinnedProjects }
@@ -545,49 +557,125 @@ private fun RemoteDrawer(
         val remainingProjects = matchingProjects.filter {
             it.id !in state.pinnedProjects && it.id !in state.recentProjects
         }
-        LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 10.dp)) {
-            listOf(
-                "固定" to pinnedProjects,
-                "最近" to recentProjects,
-                "全部项目" to remainingProjects,
-            ).filter { it.second.isNotEmpty() }.forEach { (section, projects) ->
+        val sections = listOf(
+            "固定" to pinnedProjects,
+            "最近" to recentProjects,
+            "全部项目" to remainingProjects,
+        ).filter { it.second.isNotEmpty() }
+        LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 8.dp, bottom = 6.dp)) {
+            sections.forEach { (section, projects) ->
                 item(key = "project-section-$section") {
                     Text(
                         section,
-                        modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 5.dp),
+                        modifier = Modifier.padding(start = 12.dp, top = 9.dp, bottom = 3.dp),
                         color = RemoteMuted,
                         style = MaterialTheme.typography.labelSmall,
                     )
                 }
-                items(projects, key = { it.id }) { project ->
-                    NavigationDrawerItem(
-                        icon = { RemoteIcon(RemoteGlyph.Folder, null, Modifier.size(22.dp), RemoteMuted) },
-                        label = {
-                            Column {
-                                Text(project.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                projects.forEach { project ->
+                    val projectKey = project.id.toString()
+                    val expanded = expandedProjectId == projectKey
+                    item(key = "project-$section-${project.id}") {
+                        NavigationDrawerItem(
+                            icon = { RemoteIcon(RemoteGlyph.Folder, null, Modifier.size(20.dp), RemoteMuted) },
+                            label = {
+                                Column {
+                                    Text(project.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text(
+                                        project.shortPath,
+                                        color = RemoteMuted,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            },
+                            badge = {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        if (expanded) "⌄" else project.conversationCount.toString(),
+                                        color = RemoteMuted,
+                                        style = MaterialTheme.typography.labelSmall,
+                                    )
+                                    IconButton(
+                                        onClick = { onPinProject(project.id) },
+                                        modifier = Modifier.size(30.dp),
+                                    ) {
+                                        Text(
+                                            if (project.id in state.pinnedProjects) "★" else "☆",
+                                            color = RemoteMuted,
+                                            style = MaterialTheme.typography.labelMedium,
+                                        )
+                                    }
+                                }
+                            },
+                            selected = state.selectedProjectId == project.id,
+                            onClick = {
+                                expandedProjectId = if (expanded) null else projectKey
+                                if (state.selectedProjectId != project.id) onProject(project.id)
+                            },
+                            colors = androidx.compose.material3.NavigationDrawerItemDefaults.colors(
+                                selectedContainerColor = RemoteSurfaceRaised,
+                                unselectedContainerColor = Color.Transparent,
+                                selectedTextColor = RemoteText,
+                                unselectedTextColor = RemoteText,
+                            ),
+                        )
+                    }
+                    if (expanded) {
+                        val projectMatchesQuery = query.isBlank() ||
+                            project.displayName.contains(query, ignoreCase = true) ||
+                            project.shortPath.contains(query, ignoreCase = true)
+                        val conversations = snapshot.conversations
+                            .filter { conversation ->
+                                conversation.projectId == project.id &&
+                                    conversation.provider == state.selectedProvider &&
+                                    (projectMatchesQuery || conversation.title.contains(query, ignoreCase = true))
+                            }
+                            .sortedByDescending(Conversation::updatedAtMs)
+                        if (conversations.isEmpty()) {
+                            item(key = "project-empty-${project.id}") {
                                 Text(
-                                    "${project.shortPath} · ${project.conversationCount} 个对话",
+                                    "暂无对话",
+                                    modifier = Modifier.padding(start = 48.dp, top = 4.dp, bottom = 8.dp),
                                     color = RemoteMuted,
                                     style = MaterialTheme.typography.labelSmall,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
                                 )
                             }
-                        },
-                        badge = {
-                            TextButton(onClick = { onPinProject(project.id) }) {
-                                Text(if (project.id in state.pinnedProjects) "★" else "☆")
+                        } else {
+                            items(conversations, key = { "project-conversation-${it.id}" }) { conversation ->
+                                NavigationDrawerItem(
+                                    icon = {
+                                        RemoteIcon(RemoteGlyph.Chat, null, Modifier.size(17.dp), RemoteMuted)
+                                    },
+                                    label = {
+                                        Column {
+                                            Text(
+                                                conversation.title,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                            )
+                                            Text(
+                                                stateLabel(conversation.state),
+                                                color = RemoteMuted,
+                                                style = MaterialTheme.typography.labelSmall,
+                                            )
+                                        }
+                                    },
+                                    selected = state.selectedConversationId == conversation.id,
+                                    onClick = { onConversation(project.id, conversation.id) },
+                                    modifier = Modifier.padding(start = 22.dp),
+                                    colors = androidx.compose.material3.NavigationDrawerItemDefaults.colors(
+                                        selectedContainerColor = Color(0xFF2A2532),
+                                        unselectedContainerColor = Color.Transparent,
+                                        selectedTextColor = RemoteText,
+                                        unselectedTextColor = RemoteText,
+                                    ),
+                                )
                             }
-                        },
-                        selected = state.selectedProjectId == project.id,
-                        onClick = { onProject(project.id) },
-                        colors = androidx.compose.material3.NavigationDrawerItemDefaults.colors(
-                            selectedContainerColor = RemoteSurfaceRaised,
-                            unselectedContainerColor = Color.Transparent,
-                            selectedTextColor = RemoteText,
-                            unselectedTextColor = RemoteText,
-                        ),
-                    )
+                        }
+                    }
                 }
             }
         }
@@ -595,24 +683,24 @@ private fun RemoteDrawer(
         if (!state.online) {
             TextButton(
                 onClick = if (state.retryEnabled) onStopRetrying else onRetryNow,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp).height(44.dp),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp).height(40.dp),
             ) {
                 RemoteIcon(
                     if (state.retryEnabled) RemoteGlyph.Stop else RemoteGlyph.Recent,
                     null,
-                    Modifier.size(19.dp),
+                    Modifier.size(17.dp),
                     RemoteMuted,
                 )
-                Spacer(Modifier.width(8.dp))
+                Spacer(Modifier.width(7.dp))
                 Text(if (state.retryEnabled) "停止自动重连" else "立即重连", color = RemoteMuted)
             }
         }
         TextButton(
             onClick = onDisconnect,
-            modifier = Modifier.fillMaxWidth().padding(10.dp).height(48.dp),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp).height(42.dp),
         ) {
-            RemoteIcon(RemoteGlyph.Disconnect, null, Modifier.size(20.dp), MaterialTheme.colorScheme.error)
-            Spacer(Modifier.width(8.dp))
+            RemoteIcon(RemoteGlyph.Disconnect, null, Modifier.size(18.dp), MaterialTheme.colorScheme.error)
+            Spacer(Modifier.width(7.dp))
             Text("断开 Host", color = MaterialTheme.colorScheme.error)
         }
         Spacer(Modifier.navigationBarsPadding())
@@ -637,7 +725,7 @@ private fun RemoteTopBar(
             .fillMaxWidth()
             .background(RemoteBlack)
             .statusBarsPadding()
-            .padding(horizontal = 18.dp, vertical = 10.dp),
+            .padding(horizontal = 12.dp, vertical = 7.dp),
     ) {
         FloatingIconButton(
             glyph = RemoteGlyph.Menu,
@@ -646,19 +734,19 @@ private fun RemoteTopBar(
             modifier = Modifier.align(Alignment.CenterStart),
         )
         Column(
-            modifier = Modifier.align(Alignment.Center).widthIn(max = 120.dp),
+            modifier = Modifier.align(Alignment.Center).widthIn(max = 136.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text("远程", style = MaterialTheme.typography.titleLarge)
+            Text("远程", style = MaterialTheme.typography.titleMedium)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 OnlineDot(online)
-                Spacer(Modifier.width(6.dp))
-                RemoteIcon(RemoteGlyph.Computer, null, Modifier.size(15.dp), RemoteMuted)
                 Spacer(Modifier.width(5.dp))
+                RemoteIcon(RemoteGlyph.Computer, null, Modifier.size(14.dp), RemoteMuted)
+                Spacer(Modifier.width(4.dp))
                 Text(
                     hostName,
                     color = RemoteMuted,
-                    style = MaterialTheme.typography.bodySmall,
+                    style = MaterialTheme.typography.labelSmall,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -696,8 +784,8 @@ private fun RemoteOverflowMenu(
     DropdownMenu(
         expanded = expanded,
         onDismissRequest = onDismiss,
-        modifier = Modifier.width(278.dp),
-        shape = RoundedCornerShape(24.dp),
+        modifier = Modifier.width(218.dp),
+        shape = RoundedCornerShape(16.dp),
         containerColor = RemoteSurfaceRaised,
         border = BorderStroke(1.dp, RemoteBorder),
     ) {
@@ -705,18 +793,18 @@ private fun RemoteOverflowMenu(
         RemoteMenuRow(RemoteGlyph.Folder, "按 Agent 排序", sortMode == HomeSort.AGENT) { onSort(HomeSort.AGENT) }
         RemoteMenuRow(RemoteGlyph.Recent, "按时间倒序", sortMode == HomeSort.RECENT) { onSort(HomeSort.RECENT) }
         RemoteMenuRow(RemoteGlyph.Chat, "进行中优先", sortMode == HomeSort.ACTIVE) { onSort(HomeSort.ACTIVE) }
-        HorizontalDivider(Modifier.padding(vertical = 8.dp), color = RemoteBorder)
+        HorizontalDivider(Modifier.padding(vertical = 5.dp), color = RemoteBorder)
         MenuSectionLabel("管理")
         RemoteMenuRow(RemoteGlyph.Folder, "项目列表") { onShowProjects() }
         RemoteMenuRow(RemoteGlyph.Disconnect, "断开 Host", tint = MaterialTheme.colorScheme.error) { onDisconnect() }
-        HorizontalDivider(Modifier.padding(vertical = 8.dp), color = RemoteBorder)
+        HorizontalDivider(Modifier.padding(vertical = 5.dp), color = RemoteBorder)
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 10.dp),
+            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             OnlineDot(online)
-            Spacer(Modifier.width(10.dp))
-            Text(if (online) "Host 在线" else "Host 离线", color = RemoteMuted)
+            Spacer(Modifier.width(8.dp))
+            Text(if (online) "Host 在线" else "Host 离线", color = RemoteMuted, style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -725,9 +813,9 @@ private fun RemoteOverflowMenu(
 private fun MenuSectionLabel(label: String) {
     Text(
         label,
-        modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp),
+        modifier = Modifier.padding(horizontal = 14.dp, vertical = 5.dp),
         color = RemoteMuted,
-        style = MaterialTheme.typography.labelMedium,
+        style = MaterialTheme.typography.labelSmall,
     )
 }
 
@@ -740,16 +828,16 @@ private fun RemoteMenuRow(
     onClick: () -> Unit,
 ) {
     Row(
-        Modifier.fillMaxWidth().height(50.dp).clickable(onClick = onClick).padding(horizontal = 18.dp),
+        Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClick).padding(horizontal = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(Modifier.width(24.dp), contentAlignment = Alignment.Center) {
-            if (selected) RemoteIcon(RemoteGlyph.Check, null, Modifier.size(18.dp), tint)
+        Box(Modifier.width(19.dp), contentAlignment = Alignment.Center) {
+            if (selected) RemoteIcon(RemoteGlyph.Check, null, Modifier.size(16.dp), tint)
         }
+        Spacer(Modifier.width(7.dp))
+        RemoteIcon(glyph, null, Modifier.size(19.dp), tint)
         Spacer(Modifier.width(10.dp))
-        RemoteIcon(glyph, null, Modifier.size(22.dp), tint)
-        Spacer(Modifier.width(14.dp))
-        Text(label, color = tint, style = MaterialTheme.typography.bodyLarge)
+        Text(label, color = tint, style = MaterialTheme.typography.bodyMedium)
     }
 }
 
@@ -972,8 +1060,13 @@ private fun ConversationScreen(
     val timeline = snapshot.timeline.filter { it.conversationId == conversation.id }
     val timelineBlocks = groupTimeline(timeline)
     val listState = rememberLazyListState()
-    LaunchedEffect(timeline.size, timeline.lastOrNull()?.revision) {
-        if (timeline.isNotEmpty()) listState.animateScrollToItem(timeline.lastIndex)
+    val followsLatest = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index
+        ?.let { it >= listState.layoutInfo.totalItemsCount - 2 }
+        ?: true
+    LaunchedEffect(timelineBlocks.size, timeline.lastOrNull()?.revision) {
+        if (timelineBlocks.isNotEmpty() && followsLatest) {
+            listState.scrollToItem(timelineBlocks.size)
+        }
     }
     Column(
         Modifier
@@ -1042,7 +1135,7 @@ private fun ConversationScreen(
                 .find { it.id == "permission_mode" }
                 ?.currentValue,
             promptAttachments = state.promptAttachments,
-            sending = state.pendingCommands.isNotEmpty(),
+            sending = state.creatingConversation,
             onDraft = viewModel::setDraft,
             onSend = viewModel::sendMessage,
             onSteer = viewModel::steer,
@@ -2032,7 +2125,7 @@ private fun FloatingIconButton(
     modifier: Modifier = Modifier,
     containerColor: Color = RemoteSurfaceRaised,
     contentColor: Color = RemoteText,
-    size: Dp = 52.dp,
+    size: Dp = 44.dp,
 ) {
     IconButton(
         onClick = onClick,
@@ -2041,7 +2134,7 @@ private fun FloatingIconButton(
             .background(containerColor, CircleShape)
             .border(1.dp, if (containerColor == RemotePurple) Color.Transparent else RemoteBorder, CircleShape),
     ) {
-        RemoteIcon(glyph, description, Modifier.size(24.dp), contentColor)
+        RemoteIcon(glyph, description, Modifier.size(21.dp), contentColor)
     }
 }
 

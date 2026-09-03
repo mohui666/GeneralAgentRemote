@@ -7,11 +7,13 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.viewmodel.compose.viewModel
+import dev.agentremote.messenger.debug.NativeDebugBridge
 import dev.agentremote.messenger.ui.AgentRemoteTheme
 import dev.agentremote.messenger.ui.RemoteApp
 import dev.agentremote.messenger.ui.RemoteViewModel
@@ -28,6 +30,10 @@ class MainActivity : ComponentActivity() {
         )
         setContent {
             val remoteViewModel: RemoteViewModel = viewModel()
+            DisposableEffect(remoteViewModel) {
+                NativeDebugBridge.attach(remoteViewModel)
+                onDispose { NativeDebugBridge.detach(remoteViewModel) }
+            }
             LaunchedEffect(sharedPairLink) {
                 sharedPairLink?.let(remoteViewModel::setPairLink)
             }

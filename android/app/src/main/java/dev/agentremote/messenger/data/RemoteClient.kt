@@ -8,8 +8,8 @@ import dev.agentremote.messenger.protocol.WireProtocol
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
-import kotlin.random.Random
 import kotlin.math.min
+import kotlin.random.Random
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -42,6 +42,7 @@ internal class RemoteClient(
     private var socket: WebSocket? = null
     private var target: ConnectionTarget? = null
     private var generation = 0L
+    private var readyGeneration: Long? = null
     private var reconnectAttempt = 0
     private var reconnectFuture: ScheduledFuture<*>? = null
     private var retryEnabled = true
@@ -52,6 +53,7 @@ internal class RemoteClient(
             closedByUser = false
             retryEnabled = true
             reconnectAttempt = 0
+            readyGeneration = null
             cancelReconnectLocked()
             target = newTarget
             generation += 1
@@ -72,6 +74,7 @@ internal class RemoteClient(
         synchronized(lock) {
             closedByUser = true
             retryEnabled = false
+            readyGeneration = null
             cancelReconnectLocked()
             generation += 1
             socket?.close(1000, "user disconnected")
@@ -87,6 +90,7 @@ internal class RemoteClient(
             retryEnabled = true
             closedByUser = false
             reconnectAttempt = 0
+            readyGeneration = null
             cancelReconnectLocked()
             generation += 1
             socket?.cancel()
@@ -107,6 +111,7 @@ internal class RemoteClient(
         synchronized(lock) {
             closedByUser = true
             retryEnabled = false
+            readyGeneration = null
             cancelReconnectLocked()
             generation += 1
             socket?.cancel()
@@ -125,20 +130,29 @@ internal class RemoteClient(
         if (shouldRetry) retryNow()
     }
 
+    /**
+     * Returns true only after the current socket's onOpen callback validates the subprotocol.
+     * OkHttp creates a WebSocket object before onOpen, so socket != null alone is not send-ready.
+     */
     fun send(bytes: ByteArray): Boolean = synchronized(lock) {
-        socket?.send(bytes.toByteString()) ?: false
+        val activeSocket = socket?.takeIf { readyGeneration == generation } ?: return@synchronized false
+        activeSocket.send(bytes.toByteString())
     }
 
     fun isCurrent(connectionGeneration: Long): Boolean = current(connectionGeneration)
 
     fun isConnected(connectionGeneration: Long): Boolean = synchronized(lock) {
-        generation == connectionGeneration && !closedByUser && socket != null
+        generation == connectionGeneration &&
+            readyGeneration == connectionGeneration &&
+            !closedByUser &&
+            socket != null
     }
 
     fun targets(credential: StoredCredential): Boolean =
         synchronized(lock) { target?.credential == credential }
 
     private fun openLocked(connectionGeneration: Long, connectionTarget: ConnectionTarget) {
+        readyGeneration = null
         listener.onConnecting(connectionTarget)
         val request = Request.Builder()
             .url(connectionTarget.webSocketUrl)
@@ -157,6 +171,9 @@ internal class RemoteClient(
                         listener.onError("服务端没有接受 ${WireProtocol.SUBPROTOCOL}")
                         return
                     }
+                    synchronized(lock) {
+                        if (generation == connectionGeneration) readyGeneration = connectionGeneration
+                    }
                     listener.onConnected(connectionTarget)
                     val firstFrame = connectionTarget.pairToken?.let {
                         WireProtocol.pair(connectionTarget, "${Build.MANUFACTURER} ${Build.MODEL}")
@@ -164,8 +181,9 @@ internal class RemoteClient(
                     if (firstFrame == null) {
                         listener.onError("连接缺少配对 token 或设备凭证")
                         webSocket.close(1008, "missing credentials")
-                    } else {
-                        webSocket.send(firstFrame.toByteString())
+                    } else if (!webSocket.send(firstFrame.toByteString())) {
+                        listener.onError("认证请求未能进入 WebSocket 发送队列")
+                        webSocket.close(1011, "authentication send failed")
                     }
                 }
 
@@ -188,12 +206,16 @@ internal class RemoteClient(
                                 )
                             }
                         }
-                        webSocket.send(WireProtocol.getSnapshot().toByteString())
+                        if (!webSocket.send(WireProtocol.getSnapshot().toByteString())) {
+                            listener.onError("配对成功，但无法请求 Host 快照")
+                        }
                     } else if (event is ServerEvent.Authenticated) {
                         synchronized(lock) {
                             if (generation == connectionGeneration) reconnectAttempt = 0
                         }
-                        webSocket.send(WireProtocol.getSnapshot().toByteString())
+                        if (!webSocket.send(WireProtocol.getSnapshot().toByteString())) {
+                            listener.onError("认证成功，但无法请求 Host 快照")
+                        }
                     }
                     listener.onEvent(event, connectionGeneration)
                 }
@@ -219,6 +241,7 @@ internal class RemoteClient(
     private fun handleDisconnect(connectionGeneration: Long, message: String) {
         val scheduled = synchronized(lock) {
             if (closedByUser || generation != connectionGeneration) return
+            readyGeneration = null
             socket = null
             if (!retryEnabled || reconnectFuture != null) {
                 return@synchronized null

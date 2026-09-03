@@ -61,6 +61,7 @@ data class RemoteUiState(
     val historyExhausted: Set<UUID> = emptySet(),
     val pendingCommands: Set<UUID> = emptySet(),
     val pendingApprovals: Set<UUID> = emptySet(),
+    // Kept for persisted/state compatibility; now means one message or steer is awaiting acceptance.
     val creatingConversation: Boolean = false,
     val error: String? = null,
 )
@@ -223,6 +224,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
         mutableState.update {
             it.copy(
                 error = null,
+                online = false,
                 snapshot = null,
                 activeHostId = target.hostId,
                 selectedConversationId = null,
@@ -230,6 +232,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                 promptAttachments = emptyList(),
                 connecting = true,
                 retryEnabled = true,
+                creatingConversation = false,
             )
         }
         clientStateStore.saveLastHost(target.hostId)
@@ -251,6 +254,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                 it.copy(
                     phase = if (restored.snapshot != null) "离线缓存 · 正在恢复连接" else "正在连接",
                     error = null,
+                    online = false,
                     snapshot = restored.snapshot,
                     activeHostId = credential.hostId,
                     selectedConversationId = restored.selectedConversationId,
@@ -271,6 +275,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                     historyExhausted = emptySet(),
                     pendingCommands = emptySet(),
                     pendingApprovals = emptySet(),
+                    creatingConversation = false,
                 ),
                 preserveMissingConversation = true,
             )
@@ -301,7 +306,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                     ?.let(::setOf)
                     .orEmpty(),
                 pendingApprovals = emptySet(),
-                creatingConversation = pending?.startsConversation == true && draftConversationId != null,
+                creatingConversation = pending != null,
             )
         }
         persistSelection()
@@ -529,7 +534,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
             sentAttachmentIds = current.promptAttachments.mapTo(mutableSetOf(), PromptAttachment::id),
         )
         if (queue(commandId, bytes)) {
-            mutableState.update { it.copy(creatingConversation = current.selectedConversationId == null) }
+            mutableState.update { it.copy(creatingConversation = true) }
         } else {
             pendingSend = null
         }
@@ -551,7 +556,9 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
             sentDraft = current.draft,
             sentAttachmentIds = emptySet(),
         )
-        if (!queue(commandId, bytes)) {
+        if (queue(commandId, bytes)) {
+            mutableState.update { it.copy(creatingConversation = true) }
+        } else {
             pendingSend = null
         }
     }
@@ -714,7 +721,6 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                         it.copy(
                             selectedConversationId = event.conversation.id,
                             showingNewConversation = false,
-                            creatingConversation = false,
                         )
                     }
                 }
@@ -861,7 +867,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                     ?.let(::setOf)
                     .orEmpty(),
                 pendingApprovals = emptySet(),
-                creatingConversation = pendingSend?.startsConversation == true && draftConversationId != null,
+                creatingConversation = pendingSend != null,
                 error = message,
             )
         }
@@ -885,6 +891,8 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
 
     override fun onCleared() {
         connectivity.unregisterNetworkCallback(networkCallback)
+        snapshotPersistJob?.cancel()
+        clientStateStore.flush()
         client.close()
         super.onCleared()
     }
@@ -911,7 +919,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                     historyExhausted = emptySet(),
                     pendingCommands = emptySet(),
                     pendingApprovals = emptySet(),
-                    creatingConversation = false,
+                    creatingConversation = pendingSend != null,
                     error = null,
                 ),
             )
@@ -1002,7 +1010,9 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
         val projectId = current.selectedProjectId ?: return
         val provider = current.selectedProvider ?: return
         val commandId = UUID.randomUUID()
-        queue(commandId, WireProtocol.syncProject(commandId, projectId, provider))
+        if (!client.send(WireProtocol.syncProject(commandId, projectId, provider))) {
+            showError("当前没有可用连接")
+        }
     }
 
     private fun queue(commandId: UUID, bytes: ByteArray): Boolean {
@@ -1023,7 +1033,6 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                 it.copy(
                     selectedConversationId = pending.conversationId,
                     showingNewConversation = false,
-                    creatingConversation = false,
                 )
             }
         }
@@ -1040,7 +1049,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
             mutableState.update {
                 it.copy(
                     pendingCommands = it.pendingCommands + pending.commandId,
-                    creatingConversation = pending.startsConversation && draftConversationId != null,
+                    creatingConversation = true,
                 )
             }
         }
@@ -1144,9 +1153,31 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
             current: List<TimelineItem>,
             incoming: TimelineItem,
         ): List<TimelineItem> {
-            val existing = current.find { it.id == incoming.id }
-            if (existing != null && existing.revision > incoming.revision) return current
-            return (current.filterNot { it.id == incoming.id } + incoming).sortedWith(timelineComparator)
+            val existingIndex = current.indexOfFirst { it.id == incoming.id }
+            if (existingIndex >= 0) {
+                val existing = current[existingIndex]
+                if (existing.revision > incoming.revision) return current
+                val previous = current.getOrNull(existingIndex - 1)
+                val next = current.getOrNull(existingIndex + 1)
+                val remainsOrdered =
+                    (previous == null || timelineComparator.compare(previous, incoming) <= 0) &&
+                        (next == null || timelineComparator.compare(incoming, next) <= 0)
+                if (remainsOrdered) {
+                    return current.toMutableList().also { it[existingIndex] = incoming }
+                }
+                val withoutExisting = current.toMutableList().also { it.removeAt(existingIndex) }
+                return insertTimelineItem(withoutExisting, incoming)
+            }
+            return insertTimelineItem(current, incoming)
+        }
+
+        private fun insertTimelineItem(
+            current: List<TimelineItem>,
+            incoming: TimelineItem,
+        ): List<TimelineItem> {
+            val insertionIndex = current.binarySearch(incoming, timelineComparator)
+                .let { index -> if (index >= 0) index else -index - 1 }
+            return current.toMutableList().also { it.add(insertionIndex, incoming) }
         }
     }
 }
