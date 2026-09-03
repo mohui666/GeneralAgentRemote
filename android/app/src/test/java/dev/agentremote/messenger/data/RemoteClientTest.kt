@@ -3,13 +3,17 @@ package dev.agentremote.messenger.data
 import dev.agentremote.messenger.model.ConnectionTarget
 import dev.agentremote.messenger.model.ServerEvent
 import dev.agentremote.messenger.model.StoredCredential
+import dev.agentremote.messenger.protocol.WireProtocol
 import java.io.IOException
 import java.util.UUID
+import okhttp3.Protocol
 import okhttp3.Request
+import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -40,6 +44,30 @@ class RemoteClientTest {
     }
 
     @Test
+    fun socketIsNotSendReadyUntilOnOpenValidatesSubprotocol() {
+        val opened = mutableListOf<OpenedSocket>()
+        val client = RemoteClient(
+            listener = NoOpListener,
+            socketOpener = WebSocketOpener { request, listener ->
+                val socket = FakeWebSocket(request)
+                opened += OpenedSocket(socket, listener)
+                socket
+            },
+        )
+
+        try {
+            client.connect(target())
+
+            assertFalse(client.send(byteArrayOf(1)))
+            open(opened.single())
+            assertTrue(client.send(byteArrayOf(1)))
+            assertEquals(2, opened.single().socket.binarySendCount)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
     fun staleSocketFailureCannotClearAnImmediateReconnect() {
         val opened = mutableListOf<OpenedSocket>()
         val client = RemoteClient(
@@ -56,6 +84,7 @@ class RemoteClientTest {
             client.disconnect()
             client.retryNow()
             assertEquals(2, opened.size)
+            open(opened.last())
 
             opened.first().listener.onFailure(
                 opened.first().socket,
@@ -64,7 +93,7 @@ class RemoteClientTest {
             )
 
             assertTrue(client.send(byteArrayOf(1)))
-            assertEquals(1, opened.last().socket.binarySendCount)
+            assertEquals(2, opened.last().socket.binarySendCount)
         } finally {
             client.close()
         }
@@ -89,6 +118,19 @@ class RemoteClientTest {
         } finally {
             client.close()
         }
+    }
+
+    private fun open(opened: OpenedSocket) {
+        opened.listener.onOpen(
+            opened.socket,
+            Response.Builder()
+                .request(opened.socket.request())
+                .protocol(Protocol.HTTP_1_1)
+                .code(101)
+                .message("Switching Protocols")
+                .header("Sec-WebSocket-Protocol", WireProtocol.SUBPROTOCOL)
+                .build(),
+        )
     }
 
     private fun target(): ConnectionTarget {

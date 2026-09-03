@@ -9,6 +9,9 @@ import dev.agentremote.messenger.model.Snapshot
 import dev.agentremote.messenger.model.StoredCredential
 import dev.agentremote.messenger.protocol.WireProtocol
 import java.util.UUID
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -25,8 +28,24 @@ data class RestoredClientState(
     val recentProjects: List<UUID>,
 )
 
+private data class PendingSelection(
+    val hostId: UUID,
+    val selectedConversationId: UUID?,
+    val selectedProjectId: UUID?,
+    val selectedProvider: ProviderId?,
+    val selectedModel: String?,
+    val selectedEffort: String?,
+    val selectedPermission: String?,
+    val draft: String,
+    val pinnedProjects: Set<UUID>,
+    val recentProjects: List<UUID>,
+)
+
 class ClientStateStore(context: Context) {
     private val preferences = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+    private val selectionLock = Any()
+    private var pendingSelection: PendingSelection? = null
+    private var pendingSelectionWrite: ScheduledFuture<*>? = null
 
     fun lastHostId(): UUID? = preferences.getString(LAST_HOST, null)?.let(UUID::fromString)
 
@@ -35,6 +54,7 @@ class ClientStateStore(context: Context) {
     }
 
     fun load(credential: StoredCredential): RestoredClientState {
+        flushSelection(credential.hostId)
         val hostId = credential.hostId
         val state = preferences.getString(stateKey(hostId), null)?.let(::JSONObject)
         val snapshot = preferences.getString(snapshotKey(hostId), null)
@@ -88,24 +108,69 @@ class ClientStateStore(context: Context) {
         pinnedProjects: Set<UUID>,
         recentProjects: List<UUID>,
     ) {
-        val state = JSONObject()
-            .put("conversation", selectedConversationId?.toString())
-            .put("project", selectedProjectId?.toString())
-            .put("provider", selectedProvider?.wire)
-            .put("model", selectedModel)
-            .put("effort", selectedEffort)
-            .put("permission", selectedPermission)
-            .put("draft", draft)
-            .put("pinned", JSONArray(pinnedProjects.map(UUID::toString)))
-            .put("recent", JSONArray(recentProjects.map(UUID::toString)))
-        preferences.edit().putString(stateKey(hostId), state.toString()).apply()
+        val selection = PendingSelection(
+            hostId = hostId,
+            selectedConversationId = selectedConversationId,
+            selectedProjectId = selectedProjectId,
+            selectedProvider = selectedProvider,
+            selectedModel = selectedModel,
+            selectedEffort = selectedEffort,
+            selectedPermission = selectedPermission,
+            draft = draft,
+            pinnedProjects = pinnedProjects.toSet(),
+            recentProjects = recentProjects.toList(),
+        )
+        synchronized(selectionLock) {
+            pendingSelection = selection
+            pendingSelectionWrite?.cancel(false)
+            pendingSelectionWrite = selectionWriter.schedule(
+                { flushSelection() },
+                SELECTION_WRITE_DELAY_MS,
+                TimeUnit.MILLISECONDS,
+            )
+        }
+    }
+
+    fun flush() {
+        flushSelection()
     }
 
     fun clear(hostId: UUID) {
-        preferences.edit()
-            .remove(snapshotKey(hostId))
-            .remove(stateKey(hostId))
-            .apply()
+        synchronized(selectionLock) {
+            if (pendingSelection?.hostId == hostId) {
+                pendingSelection = null
+                pendingSelectionWrite?.cancel(false)
+                pendingSelectionWrite = null
+            }
+            preferences.edit()
+                .remove(snapshotKey(hostId))
+                .remove(stateKey(hostId))
+                .apply()
+        }
+    }
+
+    private fun flushSelection(hostId: UUID? = null) {
+        synchronized(selectionLock) {
+            val selection = pendingSelection
+            if (selection == null || hostId != null && selection.hostId != hostId) return
+            pendingSelection = null
+            pendingSelectionWrite = null
+            writeSelection(selection)
+        }
+    }
+
+    private fun writeSelection(selection: PendingSelection) {
+        val state = JSONObject()
+            .put("conversation", selection.selectedConversationId?.toString())
+            .put("project", selection.selectedProjectId?.toString())
+            .put("provider", selection.selectedProvider?.wire)
+            .put("model", selection.selectedModel)
+            .put("effort", selection.selectedEffort)
+            .put("permission", selection.selectedPermission)
+            .put("draft", selection.draft)
+            .put("pinned", JSONArray(selection.pinnedProjects.map(UUID::toString)))
+            .put("recent", JSONArray(selection.recentProjects.map(UUID::toString)))
+        preferences.edit().putString(stateKey(selection.hostId), state.toString()).apply()
     }
 
     private fun snapshotKey(hostId: UUID) = "snapshot_$hostId"
@@ -127,5 +192,11 @@ class ClientStateStore(context: Context) {
     companion object {
         private const val PREFERENCES = "agent_remote_client_state_v2"
         private const val LAST_HOST = "last_host"
+        private const val SELECTION_WRITE_DELAY_MS = 250L
+        private val selectionWriter = ScheduledThreadPoolExecutor(1) { runnable ->
+            Thread(runnable, "agent-remote-state-writer").apply { isDaemon = true }
+        }.apply {
+            removeOnCancelPolicy = true
+        }
     }
 }

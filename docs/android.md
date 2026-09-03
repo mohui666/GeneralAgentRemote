@@ -15,6 +15,21 @@ adb install -r dist\android\agent-remote-debug.apk
 
 The checked-in project uses Gradle Wrapper 9.4.1, Android Gradle Plugin 9.2.0, compile/target SDK 37, and minimum Android 8.0 (API 26).
 
+## AI-native real-device tests
+
+The debug APK contains an ADB-only command receiver that controls the live Android `RemoteViewModel`. It lets Codex or another development agent inspect connection/project/conversation state, select scopes, create or open conversations, set a draft, send/steer/interrupt, retry a connection, and capture deterministic diagnostics without relying only on screen coordinates.
+
+From `android/` on Windows:
+
+```powershell
+.\ai-native.ps1 install
+.\ai-native.ps1 launch
+.\ai-native.ps1 smoke
+.\ai-native.ps1 status
+```
+
+The receiver is omitted from release builds and protected by Android's `DUMP` permission. See [android-native-debug.md](android-native-debug.md) for the full command set and an end-to-end device test flow.
+
 ## USB test loop
 
 USB port reversal lets a connected phone reach a Host bound only to the computer's loopback interface. Enable USB debugging, accept the computer's RSA prompt, then run:
@@ -43,12 +58,17 @@ For use outside the LAN, configure the HTTPS/WSS Relay described in [public-rela
 dist\bin\agent-remote-host.exe pair --relay --base-url https://relay.example.com
 ```
 
+## Codex conversation storage
+
+Agent Remote does not invent a phone-side or project-local Codex conversation directory. Listing, creating, reading, and resuming Codex conversations go through the official `codex app-server` methods. The app-server remains responsible for its normal Codex session store and the Host's Codex environment; Agent Remote stores only scoped metadata and an offline client cache. This keeps conversations compatible with Codex CLI and other app-server clients using the same Codex installation.
+
 ## Expected phone behavior
 
 - A successful first pair immediately opens the Host snapshot and saves that Host in the connection screen.
 - Killing and reopening the app authenticates with the saved credential, restores the cached Host/Provider/project/conversation/settings/draft state, and does not reuse the pair token.
 - A dropped connection preserves the visible cached conversation, reports offline status, then reconnects with bounded backoff and fetches a fresh snapshot. The drawer can stop automatic retries or request an immediate retry.
-- Provider and project selection is scoped to the active Host. Switching Provider refreshes only its authorized projects and syncs the selected project's remote sessions.
+- Provider and project selection is scoped to the active Host. Switching Provider refreshes only its authorized projects and syncs the selected project's provider-managed sessions.
+- Project navigation expands conversations beneath each project instead of presenting detached conversation entries.
 - A new conversation is created on its first send. One unacknowledged send is retained across a reconnect and replayed with the same command ID.
 - Revoking the phone from `agent-remote-host device revoke <device-id>` makes the next authentication fail and removes the invalid local credential.
 - The QR scanner is opened only when the user taps **扫码** and does not require an app-level camera permission.
