@@ -30,7 +30,7 @@ The Host owns Provider processes, authorized project paths, native-session mappi
 
 ## Crate responsibilities
 
-- `agent-remote-protocol` contains wire-safe IDs, Provider capability summaries, conversations, timeline variants, attachment metadata, commands, server messages, and Relay frames. Application CBOR envelopes use protocol version `3`; the unchanged opaque Host↔Relay tunnel remains version `1`. Attachment and tunneled payload bytes use CBOR byte strings.
+- `agent-remote-protocol` contains wire-safe IDs, Provider capability summaries, conversations, timeline variants, attachment metadata, commands, server messages, and Relay frames. Application CBOR envelopes use protocol version `4`; the unchanged opaque Host↔Relay tunnel remains version `1`. Attachment and tunneled payload bytes use CBOR byte strings.
 - `agent-remote-host` validates project boundaries, persists state with SQLite, runs Provider protocol adapters, imports remote session history, merges history and streaming deltas by stable item ID/revision, serves the web application, authenticates direct clients, and maintains the optional outbound Relay tunnel.
 - `agent-remote-relay` maintains an in-memory `host_id -> Host connection` registry. Its per-Host and per-client channels are bounded. A slow client is closed and must reconnect for a Snapshot.
 - `agent-remote-web` is a Yew CSR application. It sends and receives only binary CBOR WebSocket frames. Device credentials are origin-scoped browser `localStorage` records; browsers do not expose an OS credential vault to WASM.

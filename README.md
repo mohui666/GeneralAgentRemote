@@ -25,6 +25,8 @@ Android / Browser ── HTTPS Relay ◀── outbound ── Host ── Codex
                                                    ├── Gemini / Copilot / OpenCode ACP
                                                    ├── Cursor / Cline / Goose ACP
                                                    ├── JetBrains Junie ACP
+                                                   ├── Qwen / Kimi / Kiro ACP
+                                                   ├── Mistral Vibe / Qoder ACP
                                                    └── authorized projects
 ```
 
@@ -43,7 +45,7 @@ APK 输出到 `dist/android/agent-remote-debug.apk`。完整说明见 [Android �
 
 ### 1. 构建
 
-构建只需要 Rust stable 和 `wasm32-unknown-unknown`。要实际开始远程对话，还需至少一个已经全局安装并完成本机认证的 Provider。Host 内置 Codex app-server 适配器，并提供 Grok、Claude Code、Gemini CLI、GitHub Copilot CLI、OpenCode、Cursor Agent、Cline、Goose 和 JetBrains Junie 的 ACP profile。各 Provider 相互独立，缺少某个命令不会阻止其他 Provider 工作。
+构建只需要 Rust stable 和 `wasm32-unknown-unknown`。要实际开始远程对话，还需至少一个已经全局安装并完成本机认证的 Provider。Host 内置 Codex app-server 适配器，并提供 Grok、Claude Code、Gemini CLI、GitHub Copilot CLI、OpenCode、Cursor Agent、Cline、Goose、JetBrains Junie、Qwen Code、Kimi CLI、Kiro CLI、Mistral Vibe 和 Qoder CLI 的 ACP profile。各 Provider 相互独立，缺少某个命令不会阻止其他 Provider 工作。
 
 Host 默认从 `PATH` 启动 Provider；也可用文档列出的 `AGENT_REMOTE_*_BIN` 环境变量指定已安装的可执行文件。Host 不会下载、安装、更新或登录任何 CLI。Claude Code profile 要求 `claude-agent-acp` 已经全局安装；Host 不会在运行时调用 `npx`。Provider 凭据继续由各 CLI 保存在 Host 电脑上，不进入 Host 数据库、Relay 或远程客户端。
 
@@ -106,6 +108,30 @@ cargo xtask provider-smoke
 | Cline | `cline --acp` | ⏭ SKIP：测试机未安装 |
 | Goose | `goose acp` | ⏭ SKIP：测试机未安装 |
 | JetBrains Junie | `junie --acp=true` | ⏭ SKIP：测试机未安装 |
+| Qwen Code | `qwen --acp` | ⏭ SKIP：测试机未安装 |
+| Kimi CLI | `kimi acp` | ⏭ SKIP：测试机未安装 |
+| Kiro CLI | `kiro-cli acp` | ⏭ SKIP：测试机未安装 |
+| Mistral Vibe | `vibe-acp` | ⏭ SKIP：测试机未安装 |
+| Qoder CLI | `qoder --acp` | ⏭ SKIP：测试机未安装 |
+
+本次 15-profile 全量重跑中，Codex 再次 PASS；新增五个 profile 均因 WSL 与 Windows 未安装对应 CLI 而 SKIP。OpenCode 的勾选保留自同日较早的真实回合记录，本次环境已无法重新定位该二进制。
+
+### Android 16 模拟器实测
+
+实测环境：**2026-09-04，Pixel 9 AVD `Pixel_9_API_36_1`，Android 16 / SDK 36，1080×2424 @ 420 dpi**。以下勾选均来自安装后的 Android 应用、隔离 Host 和真实 Codex Provider 链路。
+
+| 场景 | 实测结果 |
+|---|---|
+| 构建、保留数据安装、启动与前台 Activity | ✅ PASS |
+| 一次性链接配对并进入在线状态 | ✅ PASS |
+| 真实 Codex 发送与六阶段关联链 | ✅ PASS：首个 Provider 事件 17.264 秒 |
+| 第二次真实发送延迟 | ✅ PASS：首个 Provider 事件 6.494 秒 |
+| 项目树展开/折叠 | ✅ PASS：展开态显示 9 条会话 |
+| 强制停止后自动重连 | ✅ PASS：2.947 秒恢复认证在线 |
+| 竖屏与横屏布局 | ✅ PASS：逐图确认内容、输入框和控制项完整可见 |
+| 8 秒应用日志 | ✅ PASS：无崩溃、ANR 或协议错误 |
+
+本机启动 Android 16 AVD、跨 WSL 调用 Windows ADB、配对和场景命令已经写入 [`AGENTS.md`](AGENTS.md#13-android-16-emulator-test-tutorial)。
 
 需要由 Codex/AI 在电脑端驱动一台已明确连接的 Android 设备时，使用 `cargo xtask android-device doctor|prepare|inspect|ui|scenario|logs|capture`。该工具只通过本地 adb 和稳定 accessibility ID 执行开发测试，不会把远程终端能力加入产品；完整命令见 [Android 文档](docs/android.md#aicli-device-test-driver)。
 

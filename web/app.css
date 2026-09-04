@@ -82,6 +82,11 @@ input, select { min-height: 34px; padding: 0 9px; }
 .provider-badge.cline { color: #cce8ff; background: #21445d; }
 .provider-badge.goose { color: #ffd6ba; background: #61371f; }
 .provider-badge.junie { color: #e1d6ff; background: #49316b; }
+.provider-badge.qwen-code { color: #dff8ff; background: #175064; }
+.provider-badge.kimi-cli { color: #e8e0ff; background: #40326f; }
+.provider-badge.kiro-cli { color: #ffe1c2; background: #633b1f; }
+.provider-badge.mistral-vibe { color: #fff0b5; background: #624a16; }
+.provider-badge.qoder-cli { color: #d7ffe7; background: #20543a; }
 .conversation-copy { min-width: 0; }
 .conversation-copy strong, .conversation-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-copy strong { font-size: 11px; }

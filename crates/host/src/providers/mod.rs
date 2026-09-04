@@ -25,7 +25,7 @@ use crate::storage::Project;
 pub mod acp;
 pub mod codex;
 
-pub const BUILT_IN_PROVIDER_IDS: [ProviderId; 10] = ProviderId::ALL;
+pub const BUILT_IN_PROVIDER_IDS: [ProviderId; 15] = ProviderId::ALL;
 
 pub fn built_in_providers() -> Vec<Arc<dyn AgentProvider>> {
     vec![
@@ -39,6 +39,11 @@ pub fn built_in_providers() -> Vec<Arc<dyn AgentProvider>> {
         Arc::new(acp::AcpProvider::cline()),
         Arc::new(acp::AcpProvider::goose()),
         Arc::new(acp::AcpProvider::junie()),
+        Arc::new(acp::AcpProvider::qwen()),
+        Arc::new(acp::AcpProvider::kimi()),
+        Arc::new(acp::AcpProvider::kiro()),
+        Arc::new(acp::AcpProvider::vibe()),
+        Arc::new(acp::AcpProvider::qoder()),
     ]
 }
 

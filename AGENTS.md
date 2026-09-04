@@ -321,3 +321,103 @@ A task is complete only when:
 - relevant tests/checks pass, or exact pre-existing blockers are reported;
 - the diff is reviewed for duplicate listeners, state leakage, security regressions, and mobile layout regressions;
 - the final report lists implemented behavior, principal files changed, protocol/data-model changes, commands run, results, and remaining provider limitations.
+
+## 13. Android 16 emulator test tutorial
+
+Use the existing local Android 16 AVD for repeatable device tests when a physical phone is unavailable. On this workstation the verified AVD is `Pixel_9_API_36_1` (`android-36.1`, Google Play x86_64, Pixel 9) and its fixed serial is `emulator-5554`.
+
+Start it from Windows PowerShell and wait for Android to finish booting:
+
+```powershell
+$Sdk = Join-Path $env:LOCALAPPDATA "Android\Sdk"
+$Emulator = Join-Path $Sdk "emulator\emulator.exe"
+$Adb = Join-Path $Sdk "platform-tools\adb.exe"
+
+& $Emulator -list-avds
+Start-Process $Emulator -ArgumentList @(
+  '-avd', 'Pixel_9_API_36_1',
+  '-port', '5554',
+  '-no-window', '-no-audio', '-no-boot-anim', '-no-snapshot-save'
+)
+& $Adb -s emulator-5554 wait-for-device
+do {
+  Start-Sleep -Seconds 2
+  $Booted = (& $Adb -s emulator-5554 shell getprop sys.boot_completed).Trim()
+} until ($Booted -eq '1')
+& $Adb devices -l
+```
+
+The emulator belongs to the Windows ADB server and may not appear in WSL's Linux `adb`. In that case, create a temporary WSL wrapper that calls the Windows SDK tool and translates existing WSL file paths before `adb install`:
+
+```bash
+cat > /tmp/gar-adb-windows <<'PY'
+#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+
+ADB_EXE = subprocess.check_output(
+    [
+        "powershell.exe",
+        "-NoProfile",
+        "-Command",
+        '[Console]::Write((Join-Path $env:LOCALAPPDATA "Android\\Sdk\\platform-tools\\adb.exe"))',
+    ],
+    text=True,
+).strip()
+
+def translate(value: str) -> str:
+    if value.startswith("/") and os.path.exists(value):
+        return subprocess.check_output(["wslpath", "-w", value], text=True).strip()
+    return value
+
+def cmd_escape(value: str) -> str:
+    escaped = []
+    for char in value:
+        if char == "&":
+            escaped.append("\\^")
+        elif char in "^|<>() ":
+            escaped.append("^")
+        escaped.append(char)
+    return "".join(escaped)
+
+command_line = " ".join(
+    cmd_escape(value) for value in [ADB_EXE, *(translate(arg) for arg in sys.argv[1:])]
+)
+os.chdir("/mnt/c/Windows")
+os.execvp("cmd.exe", ["cmd.exe", "/d", "/s", "/c", command_line])
+PY
+chmod +x /tmp/gar-adb-windows
+export ADB=/tmp/gar-adb-windows
+$ADB devices -l
+```
+
+Run the repository driver from WSL. Use the same port for `prepare`, `adb reverse`, the pairing URL, and the Host listener. Keep the Host foreground process alive in a separate terminal; a short-lived command runner may clean up background children.
+
+```bash
+export DEVICE_SERIAL=emulator-5554
+export HOST_PORT=7437
+export HOST_DATA=/tmp/gar-emulator-host
+mkdir -p "$HOST_DATA"
+
+cargo xtask android-device --serial "$DEVICE_SERIAL" doctor --json
+cargo xtask android-device --serial "$DEVICE_SERIAL" prepare --port "$HOST_PORT" --json
+cargo xtask android-device --serial "$DEVICE_SERIAL" inspect --output dist/android-device/inspect --json
+
+# In a separate terminal, authorize a project, create a one-use pair link, and keep serve running.
+cargo run -p agent-remote-host -- --data-dir "$HOST_DATA" project add "$PWD" --provider codex
+cargo run -p agent-remote-host -- --data-dir "$HOST_DATA" pair --base-url "http://127.0.0.1:$HOST_PORT"
+cargo run -p agent-remote-host -- --data-dir "$HOST_DATA" serve --listen "127.0.0.1:$HOST_PORT" --web-root dist/web
+```
+
+Paste the complete pair link into the emulator app and tap **连接并配对**. Require `gar.connection.status` to show online before running real scenarios:
+
+```bash
+cargo xtask android-device --serial "$DEVICE_SERIAL" scenario --name send --mode real --json
+cargo xtask android-device --serial "$DEVICE_SERIAL" scenario --name project-tree --mode real --json
+cargo xtask android-device --serial "$DEVICE_SERIAL" scenario --name reconnect --mode real --json
+cargo xtask android-device --serial "$DEVICE_SERIAL" scenario --name layout --mode real --json
+cargo xtask android-device --serial "$DEVICE_SERIAL" capture --output dist/android-device/final --json
+```
+
+The real send scenario must report the correlated stages `click`, `local_pending`, `websocket_write`, `host_received`, `provider_received`, and `first_provider_event` for one command/message identity. Treat generated PNGs as evidence only after visually checking that the app is foreground, content is rendered, and both portrait and landscape are usable; screen bounds alone do not prove a valid render. Keep mock and real scenario results separate.

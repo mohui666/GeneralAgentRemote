@@ -1101,6 +1101,11 @@ fn parse_provider(value: &str) -> Result<ProviderId> {
         "cline" => Ok(ProviderId::Cline),
         "goose" => Ok(ProviderId::Goose),
         "junie" => Ok(ProviderId::Junie),
+        "qwen_code" => Ok(ProviderId::QwenCode),
+        "kimi_cli" => Ok(ProviderId::KimiCli),
+        "kiro_cli" => Ok(ProviderId::KiroCli),
+        "mistral_vibe" => Ok(ProviderId::MistralVibe),
+        "qoder_cli" => Ok(ProviderId::QoderCli),
         _ => bail!("unknown provider in database: {value}"),
     }
 }
@@ -1332,18 +1337,7 @@ mod tests {
 
     #[test]
     fn provider_database_names_round_trip() {
-        for provider in [
-            ProviderId::Codex,
-            ProviderId::Grok,
-            ProviderId::ClaudeCode,
-            ProviderId::GeminiCli,
-            ProviderId::CopilotCli,
-            ProviderId::OpenCode,
-            ProviderId::Cursor,
-            ProviderId::Cline,
-            ProviderId::Goose,
-            ProviderId::Junie,
-        ] {
+        for provider in ProviderId::ALL {
             assert_eq!(parse_provider(provider_name(provider)).unwrap(), provider);
         }
     }

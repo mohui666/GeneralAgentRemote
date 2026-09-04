@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const RELAY_PROTOCOL_VERSION: u16 = 1;
 
 macro_rules! uuid_id {
@@ -98,6 +98,11 @@ pub enum ProviderId {
     Cline,
     Goose,
     Junie,
+    QwenCode,
+    KimiCli,
+    KiroCli,
+    MistralVibe,
+    QoderCli,
 }
 
 impl fmt::Display for ProviderId {
@@ -113,12 +118,17 @@ impl fmt::Display for ProviderId {
             Self::Cline => formatter.write_str("Cline"),
             Self::Goose => formatter.write_str("Goose"),
             Self::Junie => formatter.write_str("JetBrains Junie"),
+            Self::QwenCode => formatter.write_str("Qwen Code"),
+            Self::KimiCli => formatter.write_str("Kimi CLI"),
+            Self::KiroCli => formatter.write_str("Kiro CLI"),
+            Self::MistralVibe => formatter.write_str("Mistral Vibe"),
+            Self::QoderCli => formatter.write_str("Qoder CLI"),
         }
     }
 }
 
 impl ProviderId {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 15] = [
         Self::Codex,
         Self::Grok,
         Self::ClaudeCode,
@@ -129,6 +139,11 @@ impl ProviderId {
         Self::Cline,
         Self::Goose,
         Self::Junie,
+        Self::QwenCode,
+        Self::KimiCli,
+        Self::KiroCli,
+        Self::MistralVibe,
+        Self::QoderCli,
     ];
 
     pub const fn wire_name(self) -> &'static str {
@@ -143,6 +158,11 @@ impl ProviderId {
             Self::Cline => "cline",
             Self::Goose => "goose",
             Self::Junie => "junie",
+            Self::QwenCode => "qwen_code",
+            Self::KimiCli => "kimi_cli",
+            Self::KiroCli => "kiro_cli",
+            Self::MistralVibe => "mistral_vibe",
+            Self::QoderCli => "qoder_cli",
         }
     }
 }

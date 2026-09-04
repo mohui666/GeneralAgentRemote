@@ -82,6 +82,16 @@ enum ProviderArg {
     Cline,
     Goose,
     Junie,
+    #[value(name = "qwen-code", alias = "qwen")]
+    QwenCode,
+    #[value(name = "kimi-cli", alias = "kimi")]
+    KimiCli,
+    #[value(name = "kiro-cli", alias = "kiro")]
+    KiroCli,
+    #[value(name = "mistral-vibe", alias = "vibe")]
+    MistralVibe,
+    #[value(name = "qoder-cli", alias = "qoder")]
+    QoderCli,
 }
 
 impl From<ProviderArg> for ProviderId {
@@ -97,6 +107,11 @@ impl From<ProviderArg> for ProviderId {
             ProviderArg::Cline => Self::Cline,
             ProviderArg::Goose => Self::Goose,
             ProviderArg::Junie => Self::Junie,
+            ProviderArg::QwenCode => Self::QwenCode,
+            ProviderArg::KimiCli => Self::KimiCli,
+            ProviderArg::KiroCli => Self::KiroCli,
+            ProviderArg::MistralVibe => Self::MistralVibe,
+            ProviderArg::QoderCli => Self::QoderCli,
         }
     }
 }

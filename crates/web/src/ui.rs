@@ -25,7 +25,7 @@ use crate::{
 const CREDENTIALS_KEY: &str = "agent_remote_credentials_v1";
 const LAST_HOST_KEY: &str = "agent_remote_last_host_v2";
 const CACHE_PREFIX: &str = "agent_remote_cache_v2_";
-const WS_SUBPROTOCOL: &str = "agent-remote.cbor.v3";
+const WS_SUBPROTOCOL: &str = "agent-remote.cbor.v4";
 const MAX_RECONNECT_ATTEMPTS: u8 = 6;
 const CACHE_VERSION: u16 = 3;
 const CACHE_WRITE_DELAY_MS: i32 = 250;
@@ -3158,6 +3158,11 @@ fn provider_short(provider: ProviderId) -> &'static str {
         ProviderId::Cline => "Cn",
         ProviderId::Goose => "Go",
         ProviderId::Junie => "Jn",
+        ProviderId::QwenCode => "Qw",
+        ProviderId::KimiCli => "Km",
+        ProviderId::KiroCli => "Kr",
+        ProviderId::MistralVibe => "MV",
+        ProviderId::QoderCli => "Qd",
     }
 }
 fn provider_class(provider: ProviderId) -> &'static str {
@@ -3172,6 +3177,11 @@ fn provider_class(provider: ProviderId) -> &'static str {
         ProviderId::Cline => "cline",
         ProviderId::Goose => "goose",
         ProviderId::Junie => "junie",
+        ProviderId::QwenCode => "qwen-code",
+        ProviderId::KimiCli => "kimi-cli",
+        ProviderId::KiroCli => "kiro-cli",
+        ProviderId::MistralVibe => "mistral-vibe",
+        ProviderId::QoderCli => "qoder-cli",
     }
 }
 fn state_label(state: ConversationState) -> &'static str {
@@ -3291,6 +3301,11 @@ fn provider_label(provider: ProviderId) -> &'static str {
         ProviderId::Cline => "Cline",
         ProviderId::Goose => "Goose",
         ProviderId::Junie => "JetBrains Junie",
+        ProviderId::QwenCode => "Qwen Code",
+        ProviderId::KimiCli => "Kimi CLI",
+        ProviderId::KiroCli => "Kiro CLI",
+        ProviderId::MistralVibe => "Mistral Vibe",
+        ProviderId::QoderCli => "Qoder CLI",
     }
 }
 

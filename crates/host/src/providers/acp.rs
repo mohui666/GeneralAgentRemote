@@ -196,6 +196,56 @@ impl AcpProviderConfig {
             &["--version"],
         )
     }
+
+    pub fn qwen() -> Self {
+        Self::new(
+            ProviderId::QwenCode,
+            "Qwen Code",
+            configured_executable("AGENT_REMOTE_QWEN_BIN", "qwen"),
+            &["--acp"],
+            &["--version"],
+        )
+    }
+
+    pub fn kimi() -> Self {
+        Self::new(
+            ProviderId::KimiCli,
+            "Kimi CLI",
+            configured_executable("AGENT_REMOTE_KIMI_BIN", "kimi"),
+            &["acp"],
+            &["--version"],
+        )
+    }
+
+    pub fn kiro() -> Self {
+        Self::new(
+            ProviderId::KiroCli,
+            "Kiro CLI",
+            configured_executable("AGENT_REMOTE_KIRO_BIN", "kiro-cli"),
+            &["acp"],
+            &["--version"],
+        )
+    }
+
+    pub fn vibe() -> Self {
+        Self::new(
+            ProviderId::MistralVibe,
+            "Mistral Vibe",
+            configured_executable("AGENT_REMOTE_VIBE_BIN", "vibe-acp"),
+            &[],
+            &["--version"],
+        )
+    }
+
+    pub fn qoder() -> Self {
+        Self::new(
+            ProviderId::QoderCli,
+            "Qoder CLI",
+            configured_executable("AGENT_REMOTE_QODER_BIN", "qoder"),
+            &["--acp"],
+            &["--version"],
+        )
+    }
 }
 
 fn configured_executable(variable: &str, fallback: &str) -> PathBuf {
@@ -661,6 +711,26 @@ impl AcpProvider {
 
     pub fn junie() -> Self {
         Self::from_config(AcpProviderConfig::junie())
+    }
+
+    pub fn qwen() -> Self {
+        Self::from_config(AcpProviderConfig::qwen())
+    }
+
+    pub fn kimi() -> Self {
+        Self::from_config(AcpProviderConfig::kimi())
+    }
+
+    pub fn kiro() -> Self {
+        Self::from_config(AcpProviderConfig::kiro())
+    }
+
+    pub fn vibe() -> Self {
+        Self::from_config(AcpProviderConfig::vibe())
+    }
+
+    pub fn qoder() -> Self {
+        Self::from_config(AcpProviderConfig::qoder())
     }
 
     pub fn new() -> Self {
@@ -2806,6 +2876,11 @@ fn provider_slug(provider: ProviderId) -> &'static str {
         ProviderId::Cline => "cline",
         ProviderId::Goose => "goose",
         ProviderId::Junie => "junie",
+        ProviderId::QwenCode => "qwen-code",
+        ProviderId::KimiCli => "kimi-cli",
+        ProviderId::KiroCli => "kiro-cli",
+        ProviderId::MistralVibe => "mistral-vibe",
+        ProviderId::QoderCli => "qoder-cli",
     }
 }
 
@@ -3048,6 +3123,41 @@ mod tests {
                 ProviderId::Junie,
                 "JetBrains Junie",
                 vec!["--acp=true"],
+                None,
+            ),
+            (
+                AcpProviderConfig::qwen(),
+                ProviderId::QwenCode,
+                "Qwen Code",
+                vec!["--acp"],
+                None,
+            ),
+            (
+                AcpProviderConfig::kimi(),
+                ProviderId::KimiCli,
+                "Kimi CLI",
+                vec!["acp"],
+                None,
+            ),
+            (
+                AcpProviderConfig::kiro(),
+                ProviderId::KiroCli,
+                "Kiro CLI",
+                vec!["acp"],
+                None,
+            ),
+            (
+                AcpProviderConfig::vibe(),
+                ProviderId::MistralVibe,
+                "Mistral Vibe",
+                vec![],
+                None,
+            ),
+            (
+                AcpProviderConfig::qoder(),
+                ProviderId::QoderCli,
+                "Qoder CLI",
+                vec!["--acp"],
                 None,
             ),
         ];

@@ -16,6 +16,11 @@ Evidence date: **2026-09-04**. GeneralAgentRemote has one built-in Codex app-ser
 | Cline | `cline` | `cline --acp` | when ACP `session/list` is advertised |
 | Goose | `goose` | `goose acp` | when ACP `session/list` is advertised |
 | JetBrains Junie | `junie` | `junie --acp=true` | when ACP `session/list` is advertised |
+| Qwen Code | `qwen_code` | `qwen --acp` | when ACP `session/list` is advertised |
+| Kimi CLI | `kimi_cli` | `kimi acp` | when ACP `session/list` is advertised |
+| Kiro CLI | `kiro_cli` | `kiro-cli acp` | when ACP `session/list` is advertised |
+| Mistral Vibe | `mistral_vibe` | `vibe-acp` | when ACP `session/list` is advertised |
+| Qoder CLI | `qoder_cli` | `qoder --acp` | when ACP `session/list` is advertised |
 
 The Host resolves each executable from `PATH` by default. An administrator may point a profile at an already-installed executable with the profile-specific `AGENT_REMOTE_*_BIN` variables documented in [Host setup](setup.md). It does not install, download, auto-update, or authenticate them. The user or Host administrator owns installation, Provider login, subscriptions, API keys, quotas, and billing. Credentials remain in each Provider's own Host-side store and never enter GeneralAgentRemote persistence or cross the Relay.
 
@@ -85,6 +90,11 @@ ACP session history is a controlled full-replay fallback because the supported a
 - **Cline:** the profile launches `cline --acp`. Provider/model/thinking and auto-approval options remain driven by the CLI's ACP session options and permission requests.
 - **Goose:** the profile launches `goose acp`. Model/provider selection remains in Goose configuration unless the running version advertises a standard session option.
 - **JetBrains Junie:** the profile launches `junie --acp=true`; its session and approval capabilities are exposed only when negotiated.
+- **Qwen Code:** the profile launches the stable `qwen --acp` entry point. Sessions, modes, model choices, approvals, and filesystem or terminal calls are exposed only through negotiated ACP capabilities.
+- **Kimi CLI:** the profile launches the multi-session `kimi acp` entry point and reuses Kimi's Host-side login. Session list/load and model/thinking options are consumed only when the running CLI advertises them.
+- **Kiro CLI:** the profile launches `kiro-cli acp`. Standard sessions, streamed updates, permissions, and config options flow through the common adapter; `_kiro.dev/*` extensions are ignored.
+- **Mistral Vibe:** the profile launches the dedicated `vibe-acp` executable. GeneralAgentRemote does not start or parse Vibe's interactive terminal UI.
+- **Qoder CLI:** the profile launches `qoder --acp` and reuses Qoder's Host-side login or `QODER_PERSONAL_ACCESS_TOKEN`. Permission modes and other controls remain capability-driven.
 
 ACP has no portable rename or mid-turn steer operation in the implemented baseline. Those controls remain disabled unless an exact profile advertises and implements a compatible operation.
 
@@ -106,7 +116,7 @@ Real-turn evidence collected on 2026-09-04:
 
 - **Codex 0.150.1: PASS.** The Host adapter received the exact marker from the installed WSL CLI.
 - **OpenCode 1.18.25: PASS.** The same Host ACP adapter received the exact marker from the installed Windows CLI in a temporary authorized directory, using `AGENT_REMOTE_OPENCODE_BIN` to select that executable.
-- **Claude Code, Gemini CLI, GitHub Copilot CLI, Cursor Agent, Cline, Goose, and JetBrains Junie: SKIP.** Their protocol executables were not installed in the tested WSL or Windows environments.
+- **Claude Code, Gemini CLI, GitHub Copilot CLI, Cursor Agent, Cline, Goose, JetBrains Junie, Qwen Code, Kimi CLI, Kiro CLI, Mistral Vibe, and Qoder CLI: SKIP.** Their protocol executables were not installed in the tested WSL or Windows environments.
 - **Grok 1.0.13 cross-OS probe: FAIL.** Launching the Windows Grok executable from a WSL Host rejected the WSL temporary path as non-absolute. This result does not establish failure on a matching-platform Windows Host or with Grok installed inside WSL.
 
 These real Provider results are separate from automated tests and physical-device evidence; another API, a fake model, or TUI parsing is never substituted for a skipped Provider.

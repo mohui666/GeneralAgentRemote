@@ -27,6 +27,11 @@ Provider credentials remain in the Provider-owned store on the Host. GeneralAgen
 | Cline | `cline` | `cline --acp` |
 | Goose | `goose` | `goose acp` |
 | JetBrains Junie | `junie` | `junie --acp=true` |
+| Qwen Code | `qwen` | `qwen --acp` |
+| Kimi CLI | `kimi` | `kimi acp` |
+| Kiro CLI | `kiro-cli` | `kiro-cli acp` |
+| Mistral Vibe | `vibe-acp` | `vibe-acp` |
+| Qoder CLI | `qoder` | `qoder --acp` |
 
 `PATH` is the default. These optional variables select an already-installed executable when a Host service has a different `PATH` or an administrator needs an explicit location:
 
@@ -40,6 +45,11 @@ $env:AGENT_REMOTE_CURSOR_BIN = "C:\path\to\agent.exe"
 $env:AGENT_REMOTE_CLINE_BIN = "C:\path\to\cline.cmd"
 $env:AGENT_REMOTE_GOOSE_BIN = "C:\path\to\goose.exe"
 $env:AGENT_REMOTE_JUNIE_BIN = "C:\path\to\junie.cmd"
+$env:AGENT_REMOTE_QWEN_BIN = "C:\path\to\qwen.cmd"
+$env:AGENT_REMOTE_KIMI_BIN = "C:\path\to\kimi.exe"
+$env:AGENT_REMOTE_KIRO_BIN = "C:\path\to\kiro-cli.exe"
+$env:AGENT_REMOTE_VIBE_BIN = "C:\path\to\vibe-acp.exe"
+$env:AGENT_REMOTE_QODER_BIN = "C:\path\to\qoder.cmd"
 ```
 
 Run the Host and Provider in the same operating-system path domain. A Windows Provider launched by a WSL Host may reject `/mnt/...` project or temporary paths even when stdio itself works.
@@ -63,6 +73,11 @@ agent --version
 cline --version
 goose --version
 junie --version
+qwen --version
+kimi --version
+kiro-cli --version
+vibe-acp --version
+qoder --version
 ```
 
 Authenticate with each Provider's own supported login command before its real smoke test.
@@ -72,14 +87,14 @@ For Cursor, run `agent login`; the Host then uses the advertised ACP `cursor_log
 
 ```powershell
 dist\bin\agent-remote-host.exe project add C:\work\my-project --name "My project"
-dist\bin\agent-remote-host.exe project set-providers <project-id> --provider codex --provider opencode --provider cursor --provider cline
+dist\bin\agent-remote-host.exe project set-providers <project-id> --provider codex --provider opencode --provider qwen-code --provider kimi-cli
 dist\bin\agent-remote-host.exe project list
 dist\bin\agent-remote-host.exe project remove <project-id>
 ```
 
-Project paths are canonicalized when added. If `project add` omits every `--provider` flag, all ten built-in profiles are enabled. `set-providers` replaces the enabled set for an existing project. If a directory is moved or removed, it is shown invalid and is not silently replaced.
+Project paths are canonicalized when added. If `project add` omits every `--provider` flag, all 15 built-in profiles are enabled. `set-providers` replaces the enabled set for an existing project. If a directory is moved or removed, it is shown invalid and is not silently replaced.
 
-The `--provider` values are `codex`, `grok`, `claude-code`, `gemini-cli`, `copilot-cli`, `opencode`, `cursor`, `cline`, `goose`, and `junie`. Their versioned wire/database values use underscores for `claude_code`, `gemini_cli`, `copilot_cli`, and `open_code`; the other names are unchanged.
+The `--provider` values are `codex`, `grok`, `claude-code`, `gemini-cli`, `copilot-cli`, `opencode`, `cursor`, `cline`, `goose`, `junie`, `qwen-code`, `kimi-cli`, `kiro-cli`, `mistral-vibe`, and `qoder-cli`. Their versioned wire/database values are `codex`, `grok`, `claude_code`, `gemini_cli`, `copilot_cli`, `open_code`, `cursor`, `cline`, `goose`, `junie`, `qwen_code`, `kimi_cli`, `kiro_cli`, `mistral_vibe`, and `qoder_cli`.
 
 ## Direct localhost
 

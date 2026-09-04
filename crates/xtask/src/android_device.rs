@@ -1631,8 +1631,10 @@ fn scenario_layout(
 
     let run_result: Result<_> = (|| {
         set_rotation(adb, serial, "0")?;
-        let (portrait_xml, _, portrait_width, portrait_height) =
+        let (_, _, portrait_width, portrait_height) =
             wait_for_orientation(adb, serial, false, Duration::from_secs(8))?;
+        thread::sleep(Duration::from_millis(750));
+        let portrait_xml = dump_ui_xml(adb, serial)?;
         let portrait_xml_path = directory.join("portrait.xml");
         let portrait_screen_path = directory.join("portrait.png");
         fs::write(&portrait_xml_path, portrait_xml)
@@ -1641,8 +1643,10 @@ fn scenario_layout(
             .with_context(|| format!("write {}", portrait_screen_path.display()))?;
 
         set_rotation(adb, serial, "1")?;
-        let (landscape_xml, _, landscape_width, landscape_height) =
+        let (_, _, landscape_width, landscape_height) =
             wait_for_orientation(adb, serial, true, Duration::from_secs(8))?;
+        thread::sleep(Duration::from_millis(750));
+        let landscape_xml = dump_ui_xml(adb, serial)?;
         let landscape_xml_path = directory.join("landscape.xml");
         let landscape_screen_path = directory.join("landscape.png");
         fs::write(&landscape_xml_path, landscape_xml)
