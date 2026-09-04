@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const RELAY_PROTOCOL_VERSION: u16 = 1;
 
 macro_rules! uuid_id {
@@ -90,6 +90,14 @@ pub struct ClientAttachment {
 pub enum ProviderId {
     Codex,
     Grok,
+    ClaudeCode,
+    GeminiCli,
+    CopilotCli,
+    OpenCode,
+    Cursor,
+    Cline,
+    Goose,
+    Junie,
 }
 
 impl fmt::Display for ProviderId {
@@ -97,6 +105,44 @@ impl fmt::Display for ProviderId {
         match self {
             Self::Codex => formatter.write_str("Codex"),
             Self::Grok => formatter.write_str("Grok"),
+            Self::ClaudeCode => formatter.write_str("Claude Code"),
+            Self::GeminiCli => formatter.write_str("Gemini CLI"),
+            Self::CopilotCli => formatter.write_str("GitHub Copilot"),
+            Self::OpenCode => formatter.write_str("OpenCode"),
+            Self::Cursor => formatter.write_str("Cursor Agent"),
+            Self::Cline => formatter.write_str("Cline"),
+            Self::Goose => formatter.write_str("Goose"),
+            Self::Junie => formatter.write_str("JetBrains Junie"),
+        }
+    }
+}
+
+impl ProviderId {
+    pub const ALL: [Self; 10] = [
+        Self::Codex,
+        Self::Grok,
+        Self::ClaudeCode,
+        Self::GeminiCli,
+        Self::CopilotCli,
+        Self::OpenCode,
+        Self::Cursor,
+        Self::Cline,
+        Self::Goose,
+        Self::Junie,
+    ];
+
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Grok => "grok",
+            Self::ClaudeCode => "claude_code",
+            Self::GeminiCli => "gemini_cli",
+            Self::CopilotCli => "copilot_cli",
+            Self::OpenCode => "open_code",
+            Self::Cursor => "cursor",
+            Self::Cline => "cline",
+            Self::Goose => "goose",
+            Self::Junie => "junie",
         }
     }
 }

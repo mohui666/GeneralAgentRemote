@@ -22,7 +22,7 @@ use uuid::Uuid;
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 64;
 const MAX_RELAY_MESSAGE_BYTES: usize = 12 * 1024 * 1024;
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
-const APP_SUBPROTOCOL: &str = "agent-remote.cbor.v2";
+const APP_SUBPROTOCOL: &str = "agent-remote.cbor.v3";
 const RELAY_SUBPROTOCOL: &str = "agent-remote-relay.cbor.v1";
 
 #[derive(Clone)]

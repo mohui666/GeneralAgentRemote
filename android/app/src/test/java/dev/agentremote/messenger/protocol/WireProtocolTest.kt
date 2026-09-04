@@ -36,6 +36,27 @@ class WireProtocolTest {
     private val mapper = ObjectMapper(CBORFactory())
 
     @Test
+    fun providerIdsExposeStableWireValuesAndLabels() {
+        val expected = listOf(
+            "codex" to "Codex",
+            "grok" to "Grok",
+            "claude_code" to "Claude Code",
+            "gemini_cli" to "Gemini CLI",
+            "copilot_cli" to "GitHub Copilot",
+            "open_code" to "OpenCode",
+            "cursor" to "Cursor Agent",
+            "cline" to "Cline",
+            "goose" to "Goose",
+            "junie" to "JetBrains Junie",
+        )
+
+        assertEquals(expected, ProviderId.entries.map { it.wire to it.label })
+        ProviderId.entries.forEach { provider ->
+            assertEquals(provider, ProviderId.fromWire(provider.wire))
+        }
+    }
+
+    @Test
     fun parsesDirectAndRelayPairLinks() {
         val hostId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
         val direct = WireProtocol.parsePairLink(
@@ -61,7 +82,7 @@ class WireProtocolTest {
             StoredCredential(hostId, deviceId, "secret", "https://host", false, "Host"),
         )
         val root: JsonNode = mapper.readTree(bytes)
-        assertEquals(2, root["protocol_version"].asInt())
+        assertEquals(3, root["protocol_version"].asInt())
         assertEquals("authenticate", root["message"]["type"].asText())
         assertArrayEquals(uuidBytes(hostId), root["message"]["host_id"].binaryValue())
         assertArrayEquals(uuidBytes(deviceId), root["message"]["device_id"].binaryValue())
@@ -71,7 +92,7 @@ class WireProtocolTest {
     fun decodesHostStatusBeforeRelayAuthentication() {
         val hostId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
         val root = mapper.createObjectNode().apply {
-            put("protocol_version", 2)
+            put("protocol_version", 3)
             set<JsonNode>("message", mapper.createObjectNode().apply {
                 put("type", "host_status")
                 set<JsonNode>("host_id", mapper.nodeFactory.binaryNode(uuidBytes(hostId)))
@@ -93,7 +114,7 @@ class WireProtocolTest {
         val targetHostId = uuid(1)
         val otherHostId = uuid(2)
         val root = mapper.createObjectNode().apply {
-            put("protocol_version", 2)
+            put("protocol_version", 3)
             set<JsonNode>("message", mapper.createObjectNode().apply {
                 put("type", "host_status")
                 set<JsonNode>("host_id", mapper.nodeFactory.binaryNode(uuidBytes(otherHostId)))
@@ -114,7 +135,7 @@ class WireProtocolTest {
         val commandId = uuid(2)
         val conversationId = uuid(3)
         val root = mapper.createObjectNode().apply {
-            put("protocol_version", 2)
+            put("protocol_version", 3)
             set<JsonNode>("message", mapper.createObjectNode().apply {
                 put("type", "send_trace")
                 set<JsonNode>("command_id", mapper.nodeFactory.binaryNode(uuidBytes(commandId)))
@@ -240,7 +261,7 @@ class WireProtocolTest {
                     id = projectId,
                     displayName = "GeneralAgentRemote",
                     shortPath = "~/GeneralAgentRemote",
-                    enabledProviders = listOf(ProviderId.CODEX, ProviderId.GROK),
+                    enabledProviders = ProviderId.entries,
                     valid = true,
                     lastActivityAtMs = 9_001L,
                     conversationCount = 1,

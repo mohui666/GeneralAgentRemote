@@ -25,7 +25,7 @@ use crate::{
 const CREDENTIALS_KEY: &str = "agent_remote_credentials_v1";
 const LAST_HOST_KEY: &str = "agent_remote_last_host_v2";
 const CACHE_PREFIX: &str = "agent_remote_cache_v2_";
-const WS_SUBPROTOCOL: &str = "agent-remote.cbor.v2";
+const WS_SUBPROTOCOL: &str = "agent-remote.cbor.v3";
 const MAX_RECONNECT_ATTEMPTS: u8 = 6;
 const CACHE_VERSION: u16 = 3;
 const CACHE_WRITE_DELAY_MS: i32 = 250;
@@ -954,13 +954,14 @@ impl App {
                 <span class="collapsible-copy">{"Agent"}</span>
                 <select aria-label="选择 Agent" onchange={link.callback(|event: Event| {
                     let value = event.target_unchecked_into::<HtmlSelectElement>().value();
-                    Msg::SelectProvider(if value == "grok" { ProviderId::Grok } else { ProviderId::Codex })
+                    let provider = ProviderId::ALL
+                        .into_iter()
+                        .find(|provider| provider.wire_name() == value)
+                        .unwrap_or(ProviderId::Codex);
+                    Msg::SelectProvider(provider)
                 })}>
                     {for providers.iter().map(|provider| {
-                        let value = match provider {
-                            ProviderId::Codex => "codex",
-                            ProviderId::Grok => "grok",
-                        };
+                        let value = provider.wire_name();
                         html! {<option value={value} selected={self.selected_provider == *provider}>{provider_label(*provider)}</option>}
                     })}
                 </select>
@@ -3147,14 +3148,30 @@ fn nonempty(value: String) -> Option<String> {
 }
 fn provider_short(provider: ProviderId) -> &'static str {
     match provider {
-        ProviderId::Codex => "C",
-        ProviderId::Grok => "G",
+        ProviderId::Codex => "Cd",
+        ProviderId::Grok => "Gr",
+        ProviderId::ClaudeCode => "Cl",
+        ProviderId::GeminiCli => "Ge",
+        ProviderId::CopilotCli => "CP",
+        ProviderId::OpenCode => "OC",
+        ProviderId::Cursor => "Cu",
+        ProviderId::Cline => "Cn",
+        ProviderId::Goose => "Go",
+        ProviderId::Junie => "Jn",
     }
 }
 fn provider_class(provider: ProviderId) -> &'static str {
     match provider {
         ProviderId::Codex => "codex",
         ProviderId::Grok => "grok",
+        ProviderId::ClaudeCode => "claude-code",
+        ProviderId::GeminiCli => "gemini-cli",
+        ProviderId::CopilotCli => "copilot-cli",
+        ProviderId::OpenCode => "open-code",
+        ProviderId::Cursor => "cursor",
+        ProviderId::Cline => "cline",
+        ProviderId::Goose => "goose",
+        ProviderId::Junie => "junie",
     }
 }
 fn state_label(state: ConversationState) -> &'static str {
@@ -3251,7 +3268,7 @@ fn markdown_html(markdown: &str) -> Html {
 }
 
 fn available_providers(snapshot: &Snapshot) -> Vec<ProviderId> {
-    [ProviderId::Codex, ProviderId::Grok]
+    ProviderId::ALL
         .into_iter()
         .filter(|provider| {
             snapshot
@@ -3266,6 +3283,14 @@ fn provider_label(provider: ProviderId) -> &'static str {
     match provider {
         ProviderId::Codex => "Codex",
         ProviderId::Grok => "Grok",
+        ProviderId::ClaudeCode => "Claude Code",
+        ProviderId::GeminiCli => "Gemini CLI",
+        ProviderId::CopilotCli => "GitHub Copilot",
+        ProviderId::OpenCode => "OpenCode",
+        ProviderId::Cursor => "Cursor Agent",
+        ProviderId::Cline => "Cline",
+        ProviderId::Goose => "Goose",
+        ProviderId::Junie => "JetBrains Junie",
     }
 }
 

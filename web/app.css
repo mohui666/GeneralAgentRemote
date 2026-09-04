@@ -74,6 +74,14 @@ input, select { min-height: 34px; padding: 0 9px; }
 .provider-badge { display: grid; place-items: center; flex: 0 0 24px; height: 24px; border-radius: 7px; font-size: 9px; font-weight: 900; }
 .provider-badge.codex { color: #baf7dc; background: #174234; }
 .provider-badge.grok { color: #cfe0ff; background: #223c67; }
+.provider-badge.claude-code { color: #ffd8bc; background: #54301f; }
+.provider-badge.gemini-cli { color: #d8dcff; background: #34366b; }
+.provider-badge.copilot-cli { color: #e3d4ff; background: #493064; }
+.provider-badge.open-code { color: #ffe7a3; background: #514018; }
+.provider-badge.cursor { color: #f1f1f1; background: #373737; }
+.provider-badge.cline { color: #cce8ff; background: #21445d; }
+.provider-badge.goose { color: #ffd6ba; background: #61371f; }
+.provider-badge.junie { color: #e1d6ff; background: #49316b; }
 .conversation-copy { min-width: 0; }
 .conversation-copy strong, .conversation-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-copy strong { font-size: 11px; }

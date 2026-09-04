@@ -22,8 +22,25 @@ use tokio::sync::{Notify, broadcast};
 
 use crate::storage::Project;
 
+pub mod acp;
 pub mod codex;
-pub mod grok;
+
+pub const BUILT_IN_PROVIDER_IDS: [ProviderId; 10] = ProviderId::ALL;
+
+pub fn built_in_providers() -> Vec<Arc<dyn AgentProvider>> {
+    vec![
+        Arc::new(codex::CodexProvider::new()),
+        Arc::new(acp::AcpProvider::grok()),
+        Arc::new(acp::AcpProvider::claude()),
+        Arc::new(acp::AcpProvider::gemini()),
+        Arc::new(acp::AcpProvider::copilot()),
+        Arc::new(acp::AcpProvider::opencode()),
+        Arc::new(acp::AcpProvider::cursor()),
+        Arc::new(acp::AcpProvider::cline()),
+        Arc::new(acp::AcpProvider::goose()),
+        Arc::new(acp::AcpProvider::junie()),
+    ]
+}
 
 #[derive(Debug, Clone)]
 pub struct CreateSession {
@@ -125,6 +142,13 @@ pub struct SetSessionOption {
 pub struct NativeSession {
     pub native_session_id: String,
     pub title: String,
+    pub selected_model: Option<String>,
+    pub selected_effort: Option<String>,
+    pub session_options: Vec<SessionOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOptionsSnapshot {
     pub selected_model: Option<String>,
     pub selected_effort: Option<String>,
     pub session_options: Vec<SessionOption>,
@@ -239,6 +263,11 @@ pub enum ProviderEventKind {
         change_kind: String,
         status: ItemStatus,
     },
+    SessionOptionsChanged {
+        session_options: Vec<SessionOption>,
+        selected_model: Option<String>,
+        selected_effort: Option<String>,
+    },
     Approval {
         provider_request_id: String,
         prompt: String,
@@ -341,6 +370,13 @@ pub trait AgentProvider: Send + Sync {
     async fn interrupt(&self, request: InterruptSession) -> Result<CommandAck>;
     async fn resolve_approval(&self, request: ResolveApproval) -> Result<CommandAck>;
     async fn set_session_option(&self, request: SetSessionOption) -> Result<CommandAck>;
+    fn session_options_snapshot(
+        &self,
+        _conversation_id: ConversationId,
+        _native_session_id: &str,
+    ) -> Option<SessionOptionsSnapshot> {
+        None
+    }
 }
 
 #[derive(Clone, Default)]
@@ -384,7 +420,16 @@ pub fn effort_options(values: impl IntoIterator<Item = String>) -> Vec<EffortOpt
 mod tests {
     use std::time::Duration;
 
-    use super::ProviderHistoryBarrier;
+    use super::{BUILT_IN_PROVIDER_IDS, ProviderHistoryBarrier, built_in_providers};
+
+    #[test]
+    fn built_in_provider_factory_matches_the_public_id_list() {
+        let ids = built_in_providers()
+            .into_iter()
+            .map(|provider| provider.id())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, BUILT_IN_PROVIDER_IDS);
+    }
 
     #[tokio::test]
     async fn history_barrier_reports_a_lagged_replay() {

@@ -1,15 +1,25 @@
 # Provider compatibility baseline
 
-Evidence date: **2026-09-01**. The implementation follows the installed versions when they differ from examples in upstream prose.
+Evidence date: **2026-09-04**. GeneralAgentRemote has one built-in Codex app-server adapter and a shared ACP v1 adapter with explicit profiles. The implementation follows the installed Provider's negotiated schema and capabilities when they differ from upstream prose.
 
-## Local tools
+## Supported Provider processes
 
-| Provider | Installed CLI | Protocol entry point | Result of Gate 0 probe |
-|---|---:|---|---|
-| OpenAI Codex | `codex-cli 0.150.1` | `codex app-server --stdio` | Initialization, `account/read`, `model/list`, and cwd-filtered `thread/list` succeeded without creating a thread |
-| Grok Build | `grok 1.0.13 (5e9a58528b76)` | `grok --no-auto-update agent stdio` | ACP v1 initialization succeeded; local model metadata reported Grok 4.6 and 4.5 |
+| Provider | Wire/database ID | Protocol process | Existing-session discovery |
+|---|---|---|---|
+| OpenAI Codex | `codex` | `codex app-server --stdio` | paginated `thread/list` |
+| Grok Build | `grok` | `grok --no-auto-update agent stdio` | when ACP `session/list` is advertised |
+| Claude Code | `claude_code` | globally installed `claude-agent-acp` bridge | when ACP `session/list` is advertised |
+| Gemini CLI | `gemini_cli` | `gemini --acp` | unavailable in the current ACP capability set |
+| GitHub Copilot CLI | `copilot_cli` | `copilot --acp --stdio --no-auto-update` | when ACP `session/list` is advertised |
+| OpenCode | `open_code` | `opencode acp` | when ACP `session/list` is advertised |
+| Cursor Agent | `cursor` | `agent acp` | when ACP `session/list` is advertised |
+| Cline | `cline` | `cline --acp` | when ACP `session/list` is advertised |
+| Goose | `goose` | `goose acp` | when ACP `session/list` is advertised |
+| JetBrains Junie | `junie` | `junie --acp=true` | when ACP `session/list` is advertised |
 
-`Trunk` and `wasm-pack` were not globally installed. The repository uses a pinned local Trunk tool through `xtask`.
+The Host resolves each executable from `PATH` by default. An administrator may point a profile at an already-installed executable with the profile-specific `AGENT_REMOTE_*_BIN` variables documented in [Host setup](setup.md). It does not install, download, auto-update, or authenticate them. The user or Host administrator owns installation, Provider login, subscriptions, API keys, quotas, and billing. Credentials remain in each Provider's own Host-side store and never enter GeneralAgentRemote persistence or cross the Relay.
+
+The Claude profile specifically requires `claude-agent-acp` to be installed globally, for example from `@agentclientprotocol/claude-agent-acp`. A runtime `npx` download is not a supported fallback.
 
 ## Codex 0.150.1
 
@@ -45,27 +55,58 @@ The exact local schema was generated with `codex app-server generate-json-schema
 
 Codex itself remains the only authority for physical session files and resolves its normal store from its own configuration or `CODEX_HOME`. GeneralAgentRemote passes the authorized project cwd to start/resume/turn calls for logical ownership and execution, but it does not create a per-project session store or scan, parse, copy, move, or rewrite `.codex/sessions`.
 
-## Grok Build 1.0.13 and ACP v1
+## Shared ACP v1 adapter
 
-The adapter follows the official [ACP v1 specification](https://agentclientprotocol.com/protocol/v1) and uses the official [Rust SDK](https://github.com/agentclientprotocol/rust-sdk) with stable ACP v1 types. It starts Grok in protocol mode, not headless/TUI output mode.
+The ACP profiles follow the official [ACP v1 specification](https://agentclientprotocol.com/protocol/v1) through the official Rust SDK. They start the Provider's protocol process directly and never parse a TUI, terminal transcript, or screenshot.
 
-Negotiated local capabilities:
+The common typed path covers:
 
-- session new, list, load/resume, close, prompt, and cancel;
-- client filesystem and terminal calls needed for coding work;
-- permission requests and streamed `session/update` items;
-- output ContentBlock images;
-- prompt images are reported unsupported and are never sent.
+- `initialize`, profile-required Provider authentication, `session/new`, `session/prompt`, and `session/cancel`;
+- optional `session/list`, `session/load`, `session/resume`, and `session/close` only when advertised;
+- streamed agent/user message chunks, plans, tool calls, command activity, file changes, images, completion, interruption, and errors from `session/update`;
+- exact Provider-supplied `session/request_permission` option IDs and responses;
+- output content blocks and capability-approved reverse filesystem/terminal requests;
+- standard session config options returned by `session/new`, `session/load`, `session/resume`, or later `config_option_update` events.
 
-Current Grok-specific compatibility boundary:
+Standard config options are the model, effort/thought-level, and mode source of truth. They may not exist until a native session has been created or loaded. The Host does not hard-code a model catalog to fill that gap, and the UI updates when the Provider supplies the options. Changes use `session/set_config_option`; obsolete or Provider-private model calls stay in version-gated compatibility code.
 
-- Grok 1.0.13 does not implement standard `session/set_config_option`; it reports model/effort under `_meta.modelState` and accepts the version-gated legacy `session/set_model` request. The adapter keeps this in `providers/grok.rs` and does not claim generic ACP support for it.
-- ACP v1 has no standard steer method. Grok 1.0.13 implements the unadvertised `_x.ai/interject` extension. The UI only enables steering when this exact compatible Provider version is active.
-- Authentication has no reliable ACP status call. A successful lightweight `grok models` probe indicates a logged-in local CLI; otherwise the Host reports the actual launch/auth error rather than treating executable presence as authentication.
-- ACP `session/load` replays the whole changed session and does not expose a portable incremental cursor. Text chunks are coalesced by turn, history events cross a persistence barrier before the sync watermark advances, and stable synthetic item IDs make repeated full reads idempotent. A missing/invalid ACP update timestamp deliberately forces another full replay. Grok does not advertise conversation rename or prompt-image input, so those controls remain unavailable for this Provider.
+The current shared ACP prompt path sends text only. Prompt attachments stay disabled even when an Agent advertises image, audio, or embedded-context input. Output images remain supported through managed attachment handling.
 
-Filesystem and terminal reverse requests are bound to the conversation project. Terminal output is capped and visibly marked when truncated; exit status is preserved. Permissions use the exact Provider-supplied options.
+ACP session history is a controlled full-replay fallback because the supported agents do not expose a portable incremental history cursor. Text is coalesced into stable turn items, repeated Provider item IDs are deduplicated, and a persistence barrier completes before the history watermark advances. Reverse file and terminal requests are confined to the conversation's authorized project. Terminal output is capped and marked when truncated, and exit status is preserved.
 
-## Real smoke policy
+### Profile boundaries
 
-Automated tests use the two deterministic stdio mocks. Real smoke tests run only in a temporary authorized directory. They report `SKIP` with the actual missing installation, authentication, quota, or payment prerequisite and never substitute a generic API or TUI parser. Protocol and implementation errors remain `FAIL`.
+- **Grok Build:** Grok 1.0.13 reports model/effort through `_meta.modelState` and uses its legacy `session/set_model`. Its version-gated `_x.ai/interject` extension enables steering. Other ACP profiles do not inherit either extension. Grok prompt images and rename remain unavailable.
+- **Claude Code:** the Host launches the globally installed `claude-agent-acp` bridge. Session catalog, load/resume, modes, models, effort, and permission choices remain driven by the bridge's handshake and session config options. GeneralAgentRemote does not read Claude's private session files.
+- **Gemini CLI:** the current `gemini --acp` handshake supports new/load, prompt/cancel, streamed updates, and permissions, but does not advertise `session/list`. The Host can continue a Gemini session already mapped in GeneralAgentRemote, but cannot discover unrelated Gemini CLI sessions. It does not parse `gemini --list-sessions` output to manufacture support.
+- **GitHub Copilot CLI:** the profile uses ACP stdio with CLI auto-update disabled. Session list/load/close are exposed only when negotiated. Provider authentication remains owned by Copilot CLI. Reasoning settings that a Copilot version fixes at ACP-server startup are not presented as per-conversation controls.
+- **OpenCode:** the profile uses `opencode acp`, not OpenCode's broader HTTP file APIs. Its advertised session list/load/resume, models, variants/effort, modes, prompts, and permissions flow through the same typed ACP path.
+- **Cursor Agent:** the profile launches the official `agent acp` process and sends `authenticate(cursor_login)` only when that exact method is advertised. Standard sessions, streaming, modes, and permissions use ACP. Cursor's private `cursor/*` controls are not presented in this baseline; blocking question and plan requests receive an explicit cancelled response so a turn cannot hang waiting for an unsupported UI.
+- **Cline:** the profile launches `cline --acp`. Provider/model/thinking and auto-approval options remain driven by the CLI's ACP session options and permission requests.
+- **Goose:** the profile launches `goose acp`. Model/provider selection remains in Goose configuration unless the running version advertises a standard session option.
+- **JetBrains Junie:** the profile launches `junie --acp=true`; its session and approval capabilities are exposed only when negotiated.
+
+ACP has no portable rename or mid-turn steer operation in the implemented baseline. Those controls remain disabled unless an exact profile advertises and implements a compatible operation.
+
+## Deliberately unsupported agents
+
+Aider is not supported. Its official CLI offers one-shot messages, terminal text streaming, history files, and broad automatic confirmation, but no machine-readable stream of messages, tool activity, stable event IDs, and approval requests comparable to Codex app-server or ACP. Integrating it would require scraping terminal output or pretending that `--yes-always` is an interactive approval protocol, both of which violate this product's Provider boundary. Roo Code is currently an editor extension rather than a supported standalone ACP process in this integration.
+
+## Verification status and real smoke policy
+
+Automated tests use deterministic stdio peers to validate the built-in Codex adapter, the shared ACP transport, capability differences, session replay, config-option mapping, permission responses, cancellation, and project confinement. These tests do not prove that a vendor account can complete a model turn.
+
+`cargo xtask provider-smoke` runs each discovered Provider in a temporary authorized directory and requests the exact response `AGENT_REMOTE_SMOKE_OK` without commands or file changes:
+
+- `PASS` means the installed and authenticated Provider completed that real turn and returned the marker;
+- `SKIP` reports the actual missing executable, authentication, quota, balance, or payment prerequisite and is not a pass;
+- `FAIL` means a smoke-testable Provider hit a protocol/execution error, timed out, or returned the wrong result.
+
+Real-turn evidence collected on 2026-09-04:
+
+- **Codex 0.150.1: PASS.** The Host adapter received the exact marker from the installed WSL CLI.
+- **OpenCode 1.18.25: PASS.** The same Host ACP adapter received the exact marker from the installed Windows CLI in a temporary authorized directory, using `AGENT_REMOTE_OPENCODE_BIN` to select that executable.
+- **Claude Code, Gemini CLI, GitHub Copilot CLI, Cursor Agent, Cline, Goose, and JetBrains Junie: SKIP.** Their protocol executables were not installed in the tested WSL or Windows environments.
+- **Grok 1.0.13 cross-OS probe: FAIL.** Launching the Windows Grok executable from a WSL Host rejected the WSL temporary path as non-absolute. This result does not establish failure on a matching-platform Windows Host or with Grok installed inside WSL.
+
+These real Provider results are separate from automated tests and physical-device evidence; another API, a fake model, or TUI parsing is never substituted for a skipped Provider.

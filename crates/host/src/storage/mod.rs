@@ -184,11 +184,7 @@ impl Storage {
                 .map(|value| value.to_string_lossy().into_owned())
                 .unwrap_or_else(|| canonical_path.display().to_string())
         });
-        let providers = if enabled_providers.is_empty() {
-            vec![ProviderId::Codex, ProviderId::Grok]
-        } else {
-            enabled_providers.to_vec()
-        };
+        let providers = normalized_providers(enabled_providers)?;
         let project = Project {
             id: ProjectId::new(),
             display_name,
@@ -238,6 +234,25 @@ impl Storage {
             .into_iter()
             .find(|project| project.id == id)
             .ok_or_else(|| anyhow!("project {id} was not found"))
+    }
+
+    pub fn set_project_providers(
+        &self,
+        id: ProjectId,
+        enabled_providers: &[ProviderId],
+    ) -> Result<Project> {
+        let providers = normalized_providers(enabled_providers)?;
+        let providers_json = serde_json::to_string(&providers)?;
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let updated = connection.execute(
+            "UPDATE projects SET enabled_providers = ?2 WHERE id = ?1",
+            params![id.to_string(), providers_json],
+        )?;
+        drop(connection);
+        if updated == 0 {
+            bail!("project {id} was not found");
+        }
+        self.project(id)
     }
 
     pub fn remove_project(&self, id: ProjectId) -> Result<bool> {
@@ -1057,17 +1072,35 @@ fn short_project_path(path: &Path) -> String {
         .join("/")
 }
 
-fn provider_name(provider: ProviderId) -> &'static str {
-    match provider {
-        ProviderId::Codex => "codex",
-        ProviderId::Grok => "grok",
+fn normalized_providers(providers: &[ProviderId]) -> Result<Vec<ProviderId>> {
+    if providers.is_empty() {
+        bail!("at least one provider must be enabled");
     }
+    let mut normalized = Vec::with_capacity(providers.len());
+    for provider in providers {
+        if !normalized.contains(provider) {
+            normalized.push(*provider);
+        }
+    }
+    Ok(normalized)
+}
+
+fn provider_name(provider: ProviderId) -> &'static str {
+    provider.wire_name()
 }
 
 fn parse_provider(value: &str) -> Result<ProviderId> {
     match value {
         "codex" => Ok(ProviderId::Codex),
         "grok" => Ok(ProviderId::Grok),
+        "claude_code" => Ok(ProviderId::ClaudeCode),
+        "gemini_cli" => Ok(ProviderId::GeminiCli),
+        "copilot_cli" => Ok(ProviderId::CopilotCli),
+        "open_code" => Ok(ProviderId::OpenCode),
+        "cursor" => Ok(ProviderId::Cursor),
+        "cline" => Ok(ProviderId::Cline),
+        "goose" => Ok(ProviderId::Goose),
+        "junie" => Ok(ProviderId::Junie),
         _ => bail!("unknown provider in database: {value}"),
     }
 }
@@ -1295,6 +1328,55 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let storage = Storage::open(temp.path().join("state.db")).expect("open storage");
         (temp, storage)
+    }
+
+    #[test]
+    fn provider_database_names_round_trip() {
+        for provider in [
+            ProviderId::Codex,
+            ProviderId::Grok,
+            ProviderId::ClaudeCode,
+            ProviderId::GeminiCli,
+            ProviderId::CopilotCli,
+            ProviderId::OpenCode,
+            ProviderId::Cursor,
+            ProviderId::Cline,
+            ProviderId::Goose,
+            ProviderId::Junie,
+        ] {
+            assert_eq!(parse_provider(provider_name(provider)).unwrap(), provider);
+        }
+    }
+
+    #[test]
+    fn project_providers_can_be_replaced_without_duplicates() {
+        let (temp, storage) = storage();
+        let project = storage
+            .add_project(temp.path(), Some("providers"), &[ProviderId::Codex])
+            .expect("add project");
+
+        let updated = storage
+            .set_project_providers(
+                project.id,
+                &[
+                    ProviderId::ClaudeCode,
+                    ProviderId::OpenCode,
+                    ProviderId::ClaudeCode,
+                ],
+            )
+            .expect("replace providers");
+        assert_eq!(
+            updated.enabled_providers,
+            vec![ProviderId::ClaudeCode, ProviderId::OpenCode]
+        );
+        assert!(storage.set_project_providers(project.id, &[]).is_err());
+        assert_eq!(
+            storage
+                .project(project.id)
+                .expect("project after rejected update")
+                .enabled_providers,
+            vec![ProviderId::ClaudeCode, ProviderId::OpenCode]
+        );
     }
 
     #[test]

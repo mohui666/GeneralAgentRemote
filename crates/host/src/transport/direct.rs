@@ -23,7 +23,7 @@ use crate::{
     },
 };
 
-pub const WS_SUBPROTOCOL: &str = "agent-remote.cbor.v2";
+pub const WS_SUBPROTOCOL: &str = "agent-remote.cbor.v3";
 const MAX_WS_MESSAGE_BYTES: usize = 12 * 1024 * 1024;
 const COMMAND_QUEUE_CAPACITY: usize = 32;
 const RESPONSE_QUEUE_CAPACITY: usize = 64;

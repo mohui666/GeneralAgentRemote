@@ -1653,18 +1653,35 @@ impl AppService {
                 value: value.clone(),
             })
             .await?;
-        if let Some(option) = conversation
-            .session_options
-            .iter_mut()
-            .find(|option| option.id == option_id)
+        if let Some(snapshot) =
+            provider.session_options_snapshot(conversation_id, &conversation.native_session_id)
         {
-            option.current_value = value.clone();
-        }
-        if option_id == "model" {
-            conversation.selected_model = Some(value.clone());
-        }
-        if option_id == "thought_level" || option_id == "reasoning_effort" {
-            conversation.selected_effort = Some(value);
+            let permission_mode = conversation
+                .session_options
+                .iter()
+                .find(|option| option.category.as_deref() == Some("permission"))
+                .map(|option| option.current_value.clone());
+            conversation.session_options = permission_session_options(
+                snapshot.session_options,
+                &provider.permission_modes(),
+                permission_mode.as_deref(),
+            )?;
+            conversation.selected_model = snapshot.selected_model;
+            conversation.selected_effort = snapshot.selected_effort;
+        } else {
+            if let Some(option) = conversation
+                .session_options
+                .iter_mut()
+                .find(|option| option.id == option_id)
+            {
+                option.current_value = value.clone();
+            }
+            if option_id == "model" {
+                conversation.selected_model = Some(value.clone());
+            }
+            if option_id == "thought_level" || option_id == "reasoning_effort" {
+                conversation.selected_effort = Some(value);
+            }
         }
         conversation.revision += 1;
         conversation.updated_at_ms = now_ms();
@@ -1865,6 +1882,28 @@ impl AppService {
                         status,
                     },
                 )?;
+            }
+            ProviderEventKind::SessionOptionsChanged {
+                session_options,
+                selected_model,
+                selected_effort,
+            } => {
+                let permission_mode = conversation
+                    .session_options
+                    .iter()
+                    .find(|option| option.category.as_deref() == Some("permission"))
+                    .map(|option| option.current_value.clone());
+                let provider = self.providers.get(conversation.provider)?;
+                conversation.session_options = permission_session_options(
+                    session_options,
+                    &provider.permission_modes(),
+                    permission_mode.as_deref(),
+                )?;
+                conversation.selected_model = selected_model;
+                conversation.selected_effort = selected_effort;
+                conversation.revision += 1;
+                conversation.updated_at_ms = now_ms();
+                self.save_and_emit_conversation(&conversation)?;
             }
             ProviderEventKind::Approval {
                 provider_request_id,
@@ -2495,6 +2534,7 @@ fn provider_event_is_live(kind: &ProviderEventKind) -> bool {
             | ProviderEventKind::HistoryWatermark { .. }
             | ProviderEventKind::HistoryItem { .. }
             | ProviderEventKind::ProviderItemAlias { .. }
+            | ProviderEventKind::SessionOptionsChanged { .. }
     )
 }
 

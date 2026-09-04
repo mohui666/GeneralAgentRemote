@@ -5,8 +5,8 @@ use agent_remote_host::{
     app::{AppService, default_data_root},
     attachments::{AttachmentStore, DEFAULT_MAX_IMAGE_BYTES},
     providers::{
-        AgentProvider, CreateSession, ProviderEventKind, ProviderRegistry, ResolveApproval,
-        SendMessage, codex::CodexProvider, grok::GrokProvider,
+        AgentProvider, BUILT_IN_PROVIDER_IDS, CreateSession, ProviderEventKind, ProviderRegistry,
+        ResolveApproval, SendMessage, built_in_providers,
     },
     transport::{
         direct,
@@ -55,6 +55,11 @@ enum ProjectCommand {
         #[arg(long = "provider", value_enum)]
         providers: Vec<ProviderArg>,
     },
+    SetProviders {
+        project_id: String,
+        #[arg(long = "provider", value_enum, required = true)]
+        providers: Vec<ProviderArg>,
+    },
     List,
     Remove {
         project_id: String,
@@ -65,6 +70,18 @@ enum ProjectCommand {
 enum ProviderArg {
     Codex,
     Grok,
+    #[value(name = "claude-code", alias = "claude")]
+    ClaudeCode,
+    #[value(name = "gemini-cli", alias = "gemini")]
+    GeminiCli,
+    #[value(name = "copilot-cli", alias = "copilot")]
+    CopilotCli,
+    #[value(name = "opencode")]
+    OpenCode,
+    Cursor,
+    Cline,
+    Goose,
+    Junie,
 }
 
 impl From<ProviderArg> for ProviderId {
@@ -72,6 +89,14 @@ impl From<ProviderArg> for ProviderId {
         match provider {
             ProviderArg::Codex => Self::Codex,
             ProviderArg::Grok => Self::Grok,
+            ProviderArg::ClaudeCode => Self::ClaudeCode,
+            ProviderArg::GeminiCli => Self::GeminiCli,
+            ProviderArg::CopilotCli => Self::CopilotCli,
+            ProviderArg::OpenCode => Self::OpenCode,
+            ProviderArg::Cursor => Self::Cursor,
+            ProviderArg::Cline => Self::Cline,
+            ProviderArg::Goose => Self::Goose,
+            ProviderArg::Junie => Self::Junie,
         }
     }
 }
@@ -134,16 +159,38 @@ fn project_command(data_root: &std::path::Path, command: ProjectCommand) -> Resu
             name,
             providers,
         } => {
-            let providers = providers
-                .into_iter()
-                .map(ProviderId::from)
-                .collect::<Vec<_>>();
+            let providers = if providers.is_empty() {
+                BUILT_IN_PROVIDER_IDS.to_vec()
+            } else {
+                providers.into_iter().map(ProviderId::from).collect()
+            };
             let project = storage.add_project(path, name.as_deref(), &providers)?;
             println!(
                 "{}\t{}\t{}",
                 project.id,
                 project.display_name,
                 project.canonical_path.display()
+            );
+        }
+        ProjectCommand::SetProviders {
+            project_id,
+            providers,
+        } => {
+            let project_id = ProjectId(parse_uuid(&project_id, "project")?);
+            let providers = providers
+                .into_iter()
+                .map(ProviderId::from)
+                .collect::<Vec<_>>();
+            let project = storage.set_project_providers(project_id, &providers)?;
+            println!(
+                "updated {}\t{}",
+                project.id,
+                project
+                    .enabled_providers
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
         }
         ProjectCommand::List => {
@@ -236,11 +283,7 @@ async fn serve_command(data_root: PathBuf, args: ServeArgs) -> Result<()> {
     direct::public_plaintext_rejected(args.listen, args.dev_insecure)?;
     let storage = Arc::new(Storage::open(data_root.join("state.db"))?);
     let attachments = AttachmentStore::new(data_root.join("attachments"), DEFAULT_MAX_IMAGE_BYTES)?;
-    let providers: Vec<Arc<dyn AgentProvider>> = vec![
-        Arc::new(CodexProvider::new()),
-        Arc::new(GrokProvider::new()),
-    ];
-    let registry = ProviderRegistry::new(providers);
+    let registry = ProviderRegistry::new(built_in_providers());
     let host_name = env::var("COMPUTERNAME")
         .or_else(|_| env::var("HOSTNAME"))
         .unwrap_or_else(|_| "Agent Remote Host".to_owned());
@@ -276,16 +319,13 @@ async fn serve_command(data_root: PathBuf, args: ServeArgs) -> Result<()> {
 
 async fn provider_smoke() -> Result<()> {
     let temp = tempfile::tempdir()?;
+    let providers = built_in_providers();
     let project = Project {
         id: ProjectId::new(),
         display_name: "Agent Remote smoke".to_owned(),
         canonical_path: temp.path().canonicalize()?,
-        enabled_providers: vec![ProviderId::Codex, ProviderId::Grok],
+        enabled_providers: BUILT_IN_PROVIDER_IDS.to_vec(),
     };
-    let providers: Vec<Arc<dyn AgentProvider>> = vec![
-        Arc::new(CodexProvider::new()),
-        Arc::new(GrokProvider::new()),
-    ];
     let mut failed = false;
     for provider in providers {
         match smoke_one(Arc::clone(&provider), &project).await {

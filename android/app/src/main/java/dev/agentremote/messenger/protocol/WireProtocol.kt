@@ -33,8 +33,8 @@ import java.nio.charset.StandardCharsets
 import java.util.UUID
 
 object WireProtocol {
-    const val VERSION = 2
-    const val SUBPROTOCOL = "agent-remote.cbor.v2"
+    const val VERSION = 3
+    const val SUBPROTOCOL = "agent-remote.cbor.v3"
     private val mapper = ObjectMapper(CBORFactory())
 
     fun pair(target: ConnectionTarget, deviceName: String): ByteArray = command("pair") {

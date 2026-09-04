@@ -4,7 +4,15 @@ import java.util.UUID
 
 enum class ProviderId(val wire: String, val label: String) {
     CODEX("codex", "Codex"),
-    GROK("grok", "Grok");
+    GROK("grok", "Grok"),
+    CLAUDE_CODE("claude_code", "Claude Code"),
+    GEMINI_CLI("gemini_cli", "Gemini CLI"),
+    COPILOT_CLI("copilot_cli", "GitHub Copilot"),
+    OPEN_CODE("open_code", "OpenCode"),
+    CURSOR("cursor", "Cursor Agent"),
+    CLINE("cline", "Cline"),
+    GOOSE("goose", "Goose"),
+    JUNIE("junie", "JetBrains Junie");
 
     companion object {
         fun fromWire(value: String): ProviderId = entries.first { it.wire == value }
