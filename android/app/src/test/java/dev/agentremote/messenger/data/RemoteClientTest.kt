@@ -188,13 +188,13 @@ class RemoteClientTest {
                 .protocol(Protocol.HTTP_1_1)
                 .code(101)
                 .message("Switching Protocols")
-                .header("Sec-WebSocket-Protocol", "agent-remote.cbor.v4")
+                .header("Sec-WebSocket-Protocol", "agent-remote.cbor.v5")
                 .build(),
         )
         val credential = requireNotNull(target.credential)
         val mapper = ObjectMapper(CBORFactory())
         val envelope = mapper.createObjectNode().apply {
-            put("protocol_version", 4)
+            put("protocol_version", 5)
             set<JsonNode>("message", mapper.createObjectNode().apply {
                 put("type", "authenticated")
                 set<JsonNode>("host_id", mapper.nodeFactory.binaryNode(uuidBytes(credential.hostId)))

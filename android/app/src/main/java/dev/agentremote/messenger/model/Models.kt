@@ -17,7 +17,14 @@ enum class ProviderId(val wire: String, val label: String) {
     KIMI_CLI("kimi_cli", "Kimi CLI"),
     KIRO_CLI("kiro_cli", "Kiro CLI"),
     MISTRAL_VIBE("mistral_vibe", "Mistral Vibe"),
-    QODER_CLI("qoder_cli", "Qoder CLI");
+    QODER_CLI("qoder_cli", "Qoder CLI"),
+    AUGGIE("auggie", "Augment Auggie"),
+    FACTORY_DROID("factory_droid", "Factory Droid"),
+    DEVIN("devin", "Devin"),
+    CODEBUDDY("codebuddy", "Tencent CodeBuddy"),
+    GLM_AGENT("glm_agent", "GLM Agent"),
+    KILO_CODE("kilo_code", "Kilo Code"),
+    AMP("amp", "Amp");
 
     companion object {
         fun fromWire(value: String): ProviderId = entries.first { it.wire == value }

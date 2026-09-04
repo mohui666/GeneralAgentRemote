@@ -1106,6 +1106,13 @@ fn parse_provider(value: &str) -> Result<ProviderId> {
         "kiro_cli" => Ok(ProviderId::KiroCli),
         "mistral_vibe" => Ok(ProviderId::MistralVibe),
         "qoder_cli" => Ok(ProviderId::QoderCli),
+        "auggie" => Ok(ProviderId::Auggie),
+        "factory_droid" => Ok(ProviderId::FactoryDroid),
+        "devin" => Ok(ProviderId::Devin),
+        "codebuddy" => Ok(ProviderId::CodeBuddy),
+        "glm_agent" => Ok(ProviderId::GlmAgent),
+        "kilo_code" => Ok(ProviderId::KiloCode),
+        "amp" => Ok(ProviderId::Amp),
         _ => bail!("unknown provider in database: {value}"),
     }
 }

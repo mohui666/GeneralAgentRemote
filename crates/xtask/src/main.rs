@@ -39,7 +39,10 @@ enum Task {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    ProviderSmoke,
+    ProviderSmoke {
+        #[arg(long = "provider")]
+        providers: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -96,11 +99,17 @@ fn main() -> Result<()> {
                 &args,
             )
         }
-        Task::ProviderSmoke => run_cargo(
-            &root,
-            &["run", "-p", "agent-remote-host", "--", "provider-smoke"],
-            &[],
-        ),
+        Task::ProviderSmoke { providers } => {
+            let args = providers
+                .into_iter()
+                .flat_map(|provider| ["--provider".to_owned(), provider])
+                .collect::<Vec<_>>();
+            run_cargo(
+                &root,
+                &["run", "-p", "agent-remote-host", "--", "provider-smoke"],
+                &args,
+            )
+        }
     }
 }
 

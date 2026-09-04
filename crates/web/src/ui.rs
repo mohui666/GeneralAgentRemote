@@ -25,7 +25,7 @@ use crate::{
 const CREDENTIALS_KEY: &str = "agent_remote_credentials_v1";
 const LAST_HOST_KEY: &str = "agent_remote_last_host_v2";
 const CACHE_PREFIX: &str = "agent_remote_cache_v2_";
-const WS_SUBPROTOCOL: &str = "agent-remote.cbor.v4";
+const WS_SUBPROTOCOL: &str = "agent-remote.cbor.v5";
 const MAX_RECONNECT_ATTEMPTS: u8 = 6;
 const CACHE_VERSION: u16 = 3;
 const CACHE_WRITE_DELAY_MS: i32 = 250;
@@ -3163,6 +3163,13 @@ fn provider_short(provider: ProviderId) -> &'static str {
         ProviderId::KiroCli => "Kr",
         ProviderId::MistralVibe => "MV",
         ProviderId::QoderCli => "Qd",
+        ProviderId::Auggie => "Au",
+        ProviderId::FactoryDroid => "FD",
+        ProviderId::Devin => "Dv",
+        ProviderId::CodeBuddy => "CB",
+        ProviderId::GlmAgent => "GL",
+        ProviderId::KiloCode => "Ki",
+        ProviderId::Amp => "Am",
     }
 }
 fn provider_class(provider: ProviderId) -> &'static str {
@@ -3182,6 +3189,13 @@ fn provider_class(provider: ProviderId) -> &'static str {
         ProviderId::KiroCli => "kiro-cli",
         ProviderId::MistralVibe => "mistral-vibe",
         ProviderId::QoderCli => "qoder-cli",
+        ProviderId::Auggie => "auggie",
+        ProviderId::FactoryDroid => "factory-droid",
+        ProviderId::Devin => "devin",
+        ProviderId::CodeBuddy => "codebuddy",
+        ProviderId::GlmAgent => "glm-agent",
+        ProviderId::KiloCode => "kilo-code",
+        ProviderId::Amp => "amp",
     }
 }
 fn state_label(state: ConversationState) -> &'static str {
@@ -3306,6 +3320,13 @@ fn provider_label(provider: ProviderId) -> &'static str {
         ProviderId::KiroCli => "Kiro CLI",
         ProviderId::MistralVibe => "Mistral Vibe",
         ProviderId::QoderCli => "Qoder CLI",
+        ProviderId::Auggie => "Augment Auggie",
+        ProviderId::FactoryDroid => "Factory Droid",
+        ProviderId::Devin => "Devin",
+        ProviderId::CodeBuddy => "Tencent CodeBuddy",
+        ProviderId::GlmAgent => "GLM Agent",
+        ProviderId::KiloCode => "Kilo Code",
+        ProviderId::Amp => "Amp",
     }
 }
 

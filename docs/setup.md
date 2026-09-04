@@ -32,6 +32,13 @@ Provider credentials remain in the Provider-owned store on the Host. GeneralAgen
 | Kiro CLI | `kiro-cli` | `kiro-cli acp` |
 | Mistral Vibe | `vibe-acp` | `vibe-acp` |
 | Qoder CLI | `qoder` | `qoder --acp` |
+| Augment Auggie | `auggie` | `auggie --acp` |
+| Factory Droid | `droid` | `droid exec --output-format acp-daemon` |
+| Devin | `devin` | `devin acp` |
+| Tencent CodeBuddy | `codebuddy` | `codebuddy --acp` |
+| GLM Agent | `glm-acp-agent` | `glm-acp-agent` |
+| Kilo Code | `kilo` | `kilo acp` |
+| Amp | `amp-acp` | `amp-acp` |
 
 `PATH` is the default. These optional variables select an already-installed executable when a Host service has a different `PATH` or an administrator needs an explicit location:
 
@@ -50,6 +57,13 @@ $env:AGENT_REMOTE_KIMI_BIN = "C:\path\to\kimi.exe"
 $env:AGENT_REMOTE_KIRO_BIN = "C:\path\to\kiro-cli.exe"
 $env:AGENT_REMOTE_VIBE_BIN = "C:\path\to\vibe-acp.exe"
 $env:AGENT_REMOTE_QODER_BIN = "C:\path\to\qoder.cmd"
+$env:AGENT_REMOTE_AUGGIE_BIN = "C:\path\to\auggie.cmd"
+$env:AGENT_REMOTE_DROID_BIN = "C:\path\to\droid.exe"
+$env:AGENT_REMOTE_DEVIN_BIN = "C:\path\to\devin.exe"
+$env:AGENT_REMOTE_CODEBUDDY_BIN = "C:\path\to\codebuddy.cmd"
+$env:AGENT_REMOTE_GLM_AGENT_BIN = "C:\path\to\glm-acp-agent.cmd"
+$env:AGENT_REMOTE_KILO_BIN = "C:\path\to\kilo.exe"
+$env:AGENT_REMOTE_AMP_ACP_BIN = "C:\path\to\amp-acp.exe"
 ```
 
 Run the Host and Provider in the same operating-system path domain. A Windows Provider launched by a WSL Host may reject `/mnt/...` project or temporary paths even when stdio itself works.
@@ -78,6 +92,13 @@ kimi --version
 kiro-cli --version
 vibe-acp --version
 qoder --version
+auggie --version
+droid --version
+devin --version
+codebuddy --version
+npm list --global --depth=0 glm-acp-agent
+kilo --version
+amp-acp --version
 ```
 
 Authenticate with each Provider's own supported login command before its real smoke test.
@@ -92,9 +113,11 @@ dist\bin\agent-remote-host.exe project list
 dist\bin\agent-remote-host.exe project remove <project-id>
 ```
 
-Project paths are canonicalized when added. If `project add` omits every `--provider` flag, all 15 built-in profiles are enabled. `set-providers` replaces the enabled set for an existing project. If a directory is moved or removed, it is shown invalid and is not silently replaced.
+Project paths are canonicalized when added. If `project add` omits every `--provider` flag, all 22 built-in profiles are enabled. `set-providers` replaces the enabled set for an existing project. If a directory is moved or removed, it is shown invalid and is not silently replaced.
 
-The `--provider` values are `codex`, `grok`, `claude-code`, `gemini-cli`, `copilot-cli`, `opencode`, `cursor`, `cline`, `goose`, `junie`, `qwen-code`, `kimi-cli`, `kiro-cli`, `mistral-vibe`, and `qoder-cli`. Their versioned wire/database values are `codex`, `grok`, `claude_code`, `gemini_cli`, `copilot_cli`, `open_code`, `cursor`, `cline`, `goose`, `junie`, `qwen_code`, `kimi_cli`, `kiro_cli`, `mistral_vibe`, and `qoder_cli`.
+The `--provider` values are `codex`, `grok`, `claude-code`, `gemini-cli`, `copilot-cli`, `opencode`, `cursor`, `cline`, `goose`, `junie`, `qwen-code`, `kimi-cli`, `kiro-cli`, `mistral-vibe`, `qoder-cli`, `auggie`, `factory-droid`, `devin`, `codebuddy`, `glm-agent`, `kilo-code`, and `amp`. Their versioned wire/database values are `codex`, `grok`, `claude_code`, `gemini_cli`, `copilot_cli`, `open_code`, `cursor`, `cline`, `goose`, `junie`, `qwen_code`, `kimi_cli`, `kiro_cli`, `mistral_vibe`, `qoder_cli`, `auggie`, `factory_droid`, `devin`, `codebuddy`, `glm_agent`, `kilo_code`, and `amp`.
+
+The aliases `augment`, `droid`, `codebuddy-code`, `glm`, and `kilo` are accepted for the corresponding new profiles. Amp uses the separate `amp-acp` bridge around the installed Amp client. GLM Agent uses the standalone `glm-acp-agent` process; installing or logging into the ZCode desktop application does not provide this executable or its credentials.
 
 ## Direct localhost
 
@@ -140,9 +163,12 @@ ACP profiles negotiate session listing, loading/resuming, permission choices, an
 
 ```powershell
 cargo xtask provider-smoke
+cargo xtask provider-smoke --provider opencode --provider kilo-code
 ```
 
 The command uses a temporary authorized directory and asks each available Provider for the exact marker `AGENT_REMOTE_SMOKE_OK` without commands or file changes. A result has one of three meanings:
+
+Repeat `--provider <CLI ID>` to run only Providers whose free allowance has been confirmed. Omitting it keeps the all-profile discovery behavior.
 
 - `PASS`: the installed and authenticated Provider completed a real model turn and returned the marker;
 - `SKIP`: a prerequisite such as the executable, authentication, quota, balance, or payment is unavailable;

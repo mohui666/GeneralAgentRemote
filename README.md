@@ -27,6 +27,9 @@ Android / Browser ── HTTPS Relay ◀── outbound ── Host ── Codex
                                                    ├── JetBrains Junie ACP
                                                    ├── Qwen / Kimi / Kiro ACP
                                                    ├── Mistral Vibe / Qoder ACP
+                                                   ├── Auggie / Factory Droid / Devin ACP
+                                                   ├── CodeBuddy / GLM Agent / Kilo ACP
+                                                   ├── Amp ACP bridge
                                                    └── authorized projects
 ```
 
@@ -45,7 +48,9 @@ APK 输出到 `dist/android/agent-remote-debug.apk`。完整说明见 [Android �
 
 ### 1. 构建
 
-构建只需要 Rust stable 和 `wasm32-unknown-unknown`。要实际开始远程对话，还需至少一个已经全局安装并完成本机认证的 Provider。Host 内置 Codex app-server 适配器，并提供 Grok、Claude Code、Gemini CLI、GitHub Copilot CLI、OpenCode、Cursor Agent、Cline、Goose、JetBrains Junie、Qwen Code、Kimi CLI、Kiro CLI、Mistral Vibe 和 Qoder CLI 的 ACP profile。各 Provider 相互独立，缺少某个命令不会阻止其他 Provider 工作。
+构建只需要 Rust stable 和 `wasm32-unknown-unknown`。要实际开始远程对话，还需至少一个已经全局安装并完成本机认证的 Provider。Host 内置 Codex app-server 适配器，并提供 21 个 ACP profile：Grok、Claude Code、Gemini CLI、GitHub Copilot CLI、OpenCode、Cursor Agent、Cline、Goose、JetBrains Junie、Qwen Code、Kimi CLI、Kiro CLI、Mistral Vibe、Qoder CLI、Augment Auggie、Factory Droid、Devin、Tencent CodeBuddy、GLM Agent、Kilo Code 和 Amp。连同 Codex 共 **22 个内置 Provider**。各 Provider 相互独立，缺少某个命令不会阻止其他 Provider 工作。
+
+Qoder 已通过正式的 `qoder --acp` profile 接入。ZCode 3.11.2 也已在 WSLg 临时环境完成 GUI 登录和免费模型真实回合，但截至本次核查没有公开的 ACP、app-server、SDK 或 API 可供 Host 调用，因此不列为内置 Provider。`glm-acp-agent` 是独立的 GLM ACP 适配器，不是对 ZCode 桌面程序的封装。
 
 Host 默认从 `PATH` 启动 Provider；也可用文档列出的 `AGENT_REMOTE_*_BIN` 环境变量指定已安装的可执行文件。Host 不会下载、安装、更新或登录任何 CLI。Claude Code profile 要求 `claude-agent-acp` 已经全局安装；Host 不会在运行时调用 `npx`。Provider 凭据继续由各 CLI 保存在 Host 电脑上，不进入 Host 数据库、Relay 或远程客户端。
 
@@ -85,44 +90,55 @@ adb reverse tcp:7437 tcp:7437
 cargo xtask test
 cargo xtask android
 cargo xtask provider-smoke
+cargo xtask provider-smoke --provider opencode
 ```
 
 - `cargo xtask test` 覆盖 Rust、Web 生产编译与确定性的 Codex/ACP mock 协议链路。
 - `cargo xtask android --release` 运行 Android 协议单测并生成未签名 release APK。
-- `provider-smoke` 在临时授权目录中对每个已安装且已认证的 Provider 运行真实回合。只有 `PASS` 表示该 Provider 完成了真实回合；缺少命令、登录、额度或付费条件会得到 `SKIP`，`SKIP` 不算验证，协议错误得到 `FAIL`。
+- `provider-smoke` 在临时授权目录中对已安装且已认证的 Provider 运行真实回合；可重复使用 `--provider` 只测已确认有免费额度的项目。只有 `PASS` 表示该 Provider 完成了真实回合；缺少命令、登录、额度或付费条件会得到 `SKIP`，`SKIP` 不算验证，协议错误得到 `FAIL`。
 - 自动化构建不能替代真机或真实 Provider 验收，两类结果应分别记录。
 
-### 真实 Provider 实测
+### Provider 分层实测
 
-实测日期：**2026-09-04**。`✅` 只表示通过 GeneralAgentRemote Host 适配器完成真实模型回合，并返回精确标记 `AGENT_REMOTE_SMOKE_OK`。
+证据截至 **2026-09-05**。三列不能互相替代：安装检查只证明命令可执行；ACP `initialize` 只证明该协议进程能在登录前完成握手；真实回合才会请求模型并要求返回精确标记 `AGENT_REMOTE_SMOKE_OK`。`✅` 仅用于已有证据。
 
-| Provider | Host 启动方式 | 真实回合结果 |
-|---|---|---|
-| OpenAI Codex 0.150.1 | `codex app-server --stdio` | ✅ PASS |
-| OpenCode 1.18.25 | `opencode acp` | ✅ PASS |
-| Grok Build 1.0.13 | `grok --no-auto-update agent stdio` | ⚠️ Windows CLI 从 WSL Host 启动时拒绝 WSL 路径；同系统环境待测 |
-| Claude Code | `claude-agent-acp` | ⏭ SKIP：测试机未安装 |
-| Gemini CLI | `gemini --acp` | ⏭ SKIP：测试机未安装 |
-| GitHub Copilot CLI | `copilot --acp --stdio --no-auto-update` | ⏭ SKIP：测试机未安装 |
-| Cursor Agent | `agent acp` | ⏭ SKIP：测试机未安装 |
-| Cline | `cline --acp` | ⏭ SKIP：测试机未安装 |
-| Goose | `goose acp` | ⏭ SKIP：测试机未安装 |
-| JetBrains Junie | `junie --acp=true` | ⏭ SKIP：测试机未安装 |
-| Qwen Code | `qwen --acp` | ⏭ SKIP：测试机未安装 |
-| Kimi CLI | `kimi acp` | ⏭ SKIP：测试机未安装 |
-| Kiro CLI | `kiro-cli acp` | ⏭ SKIP：测试机未安装 |
-| Mistral Vibe | `vibe-acp` | ⏭ SKIP：测试机未安装 |
-| Qoder CLI | `qoder --acp` | ⏭ SKIP：测试机未安装 |
+| Provider | Host 启动方式 | 临时环境安装/版本 | 协议占位 | 真实模型回合 |
+|---|---|---|---|---|
+| OpenAI Codex | `codex app-server --stdio` | ✅ 0.150.1 | ✅ app-server | ✅ PASS |
+| Grok Build | `grok --no-auto-update agent stdio` | ✅ 1.0.13 | ✅ ACP `initialize` | ✅ PASS（Windows 同系统链路） |
+| Claude Code | `claude-agent-acp` | ⏭ 按要求未安装 | ⏭ 未测 | ⏭ 未测 |
+| Gemini CLI | `gemini --acp` | ⏭ 按要求未安装 | ⏭ 未测 | ⏭ 未测 |
+| GitHub Copilot CLI | `copilot --acp --stdio --no-auto-update` | ✅ 1.0.82 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| OpenCode | `opencode acp` | ✅ 1.18.27 | ✅ ACP `initialize` | ✅ PASS（1.18.25） |
+| Cursor Agent | `agent acp` | ✅ 2026.09.02-c22c1a3 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| Cline | `cline --acp` | ✅ 3.0.61 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| Goose | `goose acp` | ✅ 1.49.0 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| JetBrains Junie | `junie --acp=true` | ✅ 26.8.31（3013.5） | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| Qwen Code | `qwen --acp` | ✅ 0.23.0 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| Kimi CLI | `kimi acp` | ✅ 0.41.0 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| Kiro CLI | `kiro-cli acp` | ✅ 2.21.0 | ⏭ 登录前拒绝，未完成 `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| Mistral Vibe | `vibe-acp` | ✅ 2.25.0 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| **Qoder CLI** | `qoder --acp` | ✅ 1.1.43 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| Augment Auggie | `auggie --acp` | ✅ 0.36.0 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| Factory Droid | `droid exec --output-format acp-daemon` | ✅ 0.212.0 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| Devin | `devin acp` | ✅ 3000.6.14 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| Tencent CodeBuddy | `codebuddy --acp` | ✅ 2.143.1 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| GLM Agent | `glm-acp-agent` | ✅ 包 1.8.0 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| Kilo Code | `kilo acp` | ✅ 7.5.9 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| Amp | `amp-acp` | ✅ bridge 0.9.0 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
+| ZCode 3.11.2（非内置 Provider） | 无公开 Host 协议 | ✅ WSLg AppImage 启动 | ⏭ 无 ACP/app-server/SDK/API | ✅ GUI PASS（免费 GLM-5.3-Flash，非 Host） |
 
-本次 15-profile 全量重跑中，Codex 再次 PASS；新增五个 profile 均因 WSL 与 Windows 未安装对应 CLI 而 SKIP。OpenCode 的勾选保留自同日较早的真实回合记录，本次环境已无法重新定位该二进制。
+Codex 和 OpenCode 的 Host 真实回合勾选来自 2026-09-04 的既有记录；OpenCode 当时使用 1.18.25，本次隔离环境安装的是 1.18.27。Grok 1.0.13 于 2026-09-05 由当前源码构建的 Windows Host 直接调用已登录的 Windows Grok，在 Windows 临时项目中返回精确标记。ZCode 同日通过自身 GUI 使用免费 GLM-5.3-Flash 返回精确标记，但没有可供 GeneralAgentRemote Host 调用的公共协议。其余已安装 Provider 只执行版本检查和一次 ACP `initialize`；没有发送 `authenticate`、`session/new`、`session/prompt` 或模型请求。完整边界见 [Provider 兼容性](docs/provider-compatibility.md#verification-status-and-real-smoke-policy)。
 
 ### Android 16 模拟器实测
 
-实测环境：**2026-09-04，Pixel 9 AVD `Pixel_9_API_36_1`，Android 16 / SDK 36，1080×2424 @ 420 dpi**。以下勾选均来自安装后的 Android 应用、隔离 Host 和真实 Codex Provider 链路。
+实测环境：**截至 2026-09-05，Pixel 9 AVD `Pixel_9_API_36_1`，Android 16 / SDK 36，1080×2424 @ 420 dpi**。以下勾选均来自安装后的 Android 应用、隔离 Host 和真实 Provider 链路。
 
 | 场景 | 实测结果 |
 |---|---|
 | 构建、保留数据安装、启动与前台 Activity | ✅ PASS |
+| 协议 v5 配对、在线与历史恢复 | ✅ PASS |
+| 4 个授权项目与 Codex/Grok 切换器 | ✅ PASS |
 | 一次性链接配对并进入在线状态 | ✅ PASS |
 | 真实 Codex 发送与六阶段关联链 | ✅ PASS：首个 Provider 事件 17.264 秒 |
 | 第二次真实发送延迟 | ✅ PASS：首个 Provider 事件 6.494 秒 |

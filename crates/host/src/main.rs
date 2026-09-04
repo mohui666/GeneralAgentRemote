@@ -43,7 +43,10 @@ enum Command {
         command: DeviceCommand,
     },
     Serve(ServeArgs),
-    ProviderSmoke,
+    ProviderSmoke {
+        #[arg(long = "provider", value_enum)]
+        providers: Vec<ProviderArg>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -92,6 +95,18 @@ enum ProviderArg {
     MistralVibe,
     #[value(name = "qoder-cli", alias = "qoder")]
     QoderCli,
+    #[value(name = "auggie", alias = "augment")]
+    Auggie,
+    #[value(name = "factory-droid", alias = "droid")]
+    FactoryDroid,
+    Devin,
+    #[value(name = "codebuddy", alias = "codebuddy-code")]
+    CodeBuddy,
+    #[value(name = "glm-agent", alias = "glm")]
+    GlmAgent,
+    #[value(name = "kilo-code", alias = "kilo")]
+    KiloCode,
+    Amp,
 }
 
 impl From<ProviderArg> for ProviderId {
@@ -112,6 +127,13 @@ impl From<ProviderArg> for ProviderId {
             ProviderArg::KiroCli => Self::KiroCli,
             ProviderArg::MistralVibe => Self::MistralVibe,
             ProviderArg::QoderCli => Self::QoderCli,
+            ProviderArg::Auggie => Self::Auggie,
+            ProviderArg::FactoryDroid => Self::FactoryDroid,
+            ProviderArg::Devin => Self::Devin,
+            ProviderArg::CodeBuddy => Self::CodeBuddy,
+            ProviderArg::GlmAgent => Self::GlmAgent,
+            ProviderArg::KiloCode => Self::KiloCode,
+            ProviderArg::Amp => Self::Amp,
         }
     }
 }
@@ -162,7 +184,9 @@ async fn main() -> Result<()> {
         Command::Pair(args) => pair_command(&data_root, args),
         Command::Device { command } => device_command(&data_root, command),
         Command::Serve(args) => serve_command(data_root, args).await,
-        Command::ProviderSmoke => provider_smoke().await,
+        Command::ProviderSmoke { providers } => {
+            provider_smoke(providers.into_iter().map(ProviderId::from).collect()).await
+        }
     }
 }
 
@@ -332,14 +356,22 @@ async fn serve_command(data_root: PathBuf, args: ServeArgs) -> Result<()> {
     direct::serve(listener, service, web_root).await
 }
 
-async fn provider_smoke() -> Result<()> {
+async fn provider_smoke(selected_providers: Vec<ProviderId>) -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let providers = built_in_providers();
+    let enabled_providers = if selected_providers.is_empty() {
+        BUILT_IN_PROVIDER_IDS.to_vec()
+    } else {
+        selected_providers
+    };
+    let providers = built_in_providers()
+        .into_iter()
+        .filter(|provider| enabled_providers.contains(&provider.id()))
+        .collect::<Vec<_>>();
     let project = Project {
         id: ProjectId::new(),
         display_name: "Agent Remote smoke".to_owned(),
         canonical_path: temp.path().canonicalize()?,
-        enabled_providers: BUILT_IN_PROVIDER_IDS.to_vec(),
+        enabled_providers,
     };
     let mut failed = false;
     for provider in providers {

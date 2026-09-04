@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const RELAY_PROTOCOL_VERSION: u16 = 1;
 
 macro_rules! uuid_id {
@@ -103,6 +103,13 @@ pub enum ProviderId {
     KiroCli,
     MistralVibe,
     QoderCli,
+    Auggie,
+    FactoryDroid,
+    Devin,
+    CodeBuddy,
+    GlmAgent,
+    KiloCode,
+    Amp,
 }
 
 impl fmt::Display for ProviderId {
@@ -123,12 +130,19 @@ impl fmt::Display for ProviderId {
             Self::KiroCli => formatter.write_str("Kiro CLI"),
             Self::MistralVibe => formatter.write_str("Mistral Vibe"),
             Self::QoderCli => formatter.write_str("Qoder CLI"),
+            Self::Auggie => formatter.write_str("Augment Auggie"),
+            Self::FactoryDroid => formatter.write_str("Factory Droid"),
+            Self::Devin => formatter.write_str("Devin"),
+            Self::CodeBuddy => formatter.write_str("Tencent CodeBuddy"),
+            Self::GlmAgent => formatter.write_str("GLM Agent"),
+            Self::KiloCode => formatter.write_str("Kilo Code"),
+            Self::Amp => formatter.write_str("Amp"),
         }
     }
 }
 
 impl ProviderId {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 22] = [
         Self::Codex,
         Self::Grok,
         Self::ClaudeCode,
@@ -144,6 +158,13 @@ impl ProviderId {
         Self::KiroCli,
         Self::MistralVibe,
         Self::QoderCli,
+        Self::Auggie,
+        Self::FactoryDroid,
+        Self::Devin,
+        Self::CodeBuddy,
+        Self::GlmAgent,
+        Self::KiloCode,
+        Self::Amp,
     ];
 
     pub const fn wire_name(self) -> &'static str {
@@ -163,6 +184,13 @@ impl ProviderId {
             Self::KiroCli => "kiro_cli",
             Self::MistralVibe => "mistral_vibe",
             Self::QoderCli => "qoder_cli",
+            Self::Auggie => "auggie",
+            Self::FactoryDroid => "factory_droid",
+            Self::Devin => "devin",
+            Self::CodeBuddy => "codebuddy",
+            Self::GlmAgent => "glm_agent",
+            Self::KiloCode => "kilo_code",
+            Self::Amp => "amp",
         }
     }
 }

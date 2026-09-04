@@ -1,7 +1,7 @@
 //! Shared ACP v1 adapter for coding-agent CLIs.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env,
     path::{Path, PathBuf},
     process::Stdio,
@@ -76,6 +76,7 @@ pub struct AcpProviderConfig {
     executable: PathBuf,
     agent_args: Vec<String>,
     version_args: Vec<String>,
+    process_env: BTreeMap<String, String>,
     auth_method: Option<&'static str>,
     flavor: AcpFlavor,
 }
@@ -97,9 +98,19 @@ impl AcpProviderConfig {
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect(),
+            process_env: BTreeMap::new(),
             auth_method: None,
             flavor: AcpFlavor::Standard,
         }
+    }
+
+    fn with_process_env(mut self, values: &[(&str, &str)]) -> Self {
+        self.process_env.extend(
+            values
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+        );
+        self
     }
 
     pub fn grok() -> Self {
@@ -243,6 +254,81 @@ impl AcpProviderConfig {
             "Qoder CLI",
             configured_executable("AGENT_REMOTE_QODER_BIN", "qoder"),
             &["--acp"],
+            &["--version"],
+        )
+    }
+
+    pub fn auggie() -> Self {
+        Self::new(
+            ProviderId::Auggie,
+            "Augment Auggie",
+            configured_executable("AGENT_REMOTE_AUGGIE_BIN", "auggie"),
+            &["--acp"],
+            &["--version"],
+        )
+        .with_process_env(&[("AUGMENT_DISABLE_AUTO_UPDATE", "1")])
+    }
+
+    pub fn factory_droid() -> Self {
+        Self::new(
+            ProviderId::FactoryDroid,
+            "Factory Droid",
+            configured_executable("AGENT_REMOTE_DROID_BIN", "droid"),
+            &["exec", "--output-format", "acp-daemon"],
+            &["--version"],
+        )
+        .with_process_env(&[
+            ("DROID_DISABLE_AUTO_UPDATE", "true"),
+            ("FACTORY_DROID_AUTO_UPDATE_ENABLED", "false"),
+        ])
+    }
+
+    pub fn devin() -> Self {
+        Self::new(
+            ProviderId::Devin,
+            "Devin",
+            configured_executable("AGENT_REMOTE_DEVIN_BIN", "devin"),
+            &["acp"],
+            &["--version"],
+        )
+    }
+
+    pub fn codebuddy() -> Self {
+        Self::new(
+            ProviderId::CodeBuddy,
+            "Tencent CodeBuddy",
+            configured_executable("AGENT_REMOTE_CODEBUDDY_BIN", "codebuddy"),
+            &["--acp"],
+            &["--version"],
+        )
+    }
+
+    pub fn glm_agent() -> Self {
+        Self::new(
+            ProviderId::GlmAgent,
+            "GLM Agent",
+            configured_executable("AGENT_REMOTE_GLM_AGENT_BIN", "glm-acp-agent"),
+            &[],
+            &["--version"],
+        )
+    }
+
+    pub fn kilo() -> Self {
+        Self::new(
+            ProviderId::KiloCode,
+            "Kilo Code",
+            configured_executable("AGENT_REMOTE_KILO_BIN", "kilo"),
+            &["acp"],
+            &["--version"],
+        )
+    }
+
+    pub fn amp() -> Self {
+        Self::new(
+            ProviderId::Amp,
+            "Amp",
+            configured_executable("AGENT_REMOTE_AMP_ACP_BIN", "amp-acp"),
+            &[],
             &["--version"],
         )
     }
@@ -733,6 +819,34 @@ impl AcpProvider {
         Self::from_config(AcpProviderConfig::qoder())
     }
 
+    pub fn auggie() -> Self {
+        Self::from_config(AcpProviderConfig::auggie())
+    }
+
+    pub fn factory_droid() -> Self {
+        Self::from_config(AcpProviderConfig::factory_droid())
+    }
+
+    pub fn devin() -> Self {
+        Self::from_config(AcpProviderConfig::devin())
+    }
+
+    pub fn codebuddy() -> Self {
+        Self::from_config(AcpProviderConfig::codebuddy())
+    }
+
+    pub fn glm_agent() -> Self {
+        Self::from_config(AcpProviderConfig::glm_agent())
+    }
+
+    pub fn kilo() -> Self {
+        Self::from_config(AcpProviderConfig::kilo())
+    }
+
+    pub fn amp() -> Self {
+        Self::from_config(AcpProviderConfig::amp())
+    }
+
     pub fn new() -> Self {
         Self::grok()
     }
@@ -1038,6 +1152,7 @@ impl AgentProvider for AcpProvider {
 
         let output = Command::new(&self.shared.config.executable)
             .args(&self.shared.config.version_args)
+            .envs(&self.shared.config.process_env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1505,7 +1620,8 @@ impl Shared {
     ) -> Result<Arc<ProjectConnection>> {
         let agent = AcpAgent::new(
             AcpAgentConfig::new(self.config.executable.clone())
-                .args(self.config.agent_args.clone()),
+                .args(self.config.agent_args.clone())
+                .envs(self.config.process_env.clone()),
         );
         let (ready_tx, ready_rx) =
             oneshot::channel::<std::result::Result<(ConnectionTo<Agent>, Negotiated), String>>();
@@ -2881,6 +2997,13 @@ fn provider_slug(provider: ProviderId) -> &'static str {
         ProviderId::KiroCli => "kiro-cli",
         ProviderId::MistralVibe => "mistral-vibe",
         ProviderId::QoderCli => "qoder-cli",
+        ProviderId::Auggie => "auggie",
+        ProviderId::FactoryDroid => "factory-droid",
+        ProviderId::Devin => "devin",
+        ProviderId::CodeBuddy => "codebuddy",
+        ProviderId::GlmAgent => "glm-agent",
+        ProviderId::KiloCode => "kilo-code",
+        ProviderId::Amp => "amp",
     }
 }
 
@@ -3160,6 +3283,55 @@ mod tests {
                 vec!["--acp"],
                 None,
             ),
+            (
+                AcpProviderConfig::auggie(),
+                ProviderId::Auggie,
+                "Augment Auggie",
+                vec!["--acp"],
+                None,
+            ),
+            (
+                AcpProviderConfig::factory_droid(),
+                ProviderId::FactoryDroid,
+                "Factory Droid",
+                vec!["exec", "--output-format", "acp-daemon"],
+                None,
+            ),
+            (
+                AcpProviderConfig::devin(),
+                ProviderId::Devin,
+                "Devin",
+                vec!["acp"],
+                None,
+            ),
+            (
+                AcpProviderConfig::codebuddy(),
+                ProviderId::CodeBuddy,
+                "Tencent CodeBuddy",
+                vec!["--acp"],
+                None,
+            ),
+            (
+                AcpProviderConfig::glm_agent(),
+                ProviderId::GlmAgent,
+                "GLM Agent",
+                vec![],
+                None,
+            ),
+            (
+                AcpProviderConfig::kilo(),
+                ProviderId::KiloCode,
+                "Kilo Code",
+                vec!["acp"],
+                None,
+            ),
+            (
+                AcpProviderConfig::amp(),
+                ProviderId::Amp,
+                "Amp",
+                vec![],
+                None,
+            ),
         ];
 
         for (profile, provider, display_name, agent_args, auth_method) in profiles {
@@ -3169,6 +3341,23 @@ mod tests {
             assert_eq!(profile.version_args, ["--version"]);
             assert_eq!(profile.auth_method, auth_method);
             assert!(matches!(profile.flavor, AcpFlavor::Standard));
+            match provider {
+                ProviderId::Auggie => assert_eq!(
+                    profile.process_env,
+                    BTreeMap::from([("AUGMENT_DISABLE_AUTO_UPDATE".to_owned(), "1".to_owned())])
+                ),
+                ProviderId::FactoryDroid => assert_eq!(
+                    profile.process_env,
+                    BTreeMap::from([
+                        ("DROID_DISABLE_AUTO_UPDATE".to_owned(), "true".to_owned()),
+                        (
+                            "FACTORY_DROID_AUTO_UPDATE_ENABLED".to_owned(),
+                            "false".to_owned()
+                        ),
+                    ])
+                ),
+                _ => assert!(profile.process_env.is_empty()),
+            }
         }
     }
 
