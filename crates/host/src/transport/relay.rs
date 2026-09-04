@@ -20,6 +20,7 @@ use crate::{
 };
 
 const RELAY_SUBPROTOCOL: &str = "agent-remote-relay.cbor.v1";
+const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const COMMAND_QUEUE_CAPACITY: usize = 32;
 const RESPONSE_QUEUE_CAPACITY: usize = 128;
 const SCOPED_WORKER_IDLE: Duration = Duration::from_secs(30);
@@ -99,8 +100,14 @@ pub async fn run_once(service: Arc<AppService>, config: &RelayClientConfig) -> R
     let mut next_client_generation = 0_u64;
     let (response_tx, mut response_rx) = mpsc::channel(RESPONSE_QUEUE_CAPACITY);
     let mut updates = service.subscribe();
+    let mut keepalive = tokio::time::interval(RELAY_KEEPALIVE_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    keepalive.tick().await;
     loop {
         tokio::select! {
+            _ = keepalive.tick() => {
+                sink.send(Message::Ping(Vec::new().into())).await?;
+            }
             incoming = stream.next() => {
                 let Some(incoming) = incoming else { bail!("relay closed the WebSocket") };
                 match incoming? {

@@ -105,7 +105,7 @@ cargo xtask provider-smoke --provider opencode
 | Provider | Host 启动方式 | 临时环境安装/版本 | 协议占位 | 真实模型回合 |
 |---|---|---|---|---|
 | OpenAI Codex | `codex app-server --stdio` | ✅ 0.150.1 | ✅ app-server | ✅ PASS |
-| Grok Build | `grok --no-auto-update agent stdio` | ✅ 1.0.13 | ✅ ACP `initialize` | ✅ PASS（Windows 同系统链路） |
+| Grok Build | `grok --no-auto-update agent stdio` | ✅ 1.0.13 | ✅ ACP `initialize` | ✅ PASS（Windows 与 WSL Host） |
 | Claude Code | `claude-agent-acp` | ⏭ 按要求未安装 | ⏭ 未测 | ⏭ 未测 |
 | Gemini CLI | `gemini --acp` | ⏭ 按要求未安装 | ⏭ 未测 | ⏭ 未测 |
 | GitHub Copilot CLI | `copilot --acp --stdio --no-auto-update` | ✅ 1.0.82 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
@@ -128,7 +128,7 @@ cargo xtask provider-smoke --provider opencode
 | Amp | `amp-acp` | ✅ bridge 0.9.0 | ✅ ACP `initialize` | ⏭ 按要求不再授权；停止于占位 |
 | ZCode 3.11.2（非内置 Provider） | 无公开 Host 协议 | ✅ WSLg AppImage 启动 | ⏭ 无 ACP/app-server/SDK/API | ✅ GUI PASS（免费 GLM-5.3-Flash，非 Host） |
 
-Codex 和 OpenCode 的 Host 真实回合勾选来自 2026-09-04 的既有记录；OpenCode 当时使用 1.18.25，本次隔离环境安装的是 1.18.27。Grok 1.0.13 于 2026-09-05 由当前源码构建的 Windows Host 直接调用已登录的 Windows Grok，在 Windows 临时项目中返回精确标记。ZCode 同日通过自身 GUI 使用免费 GLM-5.3-Flash 返回精确标记，但没有可供 GeneralAgentRemote Host 调用的公共协议。其余已安装 Provider 只执行版本检查和一次 ACP `initialize`；没有发送 `authenticate`、`session/new`、`session/prompt` 或模型请求。完整边界见 [Provider 兼容性](docs/provider-compatibility.md#verification-status-and-real-smoke-policy)。
+Codex 和 OpenCode 的 Host 真实回合勾选来自 2026-09-04 的既有记录；OpenCode 当时使用 1.18.25，本次隔离环境安装的是 1.18.27。Grok 1.0.13 于 2026-09-05 先由当前源码构建的 Windows Host 直接调用已登录的 Windows Grok，在 Windows 临时项目中返回精确标记；随后 Linux Grok 通过 WSL Host 复用 Windows `GROK_HOME` 登录态，在 WSL 临时项目中再次返回相同标记。ZCode 同日通过自身 GUI 使用免费 GLM-5.3-Flash 返回精确标记，但没有可供 GeneralAgentRemote Host 调用的公共协议。其余已安装 Provider 只执行版本检查和一次 ACP `initialize`；没有发送 `authenticate`、`session/new`、`session/prompt` 或模型请求。完整边界见 [Provider 兼容性](docs/provider-compatibility.md#verification-status-and-real-smoke-policy)。
 
 ### Android 16 模拟器实测
 
@@ -142,6 +142,7 @@ Codex 和 OpenCode 的 Host 真实回合勾选来自 2026-09-04 的既有记录�
 | 一次性链接配对并进入在线状态 | ✅ PASS |
 | 真实 Codex 发送与六阶段关联链 | ✅ PASS：首个 Provider 事件 17.264 秒 |
 | 第二次真实发送延迟 | ✅ PASS：首个 Provider 事件 6.494 秒 |
+| Windows 登录态迁移后的真实 Grok 发送 | ✅ PASS：六阶段完整，首个 Provider 事件 8.679 秒，最终回复 `OK` |
 | 项目树展开/折叠 | ✅ PASS：展开态显示 9 条会话 |
 | 强制停止后自动重连 | ✅ PASS：2.947 秒恢复认证在线 |
 | 竖屏与横屏布局 | ✅ PASS：逐图确认内容、输入框和控制项完整可见 |
@@ -150,6 +151,8 @@ Codex 和 OpenCode 的 Host 真实回合勾选来自 2026-09-04 的既有记录�
 本机启动 Android 16 AVD、跨 WSL 调用 Windows ADB、配对和场景命令已经写入 [`AGENTS.md`](AGENTS.md#13-android-16-emulator-test-tutorial)。
 
 需要由 Codex/AI 在电脑端驱动一台已明确连接的 Android 设备时，使用 `cargo xtask android-device doctor|prepare|inspect|ui|scenario|logs|capture`。该工具只通过本地 adb 和稳定 accessibility ID 执行开发测试，不会把远程终端能力加入产品；完整命令见 [Android 文档](docs/android.md#aicli-device-test-driver)。
+
+同日正式公网 Relay 已通过 Windows 原生远程通道更新：`/health` 返回 `ok`，公网 WebAssembly 包含 `agent-remote.cbor.v5`，WebSocket 握手返回 `101 Switching Protocols` 并协商 v5，正式 WSL Host 已重新注册。Host 每 30 秒发送标准 WebSocket Ping；实测连续 160 秒 PID 未变、重启次数为 0，已跨过此前约 125 秒的空闲断开窗口。
 
 ## 安全边界
 

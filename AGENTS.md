@@ -421,3 +421,17 @@ cargo xtask android-device --serial "$DEVICE_SERIAL" capture --output dist/andro
 ```
 
 The real send scenario must report the correlated stages `click`, `local_pending`, `websocket_write`, `host_received`, `provider_received`, and `first_provider_event` for one command/message identity. Treat generated PNGs as evidence only after visually checking that the app is foreground, content is rendered, and both portrait and landscape are usable; screen bounds alone do not prove a valid render. Keep mock and real scenario results separate.
+
+## 14. Windows and WSL interoperability on this workstation
+
+When a command, login, deployment credential, device, or Provider appears unavailable in WSL, inspect the existing Windows environment before treating it as missing. Windows executables may be called directly through `powershell.exe`, `cmd.exe`, or their absolute `/mnt/c/Windows/...` paths. Use the platform that owns the credential and project path for a real Provider run; for example, a Windows Agent should be tested with a Windows Host build and a Windows project path instead of receiving a WSL path.
+
+Preserve Windows originals when bringing required state into WSL. Copy credentials only when the task needs them, keep them outside the repository, restrict credential files to mode `600` and helper commands to mode `700`, and never print secret values. Prefer a small explicit environment file or tool-specific home setting over copying browser profiles or whole user directories. Verify the migrated command with a read-only operation before using it for a deployment or Provider turn.
+
+The private ServerHub command channel is available in WSL as:
+
+```bash
+serverhub-remote "hostname"
+```
+
+Its local helper is `~/.local/bin/serverhub-remote` and its credential file is `~/.config/agent-remote/serverhub-ntfy.env`. The helper deliberately invokes Windows `curl.exe`, because that is the verified authenticated route on this workstation. Neither file belongs in Git.
