@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use agent_remote_protocol::encode;
 use anyhow::Result;
@@ -19,12 +19,15 @@ use tower_http::services::{ServeDir, ServeFile};
 use crate::{
     app::AppService,
     transport::session::{
-        ApplicationSession, AuthRateLimiter, AuthenticatedSession, CommandSchedule,
+        ApplicationSession, AuthRateLimiter, AuthenticatedSession, CommandSchedule, CommandScope,
     },
 };
 
-pub const WS_SUBPROTOCOL: &str = "agent-remote.cbor.v1";
+pub const WS_SUBPROTOCOL: &str = "agent-remote.cbor.v2";
 const MAX_WS_MESSAGE_BYTES: usize = 12 * 1024 * 1024;
+const COMMAND_QUEUE_CAPACITY: usize = 32;
+const RESPONSE_QUEUE_CAPACITY: usize = 64;
+const SCOPED_WORKER_IDLE: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct DirectState {
@@ -84,8 +87,8 @@ async fn run_socket(socket: WebSocket, state: DirectState, peer: SocketAddr) {
         peer.ip().to_string(),
     );
     let mut updates = state.service.subscribe();
-    let (response_tx, mut response_rx) = mpsc::unbounded_channel();
-    let mut ordered_tx = None;
+    let (response_tx, mut response_rx) = mpsc::channel(RESPONSE_QUEUE_CAPACITY);
+    let mut scoped_txs: HashMap<CommandScope, mpsc::WeakSender<Vec<u8>>> = HashMap::new();
     loop {
         tokio::select! {
             incoming = receiver.next() => {
@@ -99,17 +102,27 @@ async fn run_socket(socket: WebSocket, state: DirectState, peer: SocketAddr) {
                                     let response_tx = response_tx.clone();
                                     tokio::spawn(async move {
                                         let response = authenticated.process(&payload).await;
-                                        let _ = response_tx.send(response);
+                                        let _ = response_tx.send(response).await;
                                     });
                                 }
-                                CommandSchedule::Ordered => {
-                                    let ordered_tx = ordered_tx.get_or_insert_with(|| {
-                                        spawn_ordered_worker(
-                                            authenticated,
-                                            response_tx.clone(),
-                                        )
-                                    });
-                                    if ordered_tx.send(payload).is_err() {
+                                CommandSchedule::Scoped(scope) => {
+                                    scoped_txs.retain(|_, sender| sender.strong_count() > 0);
+                                    let scoped_tx = scoped_txs
+                                        .get(&scope)
+                                        .and_then(mpsc::WeakSender::upgrade)
+                                        .unwrap_or_else(|| {
+                                            let sender = spawn_scoped_worker(
+                                                authenticated.clone(),
+                                                response_tx.clone(),
+                                            );
+                                            scoped_txs.insert(scope, sender.downgrade());
+                                            sender
+                                        });
+                                    if scoped_tx.try_send(payload).is_err() {
+                                        let _ = sender.send(Message::Close(Some(CloseFrame {
+                                            code: 1013,
+                                            reason: "command scope queue is full; reconnect and retry unacknowledged commands".into(),
+                                        }))).await;
                                         break;
                                     }
                                 }
@@ -165,15 +178,34 @@ async fn run_socket(socket: WebSocket, state: DirectState, peer: SocketAddr) {
     }
 }
 
-fn spawn_ordered_worker(
+fn spawn_scoped_worker(
     session: AuthenticatedSession,
-    response_tx: mpsc::UnboundedSender<Vec<u8>>,
-) -> mpsc::UnboundedSender<Vec<u8>> {
-    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    response_tx: mpsc::Sender<Vec<u8>>,
+) -> mpsc::Sender<Vec<u8>> {
+    let (command_tx, mut command_rx) = mpsc::channel::<Vec<u8>>(COMMAND_QUEUE_CAPACITY);
+    let keepalive = command_tx.clone();
     tokio::spawn(async move {
-        while let Some(payload) = command_rx.recv().await {
-            let response = session.process(&payload).await;
-            let _ = response_tx.send(response);
+        let _keepalive = keepalive;
+        loop {
+            match tokio::time::timeout(SCOPED_WORKER_IDLE, command_rx.recv()).await {
+                Ok(Some(payload)) => {
+                    let response = session.process(&payload).await;
+                    if response_tx.send(response).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    command_rx.close();
+                    while let Some(payload) = command_rx.recv().await {
+                        let response = session.process(&payload).await;
+                        if response_tx.send(response).await.is_err() {
+                            return;
+                        }
+                    }
+                    break;
+                }
+            }
         }
     });
     command_tx
@@ -598,6 +630,7 @@ mod tests {
         let send_id = CommandId::new();
         let send = ClientCommand::SendMessage {
             command_id: send_id,
+            attempt: 0,
             conversation_id,
             client_message_id: Some("direct-test".to_owned()),
             text: "hello".to_owned(),
@@ -716,6 +749,86 @@ mod tests {
                 break;
             }
         }
+        harness.task.abort();
+    }
+
+    #[tokio::test]
+    async fn slow_project_sync_does_not_block_send_or_steer() {
+        let (harness, mut socket) = authenticated_direct().await;
+        let conversation_id = create_conversation(&mut socket, harness.project_id).await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *harness
+            .provider
+            .session_list_gate
+            .lock()
+            .expect("session list gate mutex") = Some(Arc::clone(&gate));
+        send_client(
+            &mut socket,
+            &ClientCommand::SyncProject {
+                command_id: CommandId::new(),
+                project_id: harness.project_id,
+                provider: ProviderId::Codex,
+            },
+        )
+        .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            harness.provider.session_list_started.notified(),
+        )
+        .await
+        .expect("sync command did not reach provider");
+
+        let send_id = CommandId::new();
+        send_client(
+            &mut socket,
+            &ClientCommand::SendMessage {
+                command_id: send_id,
+                attempt: 0,
+                conversation_id,
+                client_message_id: Some("send-during-sync".to_owned()),
+                text: "hello".to_owned(),
+                attachments: Vec::new(),
+            },
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    receive_server(&mut socket).await,
+                    ServerMessage::CommandAccepted { command_id } if command_id == send_id
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("slow project sync blocked send");
+
+        let steer_id = CommandId::new();
+        send_client(
+            &mut socket,
+            &ClientCommand::Steer {
+                command_id: steer_id,
+                conversation_id,
+                text: "continue".to_owned(),
+            },
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    receive_server(&mut socket).await,
+                    ServerMessage::CommandAccepted { command_id } if command_id == steer_id
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("slow project sync blocked steer");
+        assert_eq!(harness.provider.sends.load(Ordering::SeqCst), 1);
+
+        gate.add_permits(1);
         harness.task.abort();
     }
 

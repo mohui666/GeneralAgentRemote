@@ -7,6 +7,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
+mod android_device;
+
 const TRUNK_VERSION: &str = "0.21.14";
 
 #[derive(Parser)]
@@ -24,6 +26,7 @@ enum Task {
         #[arg(long)]
         release: bool,
     },
+    AndroidDevice(android_device::AndroidDeviceArgs),
     Web {
         #[arg(long)]
         release: bool,
@@ -46,6 +49,19 @@ fn main() -> Result<()> {
         Task::Build => build(&root),
         Task::Test => test(&root),
         Task::Android { release } => build_android(&root, release),
+        Task::AndroidDevice(args) => {
+            let json = args.json;
+            let command = args.command_name();
+            let mut build = || build_android_with_output(&root, false, !json);
+            match android_device::run(&root, &args, &mut build) {
+                Ok(report) => report.emit(json),
+                Err(error) if json => {
+                    android_device::emit_error(command, &error)?;
+                    std::process::exit(1);
+                }
+                Err(error) => Err(error),
+            }
+        }
         Task::Web { release } => build_web(&root, release),
         Task::DevHost { args } => {
             build_web(&root, false)?;
@@ -172,6 +188,10 @@ fn build_web(root: &Path, release: bool) -> Result<()> {
 }
 
 fn build_android(root: &Path, release: bool) -> Result<()> {
+    build_android_with_output(root, release, true)
+}
+
+fn build_android_with_output(root: &Path, release: bool, show_output: bool) -> Result<()> {
     let android = root.join("android");
     let wrapper = android.join(if cfg!(windows) {
         "gradlew.bat"
@@ -190,7 +210,11 @@ fn build_android(root: &Path, release: bool) -> Result<()> {
     command
         .current_dir(&android)
         .args(["--no-daemon", "testDebugUnitTest", task]);
-    run_command(command, "Android build")?;
+    if show_output {
+        run_command(command, "Android build")?;
+    } else {
+        run_command_captured(command, "Android build")?;
+    }
 
     let variant = if release { "release" } else { "debug" };
     let apk_name = if release {
@@ -211,7 +235,9 @@ fn build_android(root: &Path, release: bool) -> Result<()> {
     };
     let destination = output.join(destination_name);
     fs::copy(&source, &destination).with_context(|| format!("copy {}", source.display()))?;
-    println!("Android APK: {}", destination.display());
+    if show_output {
+        println!("Android APK: {}", destination.display());
+    }
     Ok(())
 }
 
@@ -276,6 +302,21 @@ fn run_command(mut command: Command, label: &str) -> Result<()> {
     let status = command.status().with_context(|| format!("start {label}"))?;
     if !status.success() {
         bail!("{label} failed with {status}");
+    }
+    Ok(())
+}
+
+fn run_command_captured(mut command: Command, label: &str) -> Result<()> {
+    let output = command.output().with_context(|| format!("start {label}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = [stdout.trim(), stderr.trim()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!("{label} failed with {}: {}", output.status, detail);
     }
     Ok(())
 }

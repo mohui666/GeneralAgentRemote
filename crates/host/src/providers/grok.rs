@@ -856,14 +856,12 @@ impl AgentProvider for GrokProvider {
         let shared = Arc::clone(&self.shared);
         let session_id = request.native_session_id.clone();
         let conversation_id = request.conversation_id;
+        let pending_response = connection_to_agent.send_request(PromptRequest::new(
+            SessionId::new(session_id.clone()),
+            vec![ContentBlock::Text(TextContent::new(request.text))],
+        ));
         tokio::spawn(async move {
-            let result = connection_to_agent
-                .send_request(PromptRequest::new(
-                    SessionId::new(session_id.clone()),
-                    vec![ContentBlock::Text(TextContent::new(request.text))],
-                ))
-                .block_task()
-                .await;
+            let result = pending_response.block_task().await;
             shared.finish_turn(project_id, &session_id);
             let kind = match result {
                 Ok(response) => stop_reason_event(response.stop_reason),

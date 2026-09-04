@@ -23,11 +23,11 @@ phone / desktop browser
  JSONL stdio       ACP v1 JSON-RPC
 ```
 
-The Host owns Provider processes, authorized project paths, native-session mappings, conversation state, merged timeline items, approvals, device credentials, command idempotency, Provider sync cursors, and managed images. The Relay and clients are projections of Host state. A reconnect first requests a Snapshot containing the newest 100 timeline items per conversation, refreshes projects for the selected Provider, then syncs the selected project. Older items use a stable `(created_at_ms, item_id)` cursor. Android and Web each retain at most one unacknowledged send for replay after reconnect; this is not a general offline work queue.
+The Host owns Provider processes, authorized project paths, native-session mappings, conversation state, merged timeline items, approvals, device credentials, command idempotency, Provider sync cursors, and managed images. The Relay and clients are projections of Host state. A reconnect first receives a fast Snapshot from local SQLite/memory state, then Provider capabilities and project metadata refresh incrementally. Project sync imports conversation metadata only; opening a conversation loads stale remote history and older local items use a stable `(created_at_ms, item_id)` cursor. Android and Web each retain at most one unacknowledged send for replay after reconnect; this is not a general offline work queue.
 
 ## Crate responsibilities
 
-- `agent-remote-protocol` contains wire-safe IDs, Provider capability summaries, conversations, timeline variants, attachment metadata, commands, server messages, and Relay frames. Every encoded CBOR envelope carries protocol version `1`. Attachment and tunneled payload bytes use CBOR byte strings.
+- `agent-remote-protocol` contains wire-safe IDs, Provider capability summaries, conversations, timeline variants, attachment metadata, commands, server messages, and Relay frames. Application CBOR envelopes use protocol version `2`; the unchanged opaque Host↔Relay tunnel remains version `1`. Attachment and tunneled payload bytes use CBOR byte strings.
 - `agent-remote-host` validates project boundaries, persists state with SQLite, runs Provider protocol adapters, imports remote session history, merges history and streaming deltas by stable item ID/revision, serves the web application, authenticates direct clients, and maintains the optional outbound Relay tunnel.
 - `agent-remote-relay` maintains an in-memory `host_id -> Host connection` registry. Its per-Host and per-client channels are bounded. A slow client is closed and must reconnect for a Snapshot.
 - `agent-remote-web` is a Yew CSR application. It sends and receives only binary CBOR WebSocket frames. Device credentials are origin-scoped browser `localStorage` records; browsers do not expose an OS credential vault to WASM.
@@ -39,11 +39,11 @@ The WASM build uses Cargo release mode with thin LTO. The `wasm-opt` stage bundl
 
 ## Direct and Relay equivalence
 
-Direct `/ws` and logical Relay clients both enter the same `ApplicationSession`. The first application message must be `Pair` or `Authenticate`; subsequent messages are handled by the same Host service. Relay multiplexing adds only `OpenClient`, opaque `Payload`, and `Close` frames and does not reinterpret the application message.
+Direct `/ws` and logical Relay clients both enter the same `ApplicationSession`. The first application message must be `Pair` or `Authenticate`; subsequent messages are handled by the same Host service. Relay multiplexing adds only `OpenClient`, opaque `Payload`, and `Close` frames and does not reinterpret the application message. Slow synchronization work is scoped by project while mutations are ordered by conversation; `Send`, `Steer`, and `Interrupt` do not wait behind another project's refresh or history load.
 
 ## Project confinement
 
-The Host CLI canonicalizes every added project. A conversation permanently binds `ProviderId + ProjectId + native_session_id`. Provider cwd, Codex thread filtering, ACP filesystem calls, and ACP terminal cwd use that project root. Existing paths are canonicalized before checking containment. New write paths reject parent traversal and validate their canonical parent. Only project-relative paths are placed in timeline messages.
+The Host CLI canonicalizes every added project. A conversation permanently binds `ProviderId + ProjectId + native_session_id`. Provider cwd, Codex thread classification, ACP filesystem calls, and ACP terminal cwd use that project root. Codex remains the sole owner of its native session store (including a configured `CODEX_HOME`): GeneralAgentRemote only uses `thread/list`, `thread/read`, `thread/resume`, and `thread/start`, and never scans or writes `.codex/sessions`. A paginated Codex listing is classified on the Host by exact normalized cwd against authorized projects; unmatched threads are excluded and only their count may appear in diagnostics. Existing paths are canonicalized before checking containment. New write paths reject parent traversal and validate their canonical parent. Only project-relative paths are placed in timeline messages.
 
 ## Persistence
 

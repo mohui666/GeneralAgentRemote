@@ -79,6 +79,12 @@ data class ProjectSummary(
     val conversationCount: Int,
 )
 
+data class ProjectTreeScope(
+    val hostId: UUID,
+    val provider: ProviderId,
+    val projectId: UUID,
+)
+
 data class SessionSummary(
     val nativeSessionId: String,
     val title: String,
@@ -257,6 +263,13 @@ sealed interface ServerEvent {
     data class ConversationRemoved(val conversationId: UUID) : ServerEvent
     data class AttachmentReceived(val attachment: AttachmentData) : ServerEvent
     data class HostStatus(val hostId: UUID, val online: Boolean, val message: String?) : ServerEvent
+    data class SendTrace(
+        val commandId: UUID,
+        val clientMessageId: String,
+        val conversationId: UUID,
+        val stage: String,
+        val elapsedMs: Long,
+    ) : ServerEvent
     data class CommandAccepted(val commandId: UUID) : ServerEvent
     data class CommandRejected(
         val commandId: UUID?,

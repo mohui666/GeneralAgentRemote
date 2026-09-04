@@ -92,22 +92,22 @@ Generate or consume provider schemas from the installed provider version when th
 
 Desktop defaults:
 
-- approximately `220px` wide;
-- no more than approximately `248px`;
-- collapsed width approximately `56px`;
+- approximately `190px` wide;
+- no more than approximately `208px`;
+- collapsed width approximately `46px`;
 - persist width and collapsed state.
 
 The sidebar contains, in order:
 
 1. compact connection status;
 2. Host/Agent switcher;
-3. current-project selector;
+3. projects as stable scoped, collapsed-by-default tree nodes;
 4. one-click **New conversation** action;
-5. conversation search for the current project;
-6. current project's conversations grouped by recency;
+5. project and conversation search that preserves the tree hierarchy;
+6. conversations inside their owning project's expanded region, newest first;
 7. settings and collapse control.
 
-Do not render all projects and all conversations as one permanently expanded tree. Open project selection in a searchable popover/sheet with recent, pinned, and all authorized projects. On mobile, use a dismissible drawer and close it after project or conversation selection.
+The project tree must default to only the current project expanded and allow explicit per-project expansion. Persist expansion by Host + Provider + stable project ID, and automatically expand the owning project when a conversation is selected or matched by search. Do not render every project's conversations while collapsed, trigger synchronization merely by expanding/collapsing, or leave all projects permanently expanded. On mobile, use a dismissible drawer and close it after project or conversation selection.
 
 ### Project selection
 

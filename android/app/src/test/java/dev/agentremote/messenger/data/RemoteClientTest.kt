@@ -1,15 +1,23 @@
 package dev.agentremote.messenger.data
 
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.dataformat.cbor.CBORFactory
 import dev.agentremote.messenger.model.ConnectionTarget
 import dev.agentremote.messenger.model.ServerEvent
 import dev.agentremote.messenger.model.StoredCredential
 import java.io.IOException
+import java.nio.ByteBuffer
 import java.util.UUID
+import okhttp3.Protocol
 import okhttp3.Request
+import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
+import okio.ByteString.Companion.toByteString
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -63,8 +71,67 @@ class RemoteClientTest {
                 null,
             )
 
+            authenticate(opened.last(), target())
+            opened.last().socket.binarySendCount = 0
             assertTrue(client.send(byteArrayOf(1)))
             assertEquals(1, opened.last().socket.binarySendCount)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun applicationFramesRequireAuthenticationForCurrentGeneration() {
+        val opened = mutableListOf<OpenedSocket>()
+        val target = target()
+        val client = RemoteClient(
+            listener = NoOpListener,
+            socketOpener = WebSocketOpener { request, listener ->
+                val socket = FakeWebSocket(request)
+                opened += OpenedSocket(socket, listener)
+                socket
+            },
+        )
+
+        try {
+            client.connect(target)
+            assertFalse(client.send(byteArrayOf(1)))
+
+            authenticate(opened.single(), target)
+            assertTrue(client.send(byteArrayOf(1)))
+
+            client.retryNow()
+            authenticate(opened.first(), target)
+            assertFalse(client.send(byteArrayOf(1)))
+
+            authenticate(opened.last(), target)
+            assertTrue(client.send(byteArrayOf(1)))
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun websocketSendFalseIsReturnedToCaller() {
+        val opened = mutableListOf<OpenedSocket>()
+        val target = target()
+        val client = RemoteClient(
+            listener = NoOpListener,
+            socketOpener = WebSocketOpener { request, listener ->
+                val socket = FakeWebSocket(request)
+                opened += OpenedSocket(socket, listener)
+                socket
+            },
+        )
+
+        try {
+            client.connect(target)
+            authenticate(opened.single(), target)
+            opened.single().socket.sendResult = false
+
+            assertFalse(client.send(byteArrayOf(1)))
+            opened.single().socket.sendResult = true
+            assertFalse(client.send(byteArrayOf(1)))
         } finally {
             client.close()
         }
@@ -113,8 +180,38 @@ class RemoteClientTest {
         val listener: WebSocketListener,
     )
 
+    private fun authenticate(opened: OpenedSocket, target: ConnectionTarget) {
+        opened.listener.onOpen(
+            opened.socket,
+            Response.Builder()
+                .request(opened.socket.request())
+                .protocol(Protocol.HTTP_1_1)
+                .code(101)
+                .message("Switching Protocols")
+                .header("Sec-WebSocket-Protocol", "agent-remote.cbor.v2")
+                .build(),
+        )
+        val credential = requireNotNull(target.credential)
+        val mapper = ObjectMapper(CBORFactory())
+        val envelope = mapper.createObjectNode().apply {
+            put("protocol_version", 2)
+            set<JsonNode>("message", mapper.createObjectNode().apply {
+                put("type", "authenticated")
+                set<JsonNode>("host_id", mapper.nodeFactory.binaryNode(uuidBytes(credential.hostId)))
+                set<JsonNode>("device_id", mapper.nodeFactory.binaryNode(uuidBytes(credential.deviceId)))
+            })
+        }
+        opened.listener.onMessage(opened.socket, mapper.writeValueAsBytes(envelope).toByteString())
+    }
+
+    private fun uuidBytes(uuid: UUID): ByteArray = ByteBuffer.allocate(16)
+        .putLong(uuid.mostSignificantBits)
+        .putLong(uuid.leastSignificantBits)
+        .array()
+
     private class FakeWebSocket(private val request: Request) : WebSocket {
         var binarySendCount = 0
+        var sendResult = true
 
         override fun request(): Request = request
 
@@ -124,7 +221,7 @@ class RemoteClientTest {
 
         override fun send(bytes: ByteString): Boolean {
             binarySendCount += 1
-            return true
+            return sendResult
         }
 
         override fun close(code: Int, reason: String?): Boolean = true

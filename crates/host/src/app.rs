@@ -1,18 +1,19 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Component, Path},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use agent_remote_protocol::{
-    ApprovalId, AttachmentCapability, AttachmentId, ClientAttachment, ClientCommand, Conversation,
-    ConversationId, ConversationState, ConversationTitleSource, DeviceId, HostId, ProjectId,
-    ProjectSummary, ProviderCapability, ProviderId, ServerMessage, Snapshot, TimelineItem,
-    TimelineItemId, TimelineItemKind,
+    ApprovalId, AttachmentCapability, AttachmentId, ClientAttachment, ClientCommand, CommandId,
+    Conversation, ConversationId, ConversationState, ConversationTitleSource, DeviceId, HostId,
+    ProjectId, ProjectSummary, ProviderCapability, ProviderId, SendTraceStage, ServerMessage,
+    Snapshot, TimelineItem, TimelineItemId, TimelineItemKind,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::broadcast;
@@ -33,6 +34,18 @@ struct PendingApproval {
     conversation_id: ConversationId,
     provider_request_id: String,
 }
+
+#[derive(Debug, Clone)]
+struct PendingSendTrace {
+    command_id: CommandId,
+    client_message_id: String,
+    started_at: Instant,
+    provider_received: bool,
+    first_provider_event_elapsed_ms: Option<u64>,
+}
+
+const SNAPSHOT_TIMELINE_ITEMS_PER_CONVERSATION: usize = 64;
+const STREAM_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
 
 type CommandExecutionKey = (DeviceId, agent_remote_protocol::CommandId);
 
@@ -72,6 +85,28 @@ struct ConversationMutationTicket<'a> {
     entries: &'a Mutex<HashMap<ConversationId, ConversationMutationEntry>>,
 }
 
+struct ProjectMutationEntry {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    users: usize,
+}
+
+struct ProjectMutationTicket<'a> {
+    project_id: ProjectId,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    entries: &'a Mutex<HashMap<ProjectId, ProjectMutationEntry>>,
+}
+
+struct HistoryLoadEntry {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    users: usize,
+}
+
+struct HistoryLoadTicket<'a> {
+    conversation_id: ConversationId,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    entries: &'a Mutex<HashMap<ConversationId, HistoryLoadEntry>>,
+}
+
 impl Drop for ConversationMutationTicket<'_> {
     fn drop(&mut self) {
         let mut entries = self
@@ -91,6 +126,41 @@ impl Drop for ConversationMutationTicket<'_> {
     }
 }
 
+impl Drop for ProjectMutationTicket<'_> {
+    fn drop(&mut self) {
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("project mutation mutex poisoned");
+        let remove = {
+            let entry = entries
+                .get_mut(&self.project_id)
+                .expect("project mutation entry");
+            entry.users -= 1;
+            entry.users == 0
+        };
+        if remove {
+            entries.remove(&self.project_id);
+        }
+    }
+}
+
+impl Drop for HistoryLoadTicket<'_> {
+    fn drop(&mut self) {
+        let mut entries = self.entries.lock().expect("history load mutex poisoned");
+        let remove = {
+            let entry = entries
+                .get_mut(&self.conversation_id)
+                .expect("history load entry");
+            entry.users -= 1;
+            entry.users == 0
+        };
+        if remove {
+            entries.remove(&self.conversation_id);
+        }
+    }
+}
+
 pub struct AppService {
     storage: Arc<Storage>,
     attachments: AttachmentStore,
@@ -99,13 +169,18 @@ pub struct AppService {
     host_name: String,
     updates: broadcast::Sender<ServerMessage>,
     timeline_cache: Mutex<HashMap<TimelineItemId, TimelineItem>>,
+    stream_item_persisted_at: Mutex<HashMap<TimelineItemId, Instant>>,
+    provider_capability_cache: Mutex<HashMap<(ProjectId, ProviderId), ProviderCapability>>,
     provider_item_ids: Mutex<HashMap<(ConversationId, String), TimelineItemId>>,
     approvals: Mutex<HashMap<ApprovalId, PendingApproval>>,
     provider_approval_ids: Mutex<HashMap<(ConversationId, String), ApprovalId>>,
     event_pumps_started: AtomicBool,
-    conversation_start_lock: tokio::sync::Mutex<()>,
     command_execution_locks: Mutex<HashMap<CommandExecutionKey, CommandExecutionEntry>>,
     conversation_mutation_locks: Mutex<HashMap<ConversationId, ConversationMutationEntry>>,
+    project_mutation_locks: Mutex<HashMap<ProjectId, ProjectMutationEntry>>,
+    history_load_locks: Mutex<HashMap<ConversationId, HistoryLoadEntry>>,
+    remote_history_cursors: Mutex<HashMap<ConversationId, String>>,
+    pending_send_traces: Mutex<HashMap<ConversationId, VecDeque<PendingSendTrace>>>,
 }
 
 impl AppService {
@@ -130,13 +205,18 @@ impl AppService {
             host_name,
             updates,
             timeline_cache: Mutex::new(timeline_cache),
+            stream_item_persisted_at: Mutex::new(HashMap::new()),
+            provider_capability_cache: Mutex::new(HashMap::new()),
             provider_item_ids: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             provider_approval_ids: Mutex::new(HashMap::new()),
             event_pumps_started: AtomicBool::new(false),
-            conversation_start_lock: tokio::sync::Mutex::new(()),
             command_execution_locks: Mutex::new(HashMap::new()),
             conversation_mutation_locks: Mutex::new(HashMap::new()),
+            project_mutation_locks: Mutex::new(HashMap::new()),
+            history_load_locks: Mutex::new(HashMap::new()),
+            remote_history_cursors: Mutex::new(HashMap::new()),
+            pending_send_traces: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -202,68 +282,29 @@ impl AppService {
         let mut provider_capabilities = Vec::new();
         for project in &projects {
             for provider_id in &project.enabled_providers {
-                let provider = match self.providers.get(*provider_id) {
-                    Ok(provider) => provider,
-                    Err(error) => {
-                        provider_capabilities.push(ProviderCapability {
-                            provider: *provider_id,
-                            project_id: project.id,
-                            health: agent_remote_protocol::ProviderHealth {
-                                provider: *provider_id,
-                                state: agent_remote_protocol::ProviderState::Offline,
-                                version: None,
-                                detail: Some(error.to_string()),
-                            },
-                            models: Vec::new(),
-                            supports_session_list: false,
-                            supports_history: false,
-                            supports_incremental_sync: false,
-                            supports_rename: false,
-                            supports_steer: false,
-                            permission_modes: Vec::new(),
-                            default_permission_mode: None,
-                            attachments: AttachmentCapability::default(),
-                            sessions: Vec::new(),
-                            limitation: Some("Provider adapter is unavailable".to_owned()),
-                        });
-                        continue;
-                    }
-                };
-                let health = provider.health().await;
-                let models_result = provider.list_models(project).await;
-                let sessions_result = provider.list_sessions(project).await;
-                let limitation = models_result
-                    .as_ref()
-                    .err()
-                    .map(ToString::to_string)
-                    .or_else(|| sessions_result.as_ref().err().map(ToString::to_string));
-                let capabilities = provider.capabilities();
-                provider_capabilities.push(ProviderCapability {
-                    provider: *provider_id,
-                    project_id: project.id,
-                    health,
-                    models: models_result.unwrap_or_default(),
-                    supports_session_list: capabilities.supports_session_list,
-                    supports_history: capabilities.supports_history,
-                    supports_incremental_sync: capabilities.supports_incremental_sync,
-                    supports_rename: capabilities.supports_rename,
-                    supports_steer: capabilities.supports_steer,
-                    permission_modes: provider.permission_modes(),
-                    default_permission_mode: provider.default_permission_mode(),
-                    attachments: provider.attachment_capability(),
-                    sessions: sessions_result.unwrap_or_default(),
-                    limitation,
-                });
+                provider_capabilities.push(self.cached_or_base_capability(project, *provider_id));
             }
         }
         let conversations = self.storage.list_conversations()?;
-        let mut timeline = Vec::new();
-        for conversation in &conversations {
-            let (recent, _) = self
-                .storage
-                .list_timeline_page(conversation.id, None, 100)?;
-            timeline.extend(recent);
+        let cache = self.timeline_cache.lock().expect("timeline mutex poisoned");
+        let mut grouped_timeline = HashMap::<ConversationId, Vec<&TimelineItem>>::new();
+        for item in cache.values() {
+            grouped_timeline
+                .entry(item.conversation_id)
+                .or_default()
+                .push(item);
         }
+        let mut timeline = Vec::new();
+        for items in grouped_timeline.values_mut() {
+            items.sort_by_key(|item| std::cmp::Reverse((item.created_at_ms, item.id)));
+            timeline.extend(
+                items
+                    .iter()
+                    .take(SNAPSHOT_TIMELINE_ITEMS_PER_CONVERSATION)
+                    .map(|item| (*item).clone()),
+            );
+        }
+        drop(cache);
         timeline.sort_by_key(|item| (item.created_at_ms, item.id));
         Ok(Snapshot {
             host_id: self.host_id,
@@ -298,34 +339,93 @@ impl AppService {
         command: ClientCommand,
     ) -> Result<ServerMessage> {
         let Some(command_id) = command.command_id() else {
-            return self.execute_command_inner(command).await;
+            return self.execute_command_inner(command, false).await;
         };
+        let attempt = command.attempt();
         let ticket = self.command_execution_ticket(device_id, command_id);
         let _guard = ticket.lock.lock().await;
-        match self.storage.command_state(device_id, command_id)? {
-            StoredCommand::Complete(result) => return Ok(*result),
-            StoredCommand::Pending => {
+        let retrying_rejected_send = match self.storage.command_state(device_id, command_id)? {
+            StoredCommand::Complete {
+                attempt: stored_attempt,
+                result,
+            } if stored_attempt == attempt => return Ok(*result),
+            StoredCommand::Complete {
+                attempt: stored_attempt,
+                result,
+            } if is_retryable_send_command(&command)
+                && attempt == stored_attempt.saturating_add(1)
+                && retryable_command_rejection(&result) =>
+            {
+                true
+            }
+            StoredCommand::Complete {
+                attempt: stored_attempt,
+                ..
+            } => {
+                return Ok(command_attempt_rejected(
+                    command_id,
+                    "invalid_command_attempt",
+                    format!(
+                        "command attempt {attempt} cannot follow completed attempt {stored_attempt}"
+                    ),
+                ));
+            }
+            StoredCommand::Pending {
+                attempt: stored_attempt,
+            } if stored_attempt == attempt => {
                 let result = ServerMessage::CommandRejected {
                     command_id: Some(command_id),
                     code: "command_outcome_unknown".to_owned(),
-                    message: "The Host stopped before recording this command's outcome; retry with a new command ID"
-                        .to_owned(),
+                    message:
+                        "The Host stopped before recording this command's outcome; replay is unsafe"
+                            .to_owned(),
                 };
                 self.storage
-                    .finish_command(device_id, command_id, &result)?;
+                    .finish_command(device_id, command_id, attempt, &result)?;
                 return Ok(result);
             }
-            StoredCommand::Missing => {}
+            StoredCommand::Pending {
+                attempt: stored_attempt,
+            } => {
+                return Ok(command_attempt_rejected(
+                    command_id,
+                    "invalid_command_attempt",
+                    format!(
+                        "command attempt {attempt} cannot replace pending attempt {stored_attempt}"
+                    ),
+                ));
+            }
+            // A local WebSocket write can fail before the Host observes attempt
+            // zero. The first attempt observed by this Host therefore becomes
+            // the baseline; subsequent attempts are still strictly checked.
+            StoredCommand::Missing => false,
+        };
+        let send_trace = send_trace_correlation(&command);
+        if let Some((trace_command_id, conversation_id, client_message_id)) = &send_trace {
+            self.begin_send_trace(
+                *trace_command_id,
+                *conversation_id,
+                client_message_id.clone(),
+            );
         }
         let command_project = self.project_for_command(&command);
+        let project_ticket = ordered_project_mutation(&command)
+            .map(|project_id| self.project_mutation_ticket(project_id));
+        let _project_guard = match project_ticket.as_ref() {
+            Some(ticket) => Some(ticket.lock.lock().await),
+            None => None,
+        };
         let mutation_ticket = ordered_conversation_mutation(&command)
             .map(|conversation_id| self.conversation_mutation_ticket(conversation_id));
         let _mutation_guard = match mutation_ticket.as_ref() {
             Some(ticket) => Some(ticket.lock.lock().await),
             None => None,
         };
-        self.storage.begin_command(device_id, command_id)?;
-        let result = match self.execute_command_inner(command).await {
+        self.storage.begin_command(device_id, command_id, attempt)?;
+        let result = match self
+            .execute_command_inner(command, retrying_rejected_send)
+            .await
+        {
             Ok(result) => result,
             Err(error) => ServerMessage::CommandRejected {
                 command_id: Some(command_id),
@@ -333,8 +433,13 @@ impl AppService {
                 message: redact_remote_error(&format!("{error:#}"), command_project.as_ref()),
             },
         };
+        if let Some((command_id, conversation_id, _)) = send_trace
+            && !matches!(result, ServerMessage::CommandAccepted { .. })
+        {
+            self.remove_send_trace(conversation_id, command_id);
+        }
         self.storage
-            .finish_command(device_id, command_id, &result)?;
+            .finish_command(device_id, command_id, attempt, &result)?;
         Ok(result)
     }
 
@@ -382,6 +487,44 @@ impl AppService {
         }
     }
 
+    fn project_mutation_ticket(&self, project_id: ProjectId) -> ProjectMutationTicket<'_> {
+        let mut entries = self
+            .project_mutation_locks
+            .lock()
+            .expect("project mutation mutex poisoned");
+        let entry = entries
+            .entry(project_id)
+            .or_insert_with(|| ProjectMutationEntry {
+                lock: Arc::new(tokio::sync::Mutex::new(())),
+                users: 0,
+            });
+        entry.users += 1;
+        ProjectMutationTicket {
+            project_id,
+            lock: Arc::clone(&entry.lock),
+            entries: &self.project_mutation_locks,
+        }
+    }
+
+    fn history_load_ticket(&self, conversation_id: ConversationId) -> HistoryLoadTicket<'_> {
+        let mut entries = self
+            .history_load_locks
+            .lock()
+            .expect("history load mutex poisoned");
+        let entry = entries
+            .entry(conversation_id)
+            .or_insert_with(|| HistoryLoadEntry {
+                lock: Arc::new(tokio::sync::Mutex::new(())),
+                users: 0,
+            });
+        entry.users += 1;
+        HistoryLoadTicket {
+            conversation_id,
+            lock: Arc::clone(&entry.lock),
+            entries: &self.history_load_locks,
+        }
+    }
+
     fn project_for_command(&self, command: &ClientCommand) -> Option<Project> {
         let project_id = match command {
             ClientCommand::SyncProject { project_id, .. }
@@ -421,7 +564,11 @@ impl AppService {
         self.storage.project(project_id).ok()
     }
 
-    async fn execute_command_inner(&self, command: ClientCommand) -> Result<ServerMessage> {
+    async fn execute_command_inner(
+        &self,
+        command: ClientCommand,
+        retrying_rejected_send: bool,
+    ) -> Result<ServerMessage> {
         let command_id = command.command_id();
         match command {
             ClientCommand::GetSnapshot => Ok(ServerMessage::Snapshot {
@@ -447,16 +594,18 @@ impl AppService {
             }
             ClientCommand::StartConversation {
                 command_id,
+                attempt: _,
                 conversation_id,
                 project_id,
                 provider,
                 model,
                 effort,
                 permission_mode,
+                client_message_id,
                 text,
                 attachments,
             } => {
-                self.start_conversation(
+                self.start_conversation_with_retry(
                     conversation_id,
                     project_id,
                     provider,
@@ -465,23 +614,26 @@ impl AppService {
                     permission_mode,
                     text,
                     attachments,
-                    format!("start:{command_id}"),
+                    client_message_id.unwrap_or_else(|| format!("start:{command_id}")),
+                    retrying_rejected_send,
                 )
                 .await?;
                 Ok(ServerMessage::CommandAccepted { command_id })
             }
             ClientCommand::SendMessage {
                 command_id,
+                attempt: _,
                 conversation_id,
                 client_message_id,
                 text,
                 attachments,
             } => {
-                self.send_message(
+                self.send_message_with_retry(
                     conversation_id,
                     text,
                     attachments,
                     client_message_id.or_else(|| Some(format!("command:{command_id}"))),
+                    retrying_rejected_send,
                 )
                 .await?;
                 Ok(ServerMessage::CommandAccepted { command_id })
@@ -531,18 +683,7 @@ impl AppService {
                 conversation_id,
                 before,
                 limit,
-            } => {
-                let conversation = self.storage.conversation(conversation_id)?;
-                self.authorized_project(conversation.project_id, conversation.provider)?;
-                let (items, next_before) =
-                    self.storage
-                        .list_timeline_page(conversation_id, before, limit)?;
-                Ok(ServerMessage::ConversationPage {
-                    conversation_id,
-                    items,
-                    next_before,
-                })
-            }
+            } => self.conversation_page(conversation_id, before, limit).await,
             ClientCommand::GetAttachment { attachment_id } => self.attachment_data(attachment_id),
             ClientCommand::Pair { .. } | ClientCommand::Authenticate { .. } => {
                 bail!("authentication commands are only valid as the first WebSocket message")
@@ -555,6 +696,69 @@ impl AppService {
         })
     }
 
+    fn cached_or_base_capability(
+        &self,
+        project: &Project,
+        provider_id: ProviderId,
+    ) -> ProviderCapability {
+        if let Some(capability) = self
+            .provider_capability_cache
+            .lock()
+            .expect("provider capability cache poisoned")
+            .get(&(project.id, provider_id))
+            .cloned()
+        {
+            return capability;
+        }
+        match self.providers.get(provider_id) {
+            Ok(provider) => {
+                let capabilities = provider.capabilities();
+                ProviderCapability {
+                    provider: provider_id,
+                    project_id: project.id,
+                    health: agent_remote_protocol::ProviderHealth {
+                        provider: provider_id,
+                        state: agent_remote_protocol::ProviderState::Starting,
+                        version: None,
+                        detail: None,
+                    },
+                    models: Vec::new(),
+                    supports_session_list: capabilities.supports_session_list,
+                    supports_history: capabilities.supports_history,
+                    supports_incremental_sync: capabilities.supports_incremental_sync,
+                    supports_rename: capabilities.supports_rename,
+                    supports_steer: capabilities.supports_steer,
+                    permission_modes: provider.permission_modes(),
+                    default_permission_mode: provider.default_permission_mode(),
+                    attachments: provider.attachment_capability(),
+                    sessions: Vec::new(),
+                    limitation: None,
+                }
+            }
+            Err(error) => ProviderCapability {
+                provider: provider_id,
+                project_id: project.id,
+                health: agent_remote_protocol::ProviderHealth {
+                    provider: provider_id,
+                    state: agent_remote_protocol::ProviderState::Offline,
+                    version: None,
+                    detail: Some(redact_remote_error(&error.to_string(), Some(project))),
+                },
+                models: Vec::new(),
+                supports_session_list: false,
+                supports_history: false,
+                supports_incremental_sync: false,
+                supports_rename: false,
+                supports_steer: false,
+                permission_modes: Vec::new(),
+                default_permission_mode: None,
+                attachments: AttachmentCapability::default(),
+                sessions: Vec::new(),
+                limitation: Some("Provider adapter is unavailable".to_owned()),
+            },
+        }
+    }
+
     async fn projects_updated(&self, provider_id: ProviderId) -> Result<ServerMessage> {
         let projects = self
             .storage
@@ -562,11 +766,92 @@ impl AppService {
             .into_iter()
             .filter(|project| project.enabled_providers.contains(&provider_id))
             .collect::<Vec<_>>();
-        let conversations = self.storage.list_conversations()?;
+        let (scoped_sessions, scoped_models, provider_health) =
+            match self.providers.get(provider_id) {
+                Ok(provider) => {
+                    let (sessions, models, health) = tokio::join!(
+                        provider.list_sessions_for_projects(&projects),
+                        provider.list_models_for_projects(&projects),
+                        provider.health(),
+                    );
+                    let session_error = sessions.as_ref().err().map(ToString::to_string);
+                    let model_error = models.as_ref().err().map(ToString::to_string);
+                    (
+                        sessions.unwrap_or_else(|_| {
+                            projects
+                                .iter()
+                                .map(|project| {
+                                    (
+                                        project.id,
+                                        Err(session_error.clone().unwrap_or_else(|| {
+                                            "session discovery failed".to_owned()
+                                        })),
+                                    )
+                                })
+                                .collect()
+                        }),
+                        models.unwrap_or_else(|_| {
+                            projects
+                                .iter()
+                                .map(|project| {
+                                    (
+                                        project.id,
+                                        Err(model_error.clone().unwrap_or_else(|| {
+                                            "model discovery failed".to_owned()
+                                        })),
+                                    )
+                                })
+                                .collect()
+                        }),
+                        Some(health),
+                    )
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    (
+                        projects
+                            .iter()
+                            .map(|project| (project.id, Err(error.clone())))
+                            .collect(),
+                        projects
+                            .iter()
+                            .map(|project| (project.id, Err(error.clone())))
+                            .collect(),
+                        None,
+                    )
+                }
+            };
         let mut capabilities = Vec::with_capacity(projects.len());
         for project in &projects {
-            capabilities.push(self.provider_capability(project, provider_id).await);
+            let sessions = scoped_sessions
+                .get(&project.id)
+                .cloned()
+                .unwrap_or_else(|| Ok(Vec::new()));
+            let models = scoped_models
+                .get(&project.id)
+                .cloned()
+                .unwrap_or_else(|| Ok(Vec::new()));
+            if let Ok(sessions) = &sessions {
+                let ticket = self.project_mutation_ticket(project.id);
+                let _guard = ticket.lock.lock().await;
+                self.upsert_session_metadata(project.id, provider_id, sessions)?;
+            }
+            let capability = self
+                .provider_capability(
+                    project,
+                    provider_id,
+                    sessions,
+                    models,
+                    provider_health.clone(),
+                )
+                .await;
+            self.provider_capability_cache
+                .lock()
+                .expect("provider capability cache poisoned")
+                .insert((project.id, provider_id), capability.clone());
+            capabilities.push(capability);
         }
+        let conversations = self.storage.list_conversations()?;
         Ok(ServerMessage::ProjectsUpdated {
             provider: provider_id,
             projects: project_summaries(&projects, &conversations),
@@ -578,6 +863,9 @@ impl AppService {
         &self,
         project: &Project,
         provider_id: ProviderId,
+        sessions_result: std::result::Result<Vec<agent_remote_protocol::SessionSummary>, String>,
+        models_result: std::result::Result<Vec<agent_remote_protocol::ModelOption>, String>,
+        provider_health: Option<agent_remote_protocol::ProviderHealth>,
     ) -> ProviderCapability {
         let provider = match self.providers.get(provider_id) {
             Ok(provider) => provider,
@@ -589,7 +877,7 @@ impl AppService {
                         provider: provider_id,
                         state: agent_remote_protocol::ProviderState::Offline,
                         version: None,
-                        detail: Some(error.to_string()),
+                        detail: Some(redact_remote_error(&error.to_string(), Some(project))),
                     },
                     models: Vec::new(),
                     supports_session_list: false,
@@ -605,14 +893,19 @@ impl AppService {
                 };
             }
         };
-        let health = provider.health().await;
-        let models_result = provider.list_models(project).await;
-        let sessions_result = provider.list_sessions(project).await;
+        let mut health = match provider_health {
+            Some(health) => health,
+            None => provider.health().await,
+        };
+        health.detail = health
+            .detail
+            .map(|detail| redact_remote_error(&detail, Some(project)));
         let limitation = models_result
             .as_ref()
             .err()
             .map(ToString::to_string)
-            .or_else(|| sessions_result.as_ref().err().map(ToString::to_string));
+            .or_else(|| sessions_result.as_ref().err().cloned())
+            .map(|detail| redact_remote_error(&detail, Some(project)));
         let capabilities = provider.capabilities();
         ProviderCapability {
             provider: provider_id,
@@ -632,6 +925,95 @@ impl AppService {
         }
     }
 
+    async fn conversation_page(
+        &self,
+        conversation_id: ConversationId,
+        before: Option<agent_remote_protocol::TimelinePageCursor>,
+        limit: u32,
+    ) -> Result<ServerMessage> {
+        let (cached_items, cached_next_before) =
+            self.storage
+                .list_timeline_page(conversation_id, before, limit)?;
+        let history_ticket = self.history_load_ticket(conversation_id);
+        let _history_guard = history_ticket.lock.lock().await;
+        let conversation = self.storage.conversation(conversation_id)?;
+        let project = self.authorized_project(conversation.project_id, conversation.provider)?;
+        let refresh_result: Result<()> = async {
+            let provider = self.providers.get(conversation.provider)?;
+            if provider.capabilities().supports_history
+                && self.storage.remote_history_is_stale(
+                    conversation.provider,
+                    conversation.project_id,
+                    &conversation.native_session_id,
+                    conversation.updated_at_ms,
+                )?
+            {
+                let remote_cursor = self
+                    .remote_history_cursors
+                    .lock()
+                    .expect("remote history cursor mutex poisoned")
+                    .get(&conversation_id)
+                    .cloned();
+                if before.is_none() || remote_cursor.is_some() {
+                    let page = provider
+                        .read_session_history(ReadSessionHistory {
+                            conversation_id,
+                            project: project.clone(),
+                            native_session_id: conversation.native_session_id.clone(),
+                            cursor: remote_cursor,
+                            limit: limit.clamp(1, 200),
+                        })
+                        .await?;
+                    provider
+                        .flush_history_events(conversation.project_id, conversation_id)
+                        .await?;
+                    for item in page.items {
+                        self.upsert_history_item(conversation_id, item)?;
+                    }
+                    let mut cursors = self
+                        .remote_history_cursors
+                        .lock()
+                        .expect("remote history cursor mutex poisoned");
+                    if let Some(next_cursor) = page.next_cursor {
+                        cursors.insert(conversation_id, next_cursor);
+                    } else {
+                        cursors.remove(&conversation_id);
+                        self.storage.mark_remote_history_synced(
+                            conversation.provider,
+                            conversation.project_id,
+                            &conversation.native_session_id,
+                            conversation.updated_at_ms,
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = refresh_result {
+            tracing::warn!(
+                provider = %conversation.provider,
+                project_id = %conversation.project_id,
+                conversation_id = %conversation_id,
+                error = %redact_remote_error(&format!("{error:#}"), Some(&project)),
+                "remote conversation history refresh failed; returning local cache"
+            );
+            return Ok(ServerMessage::ConversationPage {
+                conversation_id,
+                items: cached_items,
+                next_before: cached_next_before,
+            });
+        }
+        let (items, next_before) =
+            self.storage
+                .list_timeline_page(conversation_id, before, limit)?;
+        Ok(ServerMessage::ConversationPage {
+            conversation_id,
+            items,
+            next_before,
+        })
+    }
+
     async fn sync_project(
         &self,
         command_id: agent_remote_protocol::CommandId,
@@ -645,30 +1027,50 @@ impl AppService {
             bail!("{provider_id} does not support remote conversation listing");
         }
         let sessions = provider.list_sessions(&project).await?;
-        let mut full_history_fallback = false;
-        for session in &sessions {
-            let mut conversation = match self.storage.conversation_by_native_session(
+        self.upsert_session_metadata(project_id, provider_id, &sessions)?;
+        Ok(ServerMessage::ProjectSyncCompleted {
+            command_id,
+            project_id,
+            provider: provider_id,
+            conversations_synced: sessions.len() as u32,
+            full_history_fallback: false,
+        })
+    }
+
+    fn upsert_session_metadata(
+        &self,
+        project_id: ProjectId,
+        provider_id: ProviderId,
+        sessions: &[agent_remote_protocol::SessionSummary],
+    ) -> Result<()> {
+        for session in sessions {
+            let existing = self.storage.conversation_by_native_session(
                 provider_id,
                 project_id,
                 &session.native_session_id,
-            )? {
-                Some(conversation) => conversation,
-                None => Conversation {
-                    id: ConversationId::new(),
-                    revision: 1,
-                    provider: provider_id,
-                    project_id,
-                    native_session_id: session.native_session_id.clone(),
-                    title: provider_title(&session.title),
-                    title_source: ConversationTitleSource::Provider,
-                    title_updated_at_ms: now_ms(),
-                    selected_model: None,
-                    selected_effort: None,
-                    state: ConversationState::Idle,
-                    session_options: Vec::new(),
-                    updated_at_ms: session.updated_at_ms,
-                },
+            )?;
+            let (mut conversation, is_new) = match existing {
+                Some(conversation) => (conversation, false),
+                None => (
+                    Conversation {
+                        id: ConversationId::new(),
+                        revision: 1,
+                        provider: provider_id,
+                        project_id,
+                        native_session_id: session.native_session_id.clone(),
+                        title: provider_title(&session.title),
+                        title_source: ConversationTitleSource::Provider,
+                        title_updated_at_ms: now_ms(),
+                        selected_model: None,
+                        selected_effort: None,
+                        state: ConversationState::Idle,
+                        session_options: Vec::new(),
+                        updated_at_ms: session.updated_at_ms,
+                    },
+                    true,
+                ),
             };
+            let mut changed = is_new;
             if conversation.title_source != ConversationTitleSource::User
                 && !session.title.trim().is_empty()
                 && conversation.title != session.title
@@ -677,61 +1079,21 @@ impl AppService {
                 conversation.title_source = ConversationTitleSource::Provider;
                 conversation.title_updated_at_ms = now_ms();
                 conversation.revision += 1;
+                changed = true;
             }
-            conversation.updated_at_ms = conversation.updated_at_ms.max(session.updated_at_ms);
-            self.storage.upsert_conversation(&conversation)?;
-            self.emit(ServerMessage::ConversationUpserted {
-                conversation: conversation.clone(),
-            });
-
-            if capabilities.supports_history
-                && self.storage.remote_history_is_stale(
-                    provider_id,
-                    project_id,
-                    &session.native_session_id,
-                    session.updated_at_ms,
-                )?
-            {
-                let mut cursor = None;
-                let mut history_items = Vec::new();
-                loop {
-                    let page = provider
-                        .read_session_history(ReadSessionHistory {
-                            conversation_id: conversation.id,
-                            project: project.clone(),
-                            native_session_id: session.native_session_id.clone(),
-                            cursor: cursor.clone(),
-                            limit: 200,
-                        })
-                        .await?;
-                    full_history_fallback |= page.full_read_fallback;
-                    history_items.extend(page.items);
-                    match page.next_cursor {
-                        Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
-                        _ => break,
-                    }
-                }
-                provider
-                    .flush_history_events(project_id, conversation.id)
-                    .await?;
-                for item in history_items {
-                    self.upsert_history_item(conversation.id, item)?;
-                }
-                self.storage.mark_remote_history_synced(
-                    provider_id,
-                    project_id,
-                    &session.native_session_id,
-                    session.updated_at_ms,
-                )?;
+            let updated_at_ms = conversation.updated_at_ms.max(session.updated_at_ms);
+            if conversation.updated_at_ms != updated_at_ms {
+                conversation.updated_at_ms = updated_at_ms;
+                changed = true;
+            }
+            if changed {
+                self.storage.upsert_conversation(&conversation)?;
+                self.emit(ServerMessage::ConversationUpserted {
+                    conversation: conversation.clone(),
+                });
             }
         }
-        Ok(ServerMessage::ProjectSyncCompleted {
-            command_id,
-            project_id,
-            provider: provider_id,
-            conversations_synced: sessions.len() as u32,
-            full_history_fallback,
-        })
+        Ok(())
     }
 
     fn upsert_history_item(
@@ -907,6 +1269,7 @@ impl AppService {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     async fn start_conversation(
         &self,
         conversation_id: ConversationId,
@@ -919,7 +1282,35 @@ impl AppService {
         attachments: Vec<ClientAttachment>,
         client_message_id: String,
     ) -> Result<()> {
-        let _guard = self.conversation_start_lock.lock().await;
+        self.start_conversation_with_retry(
+            conversation_id,
+            project_id,
+            provider_id,
+            model,
+            effort,
+            permission_mode,
+            text,
+            attachments,
+            client_message_id,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_conversation_with_retry(
+        &self,
+        conversation_id: ConversationId,
+        project_id: ProjectId,
+        provider_id: ProviderId,
+        model: Option<String>,
+        effort: Option<String>,
+        permission_mode: Option<String>,
+        text: String,
+        attachments: Vec<ClientAttachment>,
+        client_message_id: String,
+        retrying_rejected_send: bool,
+    ) -> Result<()> {
         let existing = self
             .storage
             .list_conversations()?
@@ -941,16 +1332,35 @@ impl AppService {
             )
             .await?;
         }
-        self.send_message(conversation_id, text, attachments, Some(client_message_id))
-            .await
+        self.send_message_with_retry(
+            conversation_id,
+            text,
+            attachments,
+            Some(client_message_id),
+            retrying_rejected_send,
+        )
+        .await
     }
 
+    #[cfg(test)]
     async fn send_message(
         &self,
         conversation_id: ConversationId,
         text: String,
         attachments: Vec<ClientAttachment>,
         client_message_id: Option<String>,
+    ) -> Result<()> {
+        self.send_message_with_retry(conversation_id, text, attachments, client_message_id, false)
+            .await
+    }
+
+    async fn send_message_with_retry(
+        &self,
+        conversation_id: ConversationId,
+        text: String,
+        attachments: Vec<ClientAttachment>,
+        client_message_id: Option<String>,
+        retrying_rejected_send: bool,
     ) -> Result<()> {
         if text.trim().is_empty() {
             bail!("message text cannot be empty");
@@ -964,35 +1374,45 @@ impl AppService {
                 .provider_item_id(conversation_id, &format!("client:{client_message_id}"))?,
             None => TimelineItemId::new(),
         };
-        if let Some(existing) = self
+        let existing_user_message = self
             .timeline_cache
             .lock()
             .expect("timeline mutex poisoned")
             .get(&item_id)
-        {
+            .cloned();
+        if let Some(existing) = &existing_user_message {
             if existing.kind == (TimelineItemKind::UserMessage { text: text.clone() }) {
-                return Ok(());
+                if !retrying_rejected_send {
+                    return Ok(());
+                }
+            } else {
+                bail!("client message id was reused with different content");
             }
-            bail!("client message id was reused with different content");
         }
+        let attachment_message_id = client_message_id
+            .as_deref()
+            .unwrap_or("host-generated-message");
         let prompt_attachments = self.import_prompt_attachments(
             &conversation,
             attachments,
             &provider.attachment_capability(),
+            attachment_message_id,
         )?;
         if conversation.title_source == ConversationTitleSource::Fallback {
             conversation.title = provisional_title(&text);
             conversation.title_source = ConversationTitleSource::Generated;
             conversation.title_updated_at_ms = now_ms();
         }
-        let user_item = TimelineItem {
-            id: item_id,
-            conversation_id,
-            revision: 1,
-            created_at_ms: now_ms(),
-            kind: TimelineItemKind::UserMessage { text: text.clone() },
-        };
-        self.save_and_emit_item(user_item)?;
+        if existing_user_message.is_none() {
+            let user_item = TimelineItem {
+                id: item_id,
+                conversation_id,
+                revision: 1,
+                created_at_ms: now_ms(),
+                kind: TimelineItemKind::UserMessage { text: text.clone() },
+            };
+            self.save_and_emit_item(user_item)?;
+        }
         conversation.state = ConversationState::Running;
         conversation.revision += 1;
         conversation.updated_at_ms = now_ms();
@@ -1025,6 +1445,7 @@ impl AppService {
             )?;
             return Err(error);
         }
+        self.record_send_trace_stage(conversation_id, SendTraceStage::ProviderReceived);
         Ok(())
     }
 
@@ -1033,6 +1454,7 @@ impl AppService {
         conversation: &Conversation,
         attachments: Vec<ClientAttachment>,
         capability: &AttachmentCapability,
+        client_message_id: &str,
     ) -> Result<Vec<PromptAttachment>> {
         if attachments.is_empty() {
             return Ok(Vec::new());
@@ -1072,11 +1494,27 @@ impl AppService {
             {
                 bail!("attachment type {} is not supported", attachment.mime_type);
             }
-            let stored = self.attachments.import_bytes(
-                conversation.id,
-                &attachment.bytes,
-                Some(&attachment.mime_type),
-            )?;
+            let stored = match self.storage.find_attachment(attachment.id)? {
+                Some(stored) => {
+                    if stored.metadata.conversation_id != conversation.id
+                        || stored.metadata.mime_type != attachment.mime_type
+                        || self.attachments.read(&stored)?.as_slice() != attachment.bytes.as_slice()
+                    {
+                        bail!("attachment id was reused with different content or scope");
+                    }
+                    stored
+                }
+                None => {
+                    let stored = self.attachments.import_bytes_with_id(
+                        conversation.id,
+                        attachment.id,
+                        &attachment.bytes,
+                        Some(&attachment.mime_type),
+                    )?;
+                    self.storage.save_attachment(&stored)?;
+                    stored
+                }
+            };
             if !capability
                 .allowed_mime_types
                 .iter()
@@ -1084,9 +1522,11 @@ impl AppService {
             {
                 bail!("decoded attachment type is not supported by the provider");
             }
-            self.storage.save_attachment(&stored)?;
             self.save_and_emit_item(TimelineItem {
-                id: TimelineItemId::new(),
+                id: self.storage.provider_item_id(
+                    conversation.id,
+                    &format!("client-attachment:{client_message_id}:{}", attachment.id),
+                )?,
                 conversation_id: conversation.id,
                 revision: 1,
                 created_at_ms: now_ms(),
@@ -1247,6 +1687,9 @@ impl AppService {
         if conversation.provider != event.provider || conversation.project_id != event.project_id {
             bail!("provider event did not match the conversation authority boundary");
         }
+        if provider_event_is_live(&event.kind) {
+            self.record_send_trace_stage(event.conversation_id, SendTraceStage::FirstProviderEvent);
+        }
         let project = self.storage.project(event.project_id)?;
         match event.kind {
             ProviderEventKind::HistoryBarrier { barrier } => barrier.complete(),
@@ -1308,7 +1751,7 @@ impl AppService {
                     _ => bail!("provider reused an item id for a different event kind"),
                 }
                 item.revision += 1;
-                self.save_and_emit_item_locked(&mut cache, item)?;
+                self.save_and_emit_stream_item_locked(&mut cache, item)?;
             }
             ProviderEventKind::AgentTextDelta {
                 provider_item_id,
@@ -1338,7 +1781,7 @@ impl AppService {
                     _ => bail!("provider reused an item id for a different event kind"),
                 }
                 item.revision += 1;
-                self.save_and_emit_item_locked(&mut cache, item)?;
+                self.save_and_emit_stream_item_locked(&mut cache, item)?;
             }
             ProviderEventKind::AgentTextSnapshot {
                 provider_item_id,
@@ -1428,6 +1871,7 @@ impl AppService {
                 prompt,
                 options,
             } => {
+                self.flush_stream_items(event.conversation_id)?;
                 let approval_id = {
                     let mut ids = self
                         .provider_approval_ids
@@ -1523,6 +1967,7 @@ impl AppService {
                 }
             }
             ProviderEventKind::Completed => {
+                self.flush_stream_items(event.conversation_id)?;
                 conversation.state = ConversationState::Completed;
                 conversation.revision += 1;
                 conversation.updated_at_ms = now_ms();
@@ -1530,6 +1975,7 @@ impl AppService {
                 self.spawn_provider_title_refresh(&conversation, project);
             }
             ProviderEventKind::Interrupted => {
+                self.flush_stream_items(event.conversation_id)?;
                 conversation.state = ConversationState::Interrupted;
                 conversation.revision += 1;
                 conversation.updated_at_ms = now_ms();
@@ -1540,9 +1986,11 @@ impl AppService {
                 code,
                 message,
             } => {
+                self.flush_stream_items(event.conversation_id)?;
                 self.record_failure(&project, conversation, provider_item_id, &code, message)?;
             }
             ProviderEventKind::Crashed { message } => {
+                self.flush_stream_items(event.conversation_id)?;
                 self.record_failure(&project, conversation, None, "provider_crashed", message)?;
             }
         }
@@ -1676,8 +2124,69 @@ impl AppService {
             return Ok(());
         }
         if self.storage.upsert_timeline_item(&item)? {
+            self.stream_item_persisted_at
+                .lock()
+                .expect("stream persistence mutex poisoned")
+                .remove(&item.id);
             cache.insert(item.id, item.clone());
             self.emit(ServerMessage::TimelineItemUpserted { item });
+        }
+        Ok(())
+    }
+
+    fn save_and_emit_stream_item_locked(
+        &self,
+        cache: &mut HashMap<TimelineItemId, TimelineItem>,
+        item: TimelineItem,
+    ) -> Result<()> {
+        if cache
+            .get(&item.id)
+            .is_some_and(|existing| existing.revision >= item.revision)
+        {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let should_persist = {
+            let mut persisted = self
+                .stream_item_persisted_at
+                .lock()
+                .expect("stream persistence mutex poisoned");
+            let should_persist = persisted
+                .get(&item.id)
+                .is_none_or(|last| now.duration_since(*last) >= STREAM_PERSIST_INTERVAL);
+            if should_persist {
+                persisted.insert(item.id, now);
+            }
+            should_persist
+        };
+        if should_persist {
+            self.storage.upsert_timeline_item(&item)?;
+        }
+        cache.insert(item.id, item.clone());
+        self.emit(ServerMessage::TimelineItemUpserted { item });
+        Ok(())
+    }
+
+    fn flush_stream_items(&self, conversation_id: ConversationId) -> Result<()> {
+        let cache = self.timeline_cache.lock().expect("timeline mutex poisoned");
+        let mut persisted = self
+            .stream_item_persisted_at
+            .lock()
+            .expect("stream persistence mutex poisoned");
+        let item_ids = persisted
+            .keys()
+            .copied()
+            .filter(|item_id| {
+                cache
+                    .get(item_id)
+                    .is_some_and(|item| item.conversation_id == conversation_id)
+            })
+            .collect::<Vec<_>>();
+        for item_id in item_ids {
+            if let Some(item) = cache.get(&item_id) {
+                self.storage.upsert_timeline_item(item)?;
+            }
+            persisted.remove(&item_id);
         }
         Ok(())
     }
@@ -1775,8 +2284,232 @@ impl AppService {
         }
     }
 
+    fn begin_send_trace(
+        &self,
+        command_id: CommandId,
+        conversation_id: ConversationId,
+        client_message_id: String,
+    ) {
+        self.pending_send_traces
+            .lock()
+            .expect("send trace mutex poisoned")
+            .entry(conversation_id)
+            .or_default()
+            .push_back(PendingSendTrace {
+                command_id,
+                client_message_id: client_message_id.clone(),
+                started_at: Instant::now(),
+                provider_received: false,
+                first_provider_event_elapsed_ms: None,
+            });
+        self.emit_send_trace(
+            command_id,
+            client_message_id,
+            conversation_id,
+            SendTraceStage::HostReceived,
+            0,
+        );
+    }
+
+    fn record_send_trace_stage(&self, conversation_id: ConversationId, stage: SendTraceStage) {
+        let emissions = {
+            let mut traces = self
+                .pending_send_traces
+                .lock()
+                .expect("send trace mutex poisoned");
+            let Some(queue) = traces.get_mut(&conversation_id) else {
+                return;
+            };
+            let position = match stage {
+                SendTraceStage::HostReceived => return,
+                SendTraceStage::ProviderReceived => {
+                    queue.iter().position(|trace| !trace.provider_received)
+                }
+                SendTraceStage::FirstProviderEvent => queue
+                    .iter()
+                    .position(|trace| trace.first_provider_event_elapsed_ms.is_none()),
+            };
+            let Some(position) = position else {
+                return;
+            };
+            let trace = &mut queue[position];
+            let elapsed_ms = trace
+                .started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            let mut emissions = Vec::with_capacity(2);
+            let completed = match stage {
+                SendTraceStage::HostReceived => unreachable!(),
+                SendTraceStage::ProviderReceived => {
+                    if trace.provider_received {
+                        return;
+                    }
+                    trace.provider_received = true;
+                    emissions.push((trace.clone(), SendTraceStage::ProviderReceived, elapsed_ms));
+                    if let Some(first_event_elapsed_ms) = trace.first_provider_event_elapsed_ms {
+                        emissions.push((
+                            trace.clone(),
+                            SendTraceStage::FirstProviderEvent,
+                            first_event_elapsed_ms,
+                        ));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                SendTraceStage::FirstProviderEvent => {
+                    trace.first_provider_event_elapsed_ms = Some(elapsed_ms);
+                    if trace.provider_received {
+                        emissions.push((
+                            trace.clone(),
+                            SendTraceStage::FirstProviderEvent,
+                            elapsed_ms,
+                        ));
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if completed {
+                queue.remove(position);
+                if queue.is_empty() {
+                    traces.remove(&conversation_id);
+                }
+            }
+            emissions
+        };
+        for (trace, emitted_stage, elapsed_ms) in emissions {
+            self.emit_send_trace(
+                trace.command_id,
+                trace.client_message_id,
+                conversation_id,
+                emitted_stage,
+                elapsed_ms,
+            );
+        }
+    }
+
+    fn remove_send_trace(&self, conversation_id: ConversationId, command_id: CommandId) {
+        let mut traces = self
+            .pending_send_traces
+            .lock()
+            .expect("send trace mutex poisoned");
+        let Some(queue) = traces.get_mut(&conversation_id) else {
+            return;
+        };
+        queue.retain(|trace| trace.command_id != command_id);
+        if queue.is_empty() {
+            traces.remove(&conversation_id);
+        }
+    }
+
+    fn emit_send_trace(
+        &self,
+        command_id: CommandId,
+        client_message_id: String,
+        conversation_id: ConversationId,
+        stage: SendTraceStage,
+        elapsed_ms: u64,
+    ) {
+        tracing::info!(
+            target: "agent_remote::send_latency",
+            %command_id,
+            client_message_id,
+            %conversation_id,
+            stage = send_trace_stage_name(stage),
+            elapsed_ms,
+            "send latency stage"
+        );
+        self.emit(ServerMessage::SendTrace {
+            command_id,
+            client_message_id,
+            conversation_id,
+            stage,
+            elapsed_ms,
+        });
+    }
+
     fn emit(&self, message: ServerMessage) {
         let _ = self.updates.send(message);
+    }
+}
+
+fn send_trace_correlation(command: &ClientCommand) -> Option<(CommandId, ConversationId, String)> {
+    match command {
+        ClientCommand::StartConversation {
+            command_id,
+            conversation_id,
+            client_message_id,
+            ..
+        } => Some((
+            *command_id,
+            *conversation_id,
+            client_message_id
+                .clone()
+                .unwrap_or_else(|| format!("start:{command_id}")),
+        )),
+        ClientCommand::SendMessage {
+            command_id,
+            conversation_id,
+            client_message_id,
+            ..
+        } => Some((
+            *command_id,
+            *conversation_id,
+            client_message_id
+                .clone()
+                .unwrap_or_else(|| format!("command:{command_id}")),
+        )),
+        _ => None,
+    }
+}
+
+fn is_retryable_send_command(command: &ClientCommand) -> bool {
+    matches!(
+        command,
+        ClientCommand::StartConversation { .. } | ClientCommand::SendMessage { .. }
+    )
+}
+
+fn retryable_command_rejection(result: &ServerMessage) -> bool {
+    matches!(
+        result,
+        ServerMessage::CommandRejected { code, .. } if code == "command_failed"
+    )
+}
+
+fn command_attempt_rejected(command_id: CommandId, code: &str, message: String) -> ServerMessage {
+    ServerMessage::CommandRejected {
+        command_id: Some(command_id),
+        code: code.to_owned(),
+        message,
+    }
+}
+
+fn provider_event_is_live(kind: &ProviderEventKind) -> bool {
+    !matches!(
+        kind,
+        ProviderEventKind::HistoryBarrier { .. }
+            | ProviderEventKind::HistoryWatermark { .. }
+            | ProviderEventKind::HistoryItem { .. }
+            | ProviderEventKind::ProviderItemAlias { .. }
+    )
+}
+
+fn send_trace_stage_name(stage: SendTraceStage) -> &'static str {
+    match stage {
+        SendTraceStage::HostReceived => "host_received",
+        SendTraceStage::ProviderReceived => "provider_received",
+        SendTraceStage::FirstProviderEvent => "first_provider_event",
+    }
+}
+
+fn ordered_project_mutation(command: &ClientCommand) -> Option<ProjectId> {
+    match command {
+        ClientCommand::SyncProject { project_id, .. } => Some(*project_id),
+        _ => None,
     }
 }
 
@@ -2147,8 +2880,10 @@ mod tests {
         renames: Mutex<Vec<(String, String)>>,
         session_list_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
         session_list_error: Mutex<Option<String>>,
+        project_session_list_errors: Mutex<HashMap<ProjectId, String>>,
         session_list_started: tokio::sync::Notify,
         session_list_calls: std::sync::atomic::AtomicUsize,
+        send_failures_remaining: std::sync::atomic::AtomicUsize,
     }
 
     impl MockProvider {
@@ -2181,8 +2916,10 @@ mod tests {
                 renames: Mutex::new(Vec::new()),
                 session_list_gate: Mutex::new(None),
                 session_list_error: Mutex::new(None),
+                project_session_list_errors: Mutex::new(HashMap::new()),
                 session_list_started: tokio::sync::Notify::new(),
                 session_list_calls: std::sync::atomic::AtomicUsize::new(0),
+                send_failures_remaining: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -2231,7 +2968,7 @@ mod tests {
             Ok(self.models.clone())
         }
 
-        async fn list_sessions(&self, _project: &Project) -> Result<Vec<SessionSummary>> {
+        async fn list_sessions(&self, project: &Project) -> Result<Vec<SessionSummary>> {
             self.session_list_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let gate = self
@@ -2248,6 +2985,15 @@ mod tests {
                 .lock()
                 .expect("session list error mutex")
                 .clone()
+            {
+                bail!(error);
+            }
+            if let Some(error) = self
+                .project_session_list_errors
+                .lock()
+                .expect("project session list error mutex")
+                .get(&project.id)
+                .cloned()
             {
                 bail!(error);
             }
@@ -2349,6 +3095,17 @@ mod tests {
                 .lock()
                 .expect("messages mutex")
                 .push((request.conversation_id, request.text));
+            if self
+                .send_failures_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                bail!("mock provider send failed");
+            }
             Ok(CommandAck)
         }
 
@@ -2428,6 +3185,407 @@ mod tests {
             )
             .await
             .expect("create conversation")
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_cached_authorized_state_without_waiting_for_provider_io() {
+        let fixture = fixture();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *fixture
+            .provider
+            .session_list_gate
+            .lock()
+            .expect("session list gate mutex") = Some(gate);
+
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            fixture.service.snapshot(),
+        )
+        .await
+        .expect("snapshot waited for provider I/O")
+        .expect("snapshot");
+
+        assert_eq!(
+            fixture
+                .provider
+                .session_list_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(snapshot.projects.len(), 2);
+        assert!(snapshot.provider_capabilities.iter().all(|capability| {
+            capability.health.state == agent_remote_protocol::ProviderState::Starting
+        }));
+    }
+
+    #[tokio::test]
+    async fn project_refresh_imports_lightweight_session_metadata_for_every_project() {
+        let fixture = fixture();
+        fixture
+            .provider
+            .sessions
+            .lock()
+            .expect("sessions")
+            .push(SessionSummary {
+                native_session_id: "remote-thread".to_owned(),
+                title: "Remote thread".to_owned(),
+                updated_at_ms: 42,
+            });
+
+        let response = fixture
+            .service
+            .projects_updated(ProviderId::Codex)
+            .await
+            .expect("projects refresh");
+        let ServerMessage::ProjectsUpdated { projects, .. } = response else {
+            panic!("unexpected projects response");
+        };
+        assert!(
+            projects
+                .iter()
+                .all(|project| project.conversation_count == 1)
+        );
+        let conversations = fixture
+            .service
+            .storage
+            .list_conversations()
+            .expect("conversations");
+        assert_eq!(conversations.len(), 2);
+        assert!(conversations.iter().any(|conversation| {
+            conversation.project_id == fixture.project_a.id
+                && conversation.native_session_id == "remote-thread"
+        }));
+        assert!(conversations.iter().any(|conversation| {
+            conversation.project_id == fixture.project_b.id
+                && conversation.native_session_id == "remote-thread"
+        }));
+    }
+
+    #[tokio::test]
+    async fn project_refresh_isolates_one_project_session_list_failure() {
+        let fixture = fixture();
+        fixture
+            .provider
+            .sessions
+            .lock()
+            .expect("sessions")
+            .push(SessionSummary {
+                native_session_id: "healthy-thread".to_owned(),
+                title: "Healthy thread".to_owned(),
+                updated_at_ms: 7,
+            });
+        fixture
+            .provider
+            .project_session_list_errors
+            .lock()
+            .expect("project errors")
+            .insert(fixture.project_b.id, "project B unavailable".to_owned());
+
+        let response = fixture
+            .service
+            .projects_updated(ProviderId::Codex)
+            .await
+            .expect("projects refresh");
+        let ServerMessage::ProjectsUpdated { capabilities, .. } = response else {
+            panic!("unexpected projects response");
+        };
+        let healthy = capabilities
+            .iter()
+            .find(|capability| capability.project_id == fixture.project_a.id)
+            .expect("healthy capability");
+        assert_eq!(healthy.sessions.len(), 1);
+        let failed = capabilities
+            .iter()
+            .find(|capability| capability.project_id == fixture.project_b.id)
+            .expect("failed capability");
+        assert!(
+            failed
+                .limitation
+                .as_deref()
+                .is_some_and(|limitation| limitation.contains("project B unavailable"))
+        );
+        let conversations = fixture
+            .service
+            .storage
+            .list_conversations()
+            .expect("conversations");
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].project_id, fixture.project_a.id);
+    }
+
+    #[tokio::test]
+    async fn send_trace_correlates_host_provider_and_first_event_without_message_content() {
+        let fixture = fixture();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        let pairing = fixture
+            .service
+            .storage
+            .create_pairing_token()
+            .expect("pair token");
+        let device = fixture
+            .service
+            .storage
+            .exchange_pairing_token(&pairing.token, "phone")
+            .expect("paired device");
+        let command_id = CommandId::new();
+        let client_message_id = "client-trace-1".to_owned();
+        let mut updates = fixture.service.subscribe();
+
+        let response = fixture
+            .service
+            .execute_command(
+                device.id,
+                ClientCommand::SendMessage {
+                    command_id,
+                    attempt: 0,
+                    conversation_id: conversation.id,
+                    client_message_id: Some(client_message_id.clone()),
+                    text: "private prompt body".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )
+            .await
+            .expect("send command");
+        assert_eq!(response, ServerMessage::CommandAccepted { command_id });
+
+        fixture
+            .service
+            .apply_provider_event_inner(ProviderEvent {
+                provider: ProviderId::Codex,
+                project_id: fixture.project_a.id,
+                conversation_id: conversation.id,
+                kind: ProviderEventKind::AgentTextDelta {
+                    provider_item_id: "trace-answer".to_owned(),
+                    phase: AgentMessagePhase::Final,
+                    delta: "answer".to_owned(),
+                },
+            })
+            .await
+            .expect("provider event");
+
+        let traces = std::iter::from_fn(|| updates.try_recv().ok())
+            .filter_map(|message| match message {
+                ServerMessage::SendTrace {
+                    command_id: traced_command,
+                    client_message_id: traced_client,
+                    conversation_id: traced_conversation,
+                    stage,
+                    ..
+                } if traced_command == command_id
+                    && traced_client == client_message_id
+                    && traced_conversation == conversation.id =>
+                {
+                    Some(stage)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            traces,
+            vec![
+                SendTraceStage::HostReceived,
+                SendTraceStage::ProviderReceived,
+                SendTraceStage::FirstProviderEvent,
+            ]
+        );
+        assert!(
+            fixture
+                .service
+                .pending_send_traces
+                .lock()
+                .expect("send trace mutex")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_retry_reuses_ids_but_executes_only_the_next_attempt() {
+        let fixture = fixture();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        fixture
+            .provider
+            .send_failures_remaining
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let device = fixture
+            .service
+            .storage
+            .exchange_pairing_token(
+                &fixture
+                    .service
+                    .storage
+                    .create_pairing_token()
+                    .expect("pair token")
+                    .token,
+                "phone",
+            )
+            .expect("paired device");
+        let command_id = CommandId::new();
+        let client_message_id = "stable-client-message".to_owned();
+        let command = |attempt| ClientCommand::SendMessage {
+            command_id,
+            attempt,
+            conversation_id: conversation.id,
+            client_message_id: Some(client_message_id.clone()),
+            text: "retry this exact message".to_owned(),
+            attachments: Vec::new(),
+        };
+
+        let rejected = fixture
+            .service
+            .execute_command(device.id, command(0))
+            .await
+            .expect("first attempt response");
+        assert!(matches!(
+            rejected,
+            ServerMessage::CommandRejected { ref code, .. } if code == "command_failed"
+        ));
+        let duplicate = fixture
+            .service
+            .execute_command(device.id, command(0))
+            .await
+            .expect("duplicate response");
+        assert_eq!(duplicate, rejected);
+        assert_eq!(fixture.provider.messages.lock().expect("messages").len(), 1);
+
+        let accepted = fixture
+            .service
+            .execute_command(device.id, command(1))
+            .await
+            .expect("retry response");
+        assert_eq!(accepted, ServerMessage::CommandAccepted { command_id });
+        assert_eq!(fixture.provider.messages.lock().expect("messages").len(), 2);
+        let user_message_count = fixture
+            .service
+            .storage
+            .list_timeline_page(conversation.id, None, 100)
+            .expect("timeline")
+            .0
+            .into_iter()
+            .filter(|item| {
+                item.kind
+                    == (TimelineItemKind::UserMessage {
+                        text: "retry this exact message".to_owned(),
+                    })
+            })
+            .count();
+        assert_eq!(user_message_count, 1);
+    }
+
+    #[tokio::test]
+    async fn first_host_observed_attempt_can_follow_a_local_write_failure() {
+        let fixture = fixture();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        let device = fixture
+            .service
+            .storage
+            .exchange_pairing_token(
+                &fixture
+                    .service
+                    .storage
+                    .create_pairing_token()
+                    .expect("pair token")
+                    .token,
+                "phone",
+            )
+            .expect("paired device");
+        let command_id = CommandId::new();
+        let accepted = fixture
+            .service
+            .execute_command(
+                device.id,
+                ClientCommand::SendMessage {
+                    command_id,
+                    attempt: 1,
+                    conversation_id: conversation.id,
+                    client_message_id: Some("local-write-failed".to_owned()),
+                    text: "arrived on the explicit retry".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )
+            .await
+            .expect("send response");
+        assert_eq!(accepted, ServerMessage::CommandAccepted { command_id });
+    }
+
+    #[tokio::test]
+    async fn streaming_deltas_are_coalesced_on_disk_and_flushed_at_terminal_state() {
+        let fixture = fixture();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        let delta = |text: &str| ProviderEvent {
+            provider: ProviderId::Codex,
+            project_id: fixture.project_a.id,
+            conversation_id: conversation.id,
+            kind: ProviderEventKind::AgentTextDelta {
+                provider_item_id: "streamed-answer".to_owned(),
+                phase: AgentMessagePhase::Final,
+                delta: text.to_owned(),
+            },
+        };
+        fixture
+            .service
+            .apply_provider_event_inner(delta("a"))
+            .await
+            .expect("first delta");
+        let item_id = fixture
+            .service
+            .timeline_cache
+            .lock()
+            .expect("timeline")
+            .values()
+            .find(|item| {
+                matches!(
+                    &item.kind,
+                    TimelineItemKind::AgentMessage { text, .. } if text == "a"
+                )
+            })
+            .expect("stream item")
+            .id;
+        fixture
+            .service
+            .stream_item_persisted_at
+            .lock()
+            .expect("stream persistence")
+            .insert(item_id, Instant::now());
+        fixture
+            .service
+            .apply_provider_event_inner(delta("b"))
+            .await
+            .expect("second delta");
+
+        let before_terminal = fixture
+            .service
+            .storage
+            .list_timeline_page(conversation.id, None, 100)
+            .expect("persisted timeline")
+            .0
+            .into_iter()
+            .find(|item| item.id == item_id)
+            .expect("persisted stream item");
+        assert_eq!(before_terminal.revision, 1);
+        fixture
+            .service
+            .apply_provider_event_inner(ProviderEvent {
+                provider: ProviderId::Codex,
+                project_id: fixture.project_a.id,
+                conversation_id: conversation.id,
+                kind: ProviderEventKind::Completed,
+            })
+            .await
+            .expect("completion");
+        let after_terminal = fixture
+            .service
+            .storage
+            .list_timeline_page(conversation.id, None, 100)
+            .expect("flushed timeline")
+            .0
+            .into_iter()
+            .find(|item| item.id == item_id)
+            .expect("flushed stream item");
+        assert_eq!(after_terminal.revision, 2);
+        assert!(matches!(
+            after_terminal.kind,
+            TimelineItemKind::AgentMessage { ref text, .. } if text == "ab"
+        ));
     }
 
     #[tokio::test]
@@ -2721,7 +3879,7 @@ mod tests {
         fixture
             .service
             .storage
-            .begin_command(device.id, command_id)
+            .begin_command(device.id, command_id, 0)
             .expect("record pending command");
         let command = ClientCommand::SyncProject {
             command_id,
@@ -2755,7 +3913,10 @@ mod tests {
                 .storage
                 .command_state(device.id, command_id)
                 .expect("stored result"),
-            StoredCommand::Complete(Box::new(first))
+            StoredCommand::Complete {
+                attempt: 0,
+                result: Box::new(first),
+            }
         );
     }
 
@@ -2779,6 +3940,16 @@ mod tests {
                 .await
                 .expect("apply delta");
         }
+        fixture
+            .service
+            .apply_provider_event_inner(ProviderEvent {
+                provider: ProviderId::Codex,
+                project_id: fixture.project_a.id,
+                conversation_id: conversation.id,
+                kind: ProviderEventKind::Completed,
+            })
+            .await
+            .expect("complete stream");
         let items = fixture.service.storage.list_timeline().expect("timeline");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].revision, 2);
@@ -3483,6 +4654,11 @@ mod tests {
             )
             .expect("conversation lookup")
             .expect("synced conversation");
+        fixture
+            .service
+            .conversation_page(conversation.id, None, 100)
+            .await
+            .expect("open conversation history");
         let timeline = fixture
             .service
             .storage
@@ -3830,6 +5006,20 @@ mod tests {
             .conversation_by_native_session(ProviderId::Codex, fixture.project_a.id, "remote-1")
             .expect("conversation lookup")
             .expect("conversation");
+        assert!(
+            fixture
+                .service
+                .storage
+                .list_timeline()
+                .expect("metadata-only sync timeline")
+                .is_empty(),
+            "project sync must not eagerly load complete conversation history"
+        );
+        fixture
+            .service
+            .conversation_page(conversation.id, None, 100)
+            .await
+            .expect("load history when the conversation opens");
         fixture
             .service
             .rename_conversation(conversation.id, "我的固定标题".to_owned())

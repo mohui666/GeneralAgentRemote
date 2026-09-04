@@ -82,7 +82,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
-import androidx.compose.material3.NavigationDrawerItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -94,9 +93,11 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -110,8 +111,10 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -123,10 +126,15 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import dev.agentremote.messenger.model.Conversation
 import dev.agentremote.messenger.model.PermissionModeOption
 import dev.agentremote.messenger.model.PermissionRisk
 import dev.agentremote.messenger.model.PromptAttachment
+import dev.agentremote.messenger.model.ProjectSummary
+import dev.agentremote.messenger.model.ProjectTreeScope
 import dev.agentremote.messenger.model.ProviderCapability
 import dev.agentremote.messenger.model.ProviderId
 import dev.agentremote.messenger.model.SessionOption
@@ -138,6 +146,7 @@ import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import java.util.UUID
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.distinctUntilChanged
 
 private val RemoteBlack = Color(0xFF000000)
 private val RemoteSurface = Color(0xFF141414)
@@ -191,6 +200,16 @@ fun AgentRemoteTheme(content: @Composable () -> Unit) {
 fun RemoteApp(viewModel: RemoteViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP || event == Lifecycle.Event.ON_DESTROY) {
+                viewModel.flushState()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     LaunchedEffect(state.error) {
         state.error?.let {
             snackbar.showSnackbar(it)
@@ -198,7 +217,12 @@ fun RemoteApp(viewModel: RemoteViewModel) {
         }
     }
 
-    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .semantics { testTagsAsResourceId = true },
+    ) {
         if (state.snapshot == null) {
             ConnectionScreen(state, viewModel)
         } else {
@@ -328,6 +352,7 @@ private fun ConnectionScreen(state: RemoteUiState, viewModel: RemoteViewModel) {
 @Composable
 private fun StatusCard(text: String, online: Boolean) {
     Surface(
+        modifier = Modifier.testTag("gar.connection.status"),
         color = RemoteSurfaceRaised,
         shape = RoundedCornerShape(999.dp),
         border = BorderStroke(1.dp, RemoteBorder),
@@ -391,10 +416,17 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
     val snapshot = requireNotNull(state.snapshot)
     val drawerState = androidx.compose.material3.rememberDrawerState(androidx.compose.material3.DrawerValue.Closed)
     val scope = rememberCoroutineScope()
-    val selectedConversation = snapshot.conversations.find {
-        it.id == state.selectedConversationId &&
-            it.projectId == state.selectedProjectId &&
-            it.provider == state.selectedProvider
+    val selectedConversation = remember(
+        snapshot.conversations,
+        state.selectedConversationId,
+        state.selectedProjectId,
+        state.selectedProvider,
+    ) {
+        snapshot.conversations.find {
+            it.id == state.selectedConversationId &&
+                it.projectId == state.selectedProjectId &&
+                it.provider == state.selectedProvider
+        }
     }
     var menuExpanded by rememberSaveable { mutableStateOf(false) }
     var sortMode by rememberSaveable { mutableStateOf(HomeSort.AGENT) }
@@ -409,6 +441,11 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
                     viewModel.showConversationList()
                     scope.launch { drawerState.close() }
                 },
+                onConversation = { projectId, provider, conversationId ->
+                    viewModel.selectConversation(projectId, provider, conversationId)
+                    scope.launch { drawerState.close() }
+                },
+                onToggleProject = viewModel::toggleProjectExpanded,
                 onProvider = viewModel::selectProvider,
                 onProjectSearch = viewModel::setProjectSearch,
                 onPinProject = viewModel::toggleProjectPin,
@@ -454,7 +491,7 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
                 when {
                     state.showingNewConversation -> NewConversationScreen(state, viewModel)
                     selectedConversation != null -> ConversationScreen(state, selectedConversation, viewModel)
-                    else -> RemoteHomeScreen(state, sortMode, viewModel)
+                    else -> RemoteHomeScreen(state, sortMode, viewModel, viewModel::toggleProjectExpanded)
                 }
             }
         }
@@ -466,10 +503,48 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
 
 private enum class HomeSort { AGENT, RECENT, ACTIVE }
 
+internal fun conversationsByProjectForProvider(
+    conversations: List<Conversation>,
+    provider: ProviderId?,
+): Map<UUID, List<Conversation>> = conversations
+    .asSequence()
+    .filter { it.provider == provider }
+    .groupBy(Conversation::projectId)
+    .mapValues { (_, scoped) -> scoped.sortedByDescending(Conversation::updatedAtMs) }
+
+internal fun projectTreeMatchesSearch(
+    project: ProjectSummary,
+    conversations: List<Conversation>,
+    query: String,
+): Boolean = query.isBlank() ||
+    project.displayName.contains(query, ignoreCase = true) ||
+    project.shortPath.contains(query, ignoreCase = true) ||
+    conversations.any { it.title.contains(query, ignoreCase = true) }
+
+internal fun usesCompactDrawerLayout(maxHeightDp: Float): Boolean = maxHeightDp <= 480f
+
+internal fun availableAgentProviders(projects: List<ProjectSummary>): List<ProviderId> {
+    val enabled = projects.asSequence()
+        .filter(ProjectSummary::valid)
+        .flatMap { it.enabledProviders.asSequence() }
+        .toSet()
+    return ProviderId.entries.filter(enabled::contains)
+}
+
+internal fun isHomeProjectExpanded(
+    expandedScopes: Set<ProjectTreeScope>,
+    hostId: UUID,
+    provider: ProviderId?,
+    projectId: UUID?,
+): Boolean = provider != null && projectId != null &&
+    projectTreeScope(hostId, provider, projectId) in expandedScopes
+
 @Composable
 private fun RemoteDrawer(
     state: RemoteUiState,
     onProject: (UUID) -> Unit,
+    onConversation: (UUID, ProviderId, UUID) -> Unit,
+    onToggleProject: (UUID) -> Unit,
     onProvider: (ProviderId) -> Unit,
     onProjectSearch: (String) -> Unit,
     onPinProject: (UUID) -> Unit,
@@ -479,143 +554,432 @@ private fun RemoteDrawer(
     onDisconnect: () -> Unit,
 ) {
     val snapshot = requireNotNull(state.snapshot)
-    ModalDrawerSheet(
-        modifier = Modifier.fillMaxHeight().widthIn(max = 330.dp),
-        drawerContainerColor = RemoteSurface,
-        drawerContentColor = RemoteText,
-    ) {
-        Column(Modifier.statusBarsPadding().padding(horizontal = 18.dp, vertical = 14.dp)) {
-            Text("Agent Remote", style = MaterialTheme.typography.titleLarge)
-            Row(
-                Modifier.padding(top = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                OnlineDot(state.online)
-                Spacer(Modifier.width(8.dp))
-                Text(snapshot.hostName, color = RemoteMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-            Spacer(Modifier.height(10.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ProviderId.entries.forEach { provider ->
-                    OutlinedButton(
-                        onClick = { onProvider(provider) },
-                        modifier = Modifier.weight(1f).height(40.dp),
-                        shape = RoundedCornerShape(12.dp),
-                        border = BorderStroke(
-                            1.dp,
-                            if (state.selectedProvider == provider) RemotePurple else RemoteBorder,
-                        ),
-                    ) { Text(provider.label, style = MaterialTheme.typography.labelMedium) }
-                }
-            }
-            Spacer(Modifier.height(8.dp))
-            Button(
-                onClick = onNewConversation,
-                enabled = state.selectedProjectId != null && state.selectedProvider != null,
-                modifier = Modifier.fillMaxWidth().height(50.dp),
-                shape = RoundedCornerShape(16.dp),
-            ) {
-                RemoteIcon(RemoteGlyph.Compose, null, Modifier.size(20.dp))
-                Spacer(Modifier.width(8.dp))
-                Text("新建对话")
-            }
-        }
-        HorizontalDivider(color = RemoteBorder)
-        OutlinedTextField(
-            value = state.projectSearch,
-            onValueChange = onProjectSearch,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
-            singleLine = true,
-            label = { Text("搜索项目") },
-            leadingIcon = { RemoteIcon(RemoteGlyph.Search, null, Modifier.size(18.dp), RemoteMuted) },
-            shape = RoundedCornerShape(14.dp),
-        )
-        val matchingProjects = snapshot.projects
-            .filter {
-                it.valid && state.selectedProvider in it.enabledProviders &&
-                    (state.projectSearch.isBlank() ||
-                        it.displayName.contains(state.projectSearch, ignoreCase = true) ||
-                        it.shortPath.contains(state.projectSearch, ignoreCase = true))
-            }
-            .sortedByDescending { it.lastActivityAtMs }
-        val pinnedProjects = matchingProjects.filter { it.id in state.pinnedProjects }
-        val recentProjects = state.recentProjects.mapNotNull { recentId ->
-            matchingProjects.find { it.id == recentId && it.id !in state.pinnedProjects }
-        }
-        val remainingProjects = matchingProjects.filter {
-            it.id !in state.pinnedProjects && it.id !in state.recentProjects
-        }
-        LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 10.dp)) {
-            listOf(
-                "固定" to pinnedProjects,
-                "最近" to recentProjects,
-                "全部项目" to remainingProjects,
-            ).filter { it.second.isNotEmpty() }.forEach { (section, projects) ->
-                item(key = "project-section-$section") {
-                    Text(
-                        section,
-                        modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 5.dp),
-                        color = RemoteMuted,
-                        style = MaterialTheme.typography.labelSmall,
+    val provider = state.selectedProvider
+    val availableProviders = remember(snapshot.projects) { availableAgentProviders(snapshot.projects) }
+    val query = state.projectSearch.trim()
+    val providerConversations = remember(snapshot.conversations, provider) {
+        conversationsByProjectForProvider(snapshot.conversations, provider)
+    }
+    val matchingProjects = remember(snapshot.projects, providerConversations, provider, query) {
+        snapshot.projects
+            .asSequence()
+            .filter { it.valid && provider in it.enabledProviders }
+            .filter { project -> projectTreeMatchesSearch(project, providerConversations[project.id].orEmpty(), query) }
+            .sortedWith(
+                compareByDescending<ProjectSummary> { project ->
+                    maxOf(
+                        project.lastActivityAtMs ?: Long.MIN_VALUE,
+                        providerConversations[project.id]?.maxOfOrNull(Conversation::updatedAtMs) ?: Long.MIN_VALUE,
                     )
+                }.thenBy { it.displayName.lowercase() },
+            )
+            .toList()
+    }
+    val pinnedProjects = matchingProjects.filter { it.id in state.pinnedProjects }
+    val recentProjects = state.recentProjects.mapNotNull { recentId ->
+        matchingProjects.find { it.id == recentId && it.id !in state.pinnedProjects }
+    }.distinctBy(ProjectSummary::id)
+    val remainingProjects = matchingProjects.filter {
+        it.id !in state.pinnedProjects && it.id !in state.recentProjects
+    }
+    BoxWithConstraints(Modifier.fillMaxHeight()) {
+        val drawerWidth = minOf(280.dp, (maxWidth - 32.dp).coerceAtLeast(0.dp))
+        val compactHeight = usesCompactDrawerLayout(maxHeight.value)
+        ModalDrawerSheet(
+            modifier = Modifier.fillMaxHeight().width(drawerWidth),
+            drawerContainerColor = RemoteSurface,
+            drawerContentColor = RemoteText,
+        ) {
+            Column(
+                Modifier
+                    .statusBarsPadding()
+                    .padding(horizontal = if (compactHeight) 8.dp else 12.dp, vertical = if (compactHeight) 4.dp else 10.dp),
+            ) {
+                if (compactHeight) {
+                    Column(Modifier.fillMaxWidth().height(44.dp), verticalArrangement = Arrangement.Center) {
+                        Text("Agent Remote", style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            OnlineDot(state.online)
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                snapshot.hostName,
+                                color = RemoteMuted,
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        AgentSelector(
+                            providers = availableProviders,
+                            selected = provider,
+                            modifier = Modifier.weight(1.2f),
+                            onProvider = onProvider,
+                        )
+                        Button(
+                            onClick = onNewConversation,
+                            enabled = state.selectedProjectId != null && provider != null,
+                            modifier = Modifier
+                                .weight(1.35f)
+                                .height(44.dp)
+                                .testTag("gar.conversation.new"),
+                            contentPadding = PaddingValues(horizontal = 4.dp),
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            RemoteIcon(RemoteGlyph.Compose, null, Modifier.size(18.dp))
+                            Spacer(Modifier.width(3.dp))
+                            Text("新建", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                } else {
+                    Text("Agent Remote", style = MaterialTheme.typography.titleLarge, maxLines = 1)
+                    Row(
+                        Modifier.padding(top = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        OnlineDot(state.online)
+                        Spacer(Modifier.width(7.dp))
+                        Text(snapshot.hostName, color = RemoteMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    AgentSelector(
+                        providers = availableProviders,
+                        selected = provider,
+                        modifier = Modifier.fillMaxWidth(),
+                        onProvider = onProvider,
+                    )
+                    Spacer(Modifier.height(7.dp))
+                    Button(
+                        onClick = onNewConversation,
+                        enabled = state.selectedProjectId != null && provider != null,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(46.dp)
+                            .testTag("gar.conversation.new"),
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        RemoteIcon(RemoteGlyph.Compose, null, Modifier.size(19.dp))
+                        Spacer(Modifier.width(7.dp))
+                        Text("新建对话", maxLines = 1)
+                    }
                 }
-                items(projects, key = { it.id }) { project ->
-                    NavigationDrawerItem(
-                        icon = { RemoteIcon(RemoteGlyph.Folder, null, Modifier.size(22.dp), RemoteMuted) },
-                        label = {
-                            Column {
-                                Text(project.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text(
-                                    "${project.shortPath} · ${project.conversationCount} 个对话",
-                                    color = RemoteMuted,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
+            }
+            HorizontalDivider(color = RemoteBorder)
+            OutlinedTextField(
+                value = state.projectSearch,
+                onValueChange = onProjectSearch,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 10.dp, vertical = if (compactHeight) 4.dp else 7.dp)
+                    .then(if (compactHeight) Modifier.height(48.dp) else Modifier)
+                    .testTag("gar.tree.search"),
+                singleLine = true,
+                placeholder = { Text("搜索项目或对话", maxLines = 1) },
+                leadingIcon = { RemoteIcon(RemoteGlyph.Search, null, Modifier.size(18.dp), RemoteMuted) },
+                shape = RoundedCornerShape(13.dp),
+            )
+            LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 6.dp)) {
+                listOf(
+                    "固定" to pinnedProjects,
+                    "最近" to recentProjects,
+                    "全部项目" to remainingProjects,
+                ).filter { it.second.isNotEmpty() }.forEach { (section, projects) ->
+                    item(key = "project-section-$section") {
+                        Text(
+                            section,
+                            modifier = Modifier.padding(
+                                start = 12.dp,
+                                top = if (compactHeight) 4.dp else 10.dp,
+                                bottom = if (compactHeight) 1.dp else 3.dp,
+                            ),
+                            color = RemoteMuted,
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                    projects.forEach { project ->
+                        val conversations = providerConversations[project.id].orEmpty()
+                        val matchingConversations = if (query.isBlank()) {
+                            conversations
+                        } else {
+                            conversations.filter { it.title.contains(query, ignoreCase = true) }
+                        }
+                        val scope = provider?.let { projectTreeScope(snapshot.hostId, it, project.id) }
+                        val expanded = scope in state.expandedProjectScopes ||
+                            (query.isNotBlank() && matchingConversations.isNotEmpty())
+                        item(key = "project-${provider?.wire}-${project.id}") {
+                            DrawerProjectRow(
+                                project = project,
+                                status = snapshot.providerCapabilities.find {
+                                    it.provider == provider && it.projectId == project.id
+                                }?.state ?: if (project.valid) "available" else "unavailable",
+                                updatedAtMs = maxOf(
+                                    project.lastActivityAtMs ?: Long.MIN_VALUE,
+                                    conversations.maxOfOrNull(Conversation::updatedAtMs) ?: Long.MIN_VALUE,
+                                ).takeUnless { it == Long.MIN_VALUE },
+                                conversationCount = conversations.size,
+                                selected = state.selectedProjectId == project.id,
+                                expanded = expanded,
+                                pinned = project.id in state.pinnedProjects,
+                                onSelect = { onProject(project.id) },
+                                onToggle = { onToggleProject(project.id) },
+                                onPin = { onPinProject(project.id) },
+                            )
+                        }
+                        if (expanded) {
+                            val visibleConversations = if (query.isBlank() || matchingConversations.isEmpty()) {
+                                conversations
+                            } else {
+                                matchingConversations
+                            }
+                            items(
+                                items = visibleConversations,
+                                key = { "conversation-${it.provider.wire}-${it.projectId}-${it.id}" },
+                            ) { conversation ->
+                                DrawerConversationRow(
+                                    conversation = conversation,
+                                    selected = state.selectedConversationId == conversation.id &&
+                                        state.selectedProjectId == conversation.projectId &&
+                                        state.selectedProvider == conversation.provider,
+                                    onClick = {
+                                        onConversation(conversation.projectId, conversation.provider, conversation.id)
+                                    },
                                 )
                             }
-                        },
-                        badge = {
-                            TextButton(onClick = { onPinProject(project.id) }) {
-                                Text(if (project.id in state.pinnedProjects) "★" else "☆")
-                            }
-                        },
-                        selected = state.selectedProjectId == project.id,
-                        onClick = { onProject(project.id) },
-                        colors = androidx.compose.material3.NavigationDrawerItemDefaults.colors(
-                            selectedContainerColor = RemoteSurfaceRaised,
-                            unselectedContainerColor = Color.Transparent,
-                            selectedTextColor = RemoteText,
-                            unselectedTextColor = RemoteText,
-                        ),
-                    )
+                        }
+                    }
+                }
+            }
+            HorizontalDivider(color = RemoteBorder)
+            if (compactHeight) {
+                Row(Modifier.fillMaxWidth()) {
+                    if (!state.online) {
+                        TextButton(
+                            onClick = if (state.retryEnabled) onStopRetrying else onRetryNow,
+                            modifier = Modifier.weight(1f).height(44.dp),
+                            contentPadding = PaddingValues(horizontal = 4.dp),
+                        ) {
+                            RemoteIcon(
+                                if (state.retryEnabled) RemoteGlyph.Stop else RemoteGlyph.Recent,
+                                null,
+                                Modifier.size(18.dp),
+                                RemoteMuted,
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                if (state.retryEnabled) "停止重连" else "立即重连",
+                                color = RemoteMuted,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                    TextButton(
+                        onClick = onDisconnect,
+                        modifier = Modifier.weight(1f).height(44.dp),
+                        contentPadding = PaddingValues(horizontal = 4.dp),
+                    ) {
+                        RemoteIcon(RemoteGlyph.Disconnect, null, Modifier.size(18.dp), MaterialTheme.colorScheme.error)
+                        Spacer(Modifier.width(4.dp))
+                        Text("断开 Host", color = MaterialTheme.colorScheme.error, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            } else {
+                if (!state.online) {
+                    TextButton(
+                        onClick = if (state.retryEnabled) onStopRetrying else onRetryNow,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp).height(44.dp),
+                    ) {
+                        RemoteIcon(
+                            if (state.retryEnabled) RemoteGlyph.Stop else RemoteGlyph.Recent,
+                            null,
+                            Modifier.size(19.dp),
+                            RemoteMuted,
+                        )
+                        Spacer(Modifier.width(7.dp))
+                        Text(if (state.retryEnabled) "停止自动重连" else "立即重连", color = RemoteMuted)
+                    }
+                }
+                TextButton(
+                    onClick = onDisconnect,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp).height(44.dp),
+                ) {
+                    RemoteIcon(RemoteGlyph.Disconnect, null, Modifier.size(19.dp), MaterialTheme.colorScheme.error)
+                    Spacer(Modifier.width(7.dp))
+                    Text("断开 Host", color = MaterialTheme.colorScheme.error)
+                }
+            }
+            Spacer(Modifier.navigationBarsPadding())
+        }
+    }
+}
+
+@Composable
+private fun AgentSelector(
+    providers: List<ProviderId>,
+    selected: ProviderId?,
+    modifier: Modifier,
+    onProvider: (ProviderId) -> Unit,
+) {
+    var expanded by rememberSaveable(providers, selected) { mutableStateOf(false) }
+    val canSwitch = providers.size > 1
+    Box(modifier) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(44.dp)
+                .testTag("gar.agent.selector")
+                .then(if (canSwitch) Modifier.clickable { expanded = true } else Modifier),
+            color = Color.Transparent,
+            shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(1.dp, if (selected != null) RemotePurple else RemoteBorder),
+        ) {
+            Row(
+                Modifier.fillMaxSize().padding(horizontal = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Agent", color = RemoteMuted, style = MaterialTheme.typography.labelSmall)
+                Spacer(Modifier.width(7.dp))
+                Text(
+                    selected?.label ?: "不可用",
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (canSwitch) {
+                    RemoteIcon(RemoteGlyph.ChevronDown, "选择 Agent", Modifier.size(18.dp), RemoteMuted)
                 }
             }
         }
-        HorizontalDivider(color = RemoteBorder)
-        if (!state.online) {
-            TextButton(
-                onClick = if (state.retryEnabled) onStopRetrying else onRetryNow,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp).height(44.dp),
-            ) {
-                RemoteIcon(
-                    if (state.retryEnabled) RemoteGlyph.Stop else RemoteGlyph.Recent,
-                    null,
-                    Modifier.size(19.dp),
-                    RemoteMuted,
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            modifier = Modifier.widthIn(min = 168.dp, max = 220.dp),
+        ) {
+            providers.forEach { provider ->
+                DropdownMenuItem(
+                    text = { Text(provider.label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    onClick = {
+                        expanded = false
+                        onProvider(provider)
+                    },
+                    modifier = Modifier.testTag("gar.agent.${provider.wire}"),
+                    leadingIcon = {
+                        if (provider == selected) {
+                            RemoteIcon(RemoteGlyph.Check, null, Modifier.size(18.dp), RemotePurple)
+                        }
+                    },
+                    contentPadding = PaddingValues(horizontal = 12.dp),
                 )
-                Spacer(Modifier.width(8.dp))
-                Text(if (state.retryEnabled) "停止自动重连" else "立即重连", color = RemoteMuted)
             }
         }
-        TextButton(
-            onClick = onDisconnect,
-            modifier = Modifier.fillMaxWidth().padding(10.dp).height(48.dp),
-        ) {
-            RemoteIcon(RemoteGlyph.Disconnect, null, Modifier.size(20.dp), MaterialTheme.colorScheme.error)
-            Spacer(Modifier.width(8.dp))
-            Text("断开 Host", color = MaterialTheme.colorScheme.error)
+    }
+}
+
+@Composable
+private fun DrawerProjectRow(
+    project: ProjectSummary,
+    status: String,
+    updatedAtMs: Long?,
+    conversationCount: Int,
+    selected: Boolean,
+    expanded: Boolean,
+    pinned: Boolean,
+    onSelect: () -> Unit,
+    onToggle: () -> Unit,
+    onPin: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp)
+            .testTag("gar.project.${project.id}"),
+        color = if (selected) RemoteSurfaceRaised else Color.Transparent,
+        shape = RoundedCornerShape(12.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(
+                onClick = onToggle,
+                modifier = Modifier.size(44.dp).testTag("gar.project.${project.id}.toggle"),
+            ) {
+                RemoteIcon(
+                    if (expanded) RemoteGlyph.ChevronDown else RemoteGlyph.ChevronRight,
+                    if (expanded) "折叠 ${project.displayName}" else "展开 ${project.displayName}",
+                    Modifier.size(18.dp),
+                    RemoteMuted,
+                )
+            }
+            Column(
+                Modifier
+                    .weight(1f)
+                    .heightIn(min = 44.dp)
+                    .clickable(onClick = onSelect),
+                verticalArrangement = Arrangement.Center,
+            ) {
+                Text(project.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    "${projectStatusLabel(status)} · ${activityLabel(updatedAtMs)} · $conversationCount",
+                    color = RemoteMuted,
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            IconButton(onClick = onPin, modifier = Modifier.size(44.dp)) {
+                Text(if (pinned) "★" else "☆", color = if (pinned) RemotePurple else RemoteMuted)
+            }
         }
-        Spacer(Modifier.navigationBarsPadding())
+    }
+}
+
+@Composable
+private fun DrawerConversationRow(
+    conversation: Conversation,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(start = 38.dp, end = 4.dp, top = 1.dp, bottom = 1.dp)
+            .heightIn(min = 44.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (selected) Color(0xFF28232F) else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 6.dp)
+            .testTag("gar.conversation.${conversation.id}"),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(conversation.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                "${stateLabel(conversation.state)} · ${activityLabel(conversation.updatedAtMs)}",
+                color = RemoteMuted,
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+private fun projectStatusLabel(status: String): String = when (status) {
+    "ready", "available" -> "可用"
+    "syncing" -> "同步中"
+    "offline" -> "离线"
+    else -> status
+}
+
+private fun activityLabel(updatedAtMs: Long?): String {
+    updatedAtMs ?: return "暂无活动"
+    val elapsed = (System.currentTimeMillis() - updatedAtMs).coerceAtLeast(0L)
+    return when {
+        elapsed < 60_000L -> "刚刚"
+        elapsed < 3_600_000L -> "${elapsed / 60_000L} 分钟前"
+        elapsed < 86_400_000L -> "${elapsed / 3_600_000L} 小时前"
+        else -> "${elapsed / 86_400_000L} 天前"
     }
 }
 
@@ -643,10 +1007,13 @@ private fun RemoteTopBar(
             glyph = RemoteGlyph.Menu,
             description = "打开项目导航",
             onClick = onNavigation,
-            modifier = Modifier.align(Alignment.CenterStart),
+            modifier = Modifier.align(Alignment.CenterStart).testTag("gar.drawer.open"),
         )
         Column(
-            modifier = Modifier.align(Alignment.Center).widthIn(max = 120.dp),
+            modifier = Modifier
+                .align(Alignment.Center)
+                .widthIn(max = 120.dp)
+                .testTag("gar.connection.status"),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text("远程", style = MaterialTheme.typography.titleLarge)
@@ -696,8 +1063,8 @@ private fun RemoteOverflowMenu(
     DropdownMenu(
         expanded = expanded,
         onDismissRequest = onDismiss,
-        modifier = Modifier.width(278.dp),
-        shape = RoundedCornerShape(24.dp),
+        modifier = Modifier.widthIn(min = 168.dp, max = 220.dp),
+        shape = RoundedCornerShape(18.dp),
         containerColor = RemoteSurfaceRaised,
         border = BorderStroke(1.dp, RemoteBorder),
     ) {
@@ -711,7 +1078,7 @@ private fun RemoteOverflowMenu(
         RemoteMenuRow(RemoteGlyph.Disconnect, "断开 Host", tint = MaterialTheme.colorScheme.error) { onDisconnect() }
         HorizontalDivider(Modifier.padding(vertical = 8.dp), color = RemoteBorder)
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 10.dp),
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             OnlineDot(online)
@@ -725,7 +1092,7 @@ private fun RemoteOverflowMenu(
 private fun MenuSectionLabel(label: String) {
     Text(
         label,
-        modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp),
+        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
         color = RemoteMuted,
         style = MaterialTheme.typography.labelMedium,
     )
@@ -740,37 +1107,62 @@ private fun RemoteMenuRow(
     onClick: () -> Unit,
 ) {
     Row(
-        Modifier.fillMaxWidth().height(50.dp).clickable(onClick = onClick).padding(horizontal = 18.dp),
+        Modifier.fillMaxWidth().height(48.dp).clickable(onClick = onClick).padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(Modifier.width(24.dp), contentAlignment = Alignment.Center) {
             if (selected) RemoteIcon(RemoteGlyph.Check, null, Modifier.size(18.dp), tint)
         }
-        Spacer(Modifier.width(10.dp))
+        Spacer(Modifier.width(7.dp))
         RemoteIcon(glyph, null, Modifier.size(22.dp), tint)
-        Spacer(Modifier.width(14.dp))
-        Text(label, color = tint, style = MaterialTheme.typography.bodyLarge)
+        Spacer(Modifier.width(9.dp))
+        Text(
+            label,
+            modifier = Modifier.weight(1f),
+            color = tint,
+            style = MaterialTheme.typography.bodyMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
 @Composable
-private fun RemoteHomeScreen(state: RemoteUiState, sortMode: HomeSort, viewModel: RemoteViewModel) {
+private fun RemoteHomeScreen(
+    state: RemoteUiState,
+    sortMode: HomeSort,
+    viewModel: RemoteViewModel,
+    onToggleProject: (UUID) -> Unit,
+) {
     val snapshot = requireNotNull(state.snapshot)
     val selectedProject = snapshot.projects.find { it.valid && it.id == state.selectedProjectId }
+    val projectExpanded = isHomeProjectExpanded(
+        expandedScopes = state.expandedProjectScopes,
+        hostId = snapshot.hostId,
+        provider = state.selectedProvider,
+        projectId = selectedProject?.id,
+    )
     var search by rememberSaveable { mutableStateOf("") }
-    val filtered = snapshot.conversations
-        .asSequence()
-        .filter { selectedProject != null && it.projectId == selectedProject.id }
-        .filter { state.selectedProvider == null || it.provider == state.selectedProvider }
-        .filter { search.isBlank() || it.title.contains(search.trim(), ignoreCase = true) }
-        .let { conversations ->
-            when (sortMode) {
-                HomeSort.AGENT -> conversations.sortedWith(compareBy<Conversation> { it.provider.label }.thenByDescending { it.updatedAtMs })
-                HomeSort.RECENT -> conversations.sortedByDescending { it.updatedAtMs }
-                HomeSort.ACTIVE -> conversations.sortedWith(compareByDescending<Conversation> { it.running }.thenByDescending { it.updatedAtMs })
+    val filtered = remember(snapshot.conversations, selectedProject?.id, state.selectedProvider, search, sortMode) {
+        val normalizedSearch = search.trim()
+        snapshot.conversations
+            .asSequence()
+            .filter { selectedProject != null && it.projectId == selectedProject.id }
+            .filter { state.selectedProvider == null || it.provider == state.selectedProvider }
+            .filter { normalizedSearch.isBlank() || it.title.contains(normalizedSearch, ignoreCase = true) }
+            .let { conversations ->
+                when (sortMode) {
+                    HomeSort.AGENT -> conversations.sortedWith(
+                        compareBy<Conversation> { it.provider.label }.thenByDescending { it.updatedAtMs },
+                    )
+                    HomeSort.RECENT -> conversations.sortedByDescending { it.updatedAtMs }
+                    HomeSort.ACTIVE -> conversations.sortedWith(
+                        compareByDescending<Conversation> { it.running }.thenByDescending { it.updatedAtMs },
+                    )
+                }
             }
-        }
-        .toList()
+            .toList()
+    }
 
     Column(Modifier.fillMaxSize()) {
         Text(
@@ -778,21 +1170,31 @@ private fun RemoteHomeScreen(state: RemoteUiState, sortMode: HomeSort, viewModel
             modifier = Modifier.padding(horizontal = 20.dp, vertical = 18.dp),
             style = MaterialTheme.typography.titleLarge,
         )
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            RemoteIcon(RemoteGlyph.Folder, null, Modifier.size(27.dp))
-            Spacer(Modifier.width(12.dp))
-            Text(
-                selectedProject?.displayName ?: "请从侧栏选择项目",
-                modifier = Modifier.weight(1f),
-                style = MaterialTheme.typography.titleLarge,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+        if (selectedProject == null) {
+            Row(
+                Modifier.fillMaxWidth().heightIn(min = 44.dp).padding(horizontal = 20.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RemoteIcon(RemoteGlyph.Folder, null, Modifier.size(24.dp))
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    "请从侧栏选择项目",
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        } else {
+            HomeProjectRow(
+                project = selectedProject,
+                expanded = projectExpanded,
+                onToggle = { onToggleProject(selectedProject.id) },
             )
         }
-        if (filtered.isEmpty()) {
+        if (!projectExpanded) {
+            Spacer(Modifier.weight(1f))
+        } else if (filtered.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     RemoteIcon(RemoteGlyph.Chat, null, Modifier.size(34.dp), RemoteMuted)
@@ -805,7 +1207,7 @@ private fun RemoteHomeScreen(state: RemoteUiState, sortMode: HomeSort, viewModel
                 modifier = Modifier.weight(1f),
                 contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
             ) {
-                items(filtered, key = { it.id }) { conversation ->
+                items(filtered, key = { it.id }, contentType = { "conversation" }) { conversation ->
                     ConversationListItem(conversation) { viewModel.selectConversation(conversation.id) }
                 }
             }
@@ -818,9 +1220,54 @@ private fun RemoteHomeScreen(state: RemoteUiState, sortMode: HomeSort, viewModel
 }
 
 @Composable
+private fun HomeProjectRow(
+    project: ProjectSummary,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .heightIn(min = 44.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onToggle)
+            .padding(start = 8.dp)
+            .testTag("gar.home.project.${project.id}"),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RemoteIcon(RemoteGlyph.Folder, null, Modifier.size(24.dp))
+        Spacer(Modifier.width(10.dp))
+        Text(
+            project.displayName,
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.titleMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        IconButton(
+            onClick = onToggle,
+            modifier = Modifier.size(44.dp).testTag("gar.home.project.${project.id}.toggle"),
+        ) {
+            RemoteIcon(
+                if (expanded) RemoteGlyph.ChevronDown else RemoteGlyph.ChevronRight,
+                if (expanded) "折叠 ${project.displayName}" else "展开 ${project.displayName}",
+                Modifier.size(19.dp),
+                RemoteMuted,
+            )
+        }
+    }
+}
+
+@Composable
 private fun ConversationListItem(conversation: Conversation, onClick: () -> Unit) {
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 14.dp),
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 44.dp)
+            .clickable(onClick = onClick)
+            .padding(vertical = 14.dp)
+            .testTag("gar.home.conversation.${conversation.id}"),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f)) {
@@ -884,7 +1331,7 @@ private fun HomeBottomBar(search: String, onSearch: (String) -> Unit) {
                             input()
                         }
                         if (search.isNotEmpty()) {
-                            IconButton(onClick = { onSearch("") }, modifier = Modifier.size(40.dp)) {
+                            IconButton(onClick = { onSearch("") }, modifier = Modifier.size(44.dp)) {
                                 RemoteIcon(RemoteGlyph.Close, "清除搜索", Modifier.size(17.dp), RemoteMuted)
                             }
                         }
@@ -940,9 +1387,11 @@ private fun NewConversationScreen(state: RemoteUiState, viewModel: RemoteViewMod
             selectedEffort = state.selectedEffort,
             selectedPermission = state.selectedPermission,
             promptAttachments = state.promptAttachments,
-            sending = state.creatingConversation,
+            sendStatus = state.sendStatus,
+            sendFailure = state.sendFailure,
             onDraft = viewModel::setDraft,
             onSend = viewModel::sendMessage,
+            onRetry = viewModel::retryPendingSend,
             onSteer = {},
             onInterrupt = {},
             onSessionOption = { option, value ->
@@ -966,14 +1415,27 @@ private fun ConversationScreen(
     viewModel: RemoteViewModel,
 ) {
     val snapshot = requireNotNull(state.snapshot)
-    val capability = snapshot.providerCapabilities.find {
-        it.projectId == conversation.projectId && it.provider == conversation.provider
+    val capability = remember(snapshot.providerCapabilities, conversation.projectId, conversation.provider) {
+        snapshot.providerCapabilities.find {
+            it.projectId == conversation.projectId && it.provider == conversation.provider
+        }
     }
-    val timeline = snapshot.timeline.filter { it.conversationId == conversation.id }
-    val timelineBlocks = groupTimeline(timeline)
+    val timeline = state.timelineByConversation[conversation.id].orEmpty()
+    val timelineGrouper = remember(conversation.id) { TimelineBlockGrouper() }
+    val timelineBlocks = remember(timeline) { timelineGrouper.update(timeline) }
     val listState = rememberLazyListState()
-    LaunchedEffect(timeline.size, timeline.lastOrNull()?.revision) {
-        if (timeline.isNotEmpty()) listState.animateScrollToItem(timeline.lastIndex)
+    var followingTail by remember(conversation.id) { mutableStateOf(true) }
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress to !listState.canScrollForward }
+            .distinctUntilChanged()
+            .collect { (scrolling, atBottom) ->
+                if (scrolling) followingTail = atBottom else if (atBottom) followingTail = true
+            }
+    }
+    LaunchedEffect(timelineBlocks.lastOrNull()?.key, timeline.lastOrNull()?.revision) {
+        if (followingTail && timelineBlocks.isNotEmpty()) {
+            listState.scrollToItem(timelineBlocks.lastIndex + 1)
+        }
     }
     Column(
         Modifier
@@ -1004,7 +1466,16 @@ private fun ConversationScreen(
                             }
                         }
                     }
-                    items(timelineBlocks, key = { it.key }) { block ->
+                    items(
+                        items = timelineBlocks,
+                        key = { it.key },
+                        contentType = {
+                            when (it) {
+                                is TimelineBlock.Single -> "timeline"
+                                is TimelineBlock.Activity -> "activity"
+                            }
+                        },
+                    ) { block ->
                         when (block) {
                             is TimelineBlock.Single -> TimelineCard(
                                 item = block.item,
@@ -1042,9 +1513,11 @@ private fun ConversationScreen(
                 .find { it.id == "permission_mode" }
                 ?.currentValue,
             promptAttachments = state.promptAttachments,
-            sending = state.pendingCommands.isNotEmpty(),
+            sendStatus = state.sendStatus,
+            sendFailure = state.sendFailure,
             onDraft = viewModel::setDraft,
             onSend = viewModel::sendMessage,
+            onRetry = viewModel::retryPendingSend,
             onSteer = viewModel::steer,
             onInterrupt = viewModel::interrupt,
             onSessionOption = viewModel::setSessionOption,
@@ -1140,9 +1613,11 @@ private fun Composer(
     selectedEffort: String?,
     selectedPermission: String?,
     promptAttachments: List<PromptAttachment>,
-    sending: Boolean,
+    sendStatus: SendStatus,
+    sendFailure: String?,
     onDraft: (String) -> Unit,
     onSend: () -> Unit,
+    onRetry: () -> Unit,
     onSteer: () -> Unit,
     onInterrupt: () -> Unit,
     onSessionOption: (String, String) -> Unit,
@@ -1192,12 +1667,14 @@ private fun Composer(
                         ) {
                             Text(
                                 attachment.fileName,
+                                modifier = Modifier.widthIn(max = 160.dp),
                                 style = MaterialTheme.typography.labelSmall,
                                 maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                             )
                             IconButton(
                                 onClick = { onRemoveAttachment(attachment.id) },
-                                modifier = Modifier.size(30.dp),
+                                modifier = Modifier.size(44.dp),
                             ) {
                                 RemoteIcon(RemoteGlyph.Close, "移除附件", Modifier.size(14.dp), RemoteMuted)
                             }
@@ -1226,7 +1703,7 @@ private fun Composer(
                             promptAttachments.size < capability.attachments.maxCount &&
                             promptAttachments.sumOf { it.bytes.size.toLong() } <
                             capability.attachments.maxTotalBytes,
-                        modifier = Modifier.size(38.dp),
+                        modifier = Modifier.size(44.dp),
                     ) {
                         RemoteIcon(RemoteGlyph.Attach, "添加附件", Modifier.size(19.dp), RemoteMuted)
                     }
@@ -1238,6 +1715,7 @@ private fun Composer(
                         modifier = Modifier
                             .weight(1f)
                             .padding(vertical = 9.dp)
+                            .testTag("gar.composer.input")
                             .semantics {
                                 contentDescription = when {
                                     running && !supportsSteer -> "当前 Agent 不支持追加指令"
@@ -1265,8 +1743,11 @@ private fun Composer(
                     if (!running || supportsSteer) {
                         IconButton(
                             onClick = if (running) onSteer else onSend,
-                            enabled = online && draft.isNotBlank() && !sending,
-                            modifier = Modifier.size(46.dp).background(Color.White, CircleShape),
+                            enabled = online && draft.isNotBlank() && sendStatus == SendStatus.IDLE,
+                            modifier = Modifier
+                                .size(46.dp)
+                                .background(Color.White, CircleShape)
+                                .testTag("gar.composer.send"),
                         ) {
                             RemoteIcon(RemoteGlyph.Send, if (running) "追加指令" else "发送", Modifier.size(22.dp), Color.Black)
                         }
@@ -1280,6 +1761,36 @@ private fun Composer(
                     modifier = Modifier.size(56.dp).border(1.dp, Color(0xFF70343D), CircleShape).background(Color(0xFF2B171B), CircleShape),
                 ) {
                     RemoteIcon(RemoteGlyph.Stop, "停止", Modifier.size(22.dp), MaterialTheme.colorScheme.error)
+                }
+            }
+        }
+        if (sendStatus != SendStatus.IDLE) {
+            Row(
+                Modifier.fillMaxWidth().heightIn(min = 44.dp).padding(horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    when (sendStatus) {
+                        SendStatus.SENDING -> "正在发送…"
+                        SendStatus.QUEUED -> "已排队，等待 Host 确认"
+                        SendStatus.FAILED -> sendFailure ?: "发送失败，草稿已保留"
+                        SendStatus.IDLE -> ""
+                    },
+                    modifier = Modifier.weight(1f),
+                    color = if (sendStatus == SendStatus.FAILED) MaterialTheme.colorScheme.error else RemoteMuted,
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (sendStatus == SendStatus.FAILED) {
+                    TextButton(
+                        onClick = onRetry,
+                        enabled = online,
+                        modifier = Modifier.heightIn(min = 44.dp).testTag("gar.send.retry"),
+                        contentPadding = PaddingValues(horizontal = 10.dp),
+                    ) {
+                        Text("重试")
+                    }
                 }
             }
         }
@@ -1394,7 +1905,7 @@ private fun SessionSettingsChip(
     modifier: Modifier = Modifier,
 ) {
     Surface(
-        modifier = modifier.height(40.dp).clip(RoundedCornerShape(14.dp)).clickable(enabled = enabled, onClick = onClick),
+        modifier = modifier.height(44.dp).clip(RoundedCornerShape(14.dp)).clickable(enabled = enabled, onClick = onClick),
         color = RemoteSurfaceRaised,
         shape = RoundedCornerShape(14.dp),
         border = BorderStroke(1.dp, RemoteBorder),
@@ -1614,32 +2125,89 @@ private fun CodexScrollbar(state: LazyListState, modifier: Modifier = Modifier) 
     }
 }
 
-private sealed interface TimelineBlock {
+internal sealed interface TimelineBlock {
     val key: String
+    val startIndex: Int
+    val endExclusive: Int
 
-    data class Single(val item: TimelineItem) : TimelineBlock {
+    data class Single(val item: TimelineItem, override val startIndex: Int) : TimelineBlock {
         override val key: String = item.id.toString()
+        override val endExclusive: Int = startIndex + 1
     }
 
-    data class Activity(val items: List<TimelineItem>) : TimelineBlock {
+    data class Activity(
+        val items: List<TimelineItem>,
+        override val startIndex: Int,
+    ) : TimelineBlock {
         override val key: String = "activity-${items.first().id}"
+        override val endExclusive: Int = startIndex + items.size
     }
 }
 
-private fun groupTimeline(items: List<TimelineItem>): List<TimelineBlock> = buildList {
+internal data class TimelineGrouping(
+    val items: List<TimelineItem>,
+    val blocks: List<TimelineBlock>,
+)
+
+internal class TimelineBlockGrouper {
+    private var grouping = TimelineGrouping(emptyList(), emptyList())
+
+    fun update(items: List<TimelineItem>): List<TimelineBlock> {
+        grouping = updateTimelineGrouping(grouping, items)
+        return grouping.blocks
+    }
+}
+
+internal fun updateTimelineGrouping(
+    previous: TimelineGrouping,
+    items: List<TimelineItem>,
+): TimelineGrouping {
+    if (previous.items.isEmpty()) return TimelineGrouping(items, groupTimeline(items))
+    var commonPrefix = 0
+    val comparableCount = minOf(previous.items.size, items.size)
+    while (commonPrefix < comparableCount && previous.items[commonPrefix].sameTimelineVersion(items[commonPrefix])) {
+        commonPrefix++
+    }
+    if (commonPrefix == previous.items.size && commonPrefix == items.size) return previous
+
+    var rebuildStart = commonPrefix
+    val affectedBlock = previous.blocks.firstOrNull { commonPrefix < it.endExclusive }
+    if (affectedBlock != null) {
+        rebuildStart = affectedBlock.startIndex
+    } else if (
+        commonPrefix == previous.items.size &&
+        previous.blocks.lastOrNull() is TimelineBlock.Activity &&
+        items.getOrNull(commonPrefix)?.content?.isActivity() == true
+    ) {
+        rebuildStart = previous.blocks.last().startIndex
+    }
+    rebuildStart = rebuildStart.coerceAtMost(items.size)
+    val preserved = previous.blocks.takeWhile { it.endExclusive <= rebuildStart }
+    return TimelineGrouping(
+        items = items,
+        blocks = preserved + groupTimeline(items.drop(rebuildStart), startIndex = rebuildStart),
+    )
+}
+
+private fun TimelineItem.sameTimelineVersion(other: TimelineItem): Boolean =
+    id == other.id && revision == other.revision && createdAtMs == other.createdAtMs
+
+internal fun groupTimeline(items: List<TimelineItem>, startIndex: Int = 0): List<TimelineBlock> = buildList {
     var activity = mutableListOf<TimelineItem>()
+    var activityStart = startIndex
     fun flush() {
         if (activity.isNotEmpty()) {
-            add(TimelineBlock.Activity(activity))
+            add(TimelineBlock.Activity(activity, activityStart))
             activity = mutableListOf()
         }
     }
-    items.forEach { item ->
+    items.forEachIndexed { localIndex, item ->
         if (item.content.isActivity()) {
+            if (activity.isEmpty()) activityStart = startIndex + localIndex
             activity += item
         } else {
             flush()
-            add(TimelineBlock.Single(item))
+            add(TimelineBlock.Single(item, startIndex + localIndex))
         }
     }
     flush()
@@ -1664,16 +2232,18 @@ private fun ActivityTimelineCard(
     onApproval: (UUID, String) -> Unit,
 ) {
     var expanded by rememberSaveable(items.first().id) { mutableStateOf(false) }
-    val labels = items.groupingBy {
-        when (it.content) {
-            is TimelineContent.FileChange -> "文件"
-            is TimelineContent.Command -> "命令"
-            is TimelineContent.Approval -> "审批"
-            is TimelineContent.Error -> "错误"
-            is TimelineContent.Progress -> if (it.content.kind == "test") "测试" else "进度"
-            else -> "工具"
-        }
-    }.eachCount().entries.joinToString(" · ") { "${it.key} ${it.value}" }
+    val labels = remember(items) {
+        items.groupingBy {
+            when (it.content) {
+                is TimelineContent.FileChange -> "文件"
+                is TimelineContent.Command -> "命令"
+                is TimelineContent.Approval -> "审批"
+                is TimelineContent.Error -> "错误"
+                is TimelineContent.Progress -> if (it.content.kind == "test") "测试" else "进度"
+                else -> "工具"
+            }
+        }.eachCount().entries.joinToString(" · ") { "${it.key} ${it.value}" }
+    }
     Surface(
         modifier = Modifier.fillMaxWidth(),
         color = RemoteSurface,
@@ -1717,10 +2287,11 @@ private fun TimelineCard(
     onApproval: (UUID, String) -> Unit,
 ) {
     when (val content = item.content) {
-        is TimelineContent.UserMessage -> MessageBubble(content.text, user = true)
+        is TimelineContent.UserMessage -> MessageBubble(content.text, user = true, messageId = item.id)
         is TimelineContent.AgentMessage -> MessageBubble(
             text = content.text,
             user = false,
+            messageId = item.id,
             label = when (content.phase) {
                 "final" -> "Agent 最终回复"
                 "reasoning_summary" -> "推理摘要"
@@ -1814,22 +2385,45 @@ private fun meaningfulToolSummary(value: String?): String? {
 }
 
 @Composable
-private fun MessageBubble(text: String, user: Boolean, label: String = "你") {
+private fun MessageBubble(text: String, user: Boolean, messageId: UUID, label: String = "你") {
+    val clipboard = LocalClipboardManager.current
+    val copyButton: @Composable () -> Unit = {
+        IconButton(
+            onClick = { clipboard.setText(AnnotatedString(text)) },
+            modifier = Modifier.size(44.dp).testTag("gar.message.$messageId.copy"),
+        ) {
+            RemoteIcon(RemoteGlyph.Copy, "复制消息", Modifier.size(18.dp), RemoteMuted)
+        }
+    }
     if (user) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-            Surface(
-                modifier = Modifier.fillMaxWidth(0.86f),
-                color = RemoteSurfaceRaised,
-                shape = RoundedCornerShape(24.dp),
-                border = BorderStroke(1.dp, RemoteBorder),
-            ) {
-                Text(text, modifier = Modifier.padding(horizontal = 17.dp, vertical = 14.dp), style = MaterialTheme.typography.bodyLarge)
+            Column(Modifier.fillMaxWidth(0.86f)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Spacer(Modifier.weight(1f))
+                    Text(label, color = RemoteMuted, style = MaterialTheme.typography.labelMedium)
+                    copyButton()
+                }
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = RemoteSurfaceRaised,
+                    shape = RoundedCornerShape(24.dp),
+                    border = BorderStroke(1.dp, RemoteBorder),
+                ) {
+                    MarkdownText(
+                        markdown = text,
+                        modifier = Modifier.padding(horizontal = 17.dp, vertical = 14.dp),
+                        contentKey = messageId.toString(),
+                    )
+                }
             }
         }
     } else {
         Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(7.dp)) {
-            Text(label, color = RemoteMuted, style = MaterialTheme.typography.labelMedium)
-            Text(text, style = MaterialTheme.typography.bodyLarge)
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(label, modifier = Modifier.weight(1f), color = RemoteMuted, style = MaterialTheme.typography.labelMedium)
+                copyButton()
+            }
+            MarkdownText(text, contentKey = messageId.toString())
         }
     }
 }

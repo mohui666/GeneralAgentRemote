@@ -5,14 +5,18 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.agentremote.messenger.data.ClientStateStore
 import dev.agentremote.messenger.data.CredentialStore
+import dev.agentremote.messenger.data.DraftScope
 import dev.agentremote.messenger.data.RemoteClient
+import dev.agentremote.messenger.data.draftScope
 import dev.agentremote.messenger.model.ConnectionTarget
 import dev.agentremote.messenger.model.Conversation
 import dev.agentremote.messenger.model.ProjectSummary
+import dev.agentremote.messenger.model.ProjectTreeScope
 import dev.agentremote.messenger.model.PromptAttachment
 import dev.agentremote.messenger.model.ProviderCapability
 import dev.agentremote.messenger.model.ProviderId
@@ -24,6 +28,7 @@ import dev.agentremote.messenger.model.TimelineItem
 import dev.agentremote.messenger.model.TimelinePageCursor
 import dev.agentremote.messenger.protocol.WireProtocol
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -33,6 +38,14 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
+
+enum class SendStatus {
+    IDLE,
+    SENDING,
+    QUEUED,
+    FAILED,
+}
 
 data class RemoteUiState(
     val phase: String = "未连接",
@@ -44,6 +57,7 @@ data class RemoteUiState(
     val credentials: List<StoredCredential> = emptyList(),
     val activeHostId: UUID? = null,
     val snapshot: Snapshot? = null,
+    val timelineByConversation: Map<UUID, List<TimelineItem>> = emptyMap(),
     val selectedConversationId: UUID? = null,
     val showingNewConversation: Boolean = false,
     val selectedProjectId: UUID? = null,
@@ -56,46 +70,44 @@ data class RemoteUiState(
     val attachments: Map<UUID, ByteArray> = emptyMap(),
     val pinnedProjects: Set<UUID> = emptySet(),
     val recentProjects: List<UUID> = emptyList(),
+    val expandedProjectScopes: Set<ProjectTreeScope> = emptySet(),
+    val projectExpansionInitialized: Boolean = false,
     val projectSearch: String = "",
     val historyBefore: Map<UUID, TimelinePageCursor> = emptyMap(),
     val historyExhausted: Set<UUID> = emptySet(),
     val pendingCommands: Set<UUID> = emptySet(),
     val pendingApprovals: Set<UUID> = emptySet(),
     val creatingConversation: Boolean = false,
+    val sendStatus: SendStatus = SendStatus.IDLE,
+    val sendFailure: String? = null,
     val error: String? = null,
 )
 
-internal enum class PendingStartResolution {
-    LANDED,
-    UNRESOLVED,
-}
-
 internal data class PendingSendContext(
     val commandId: UUID,
-    val frame: ByteArray,
+    val clientMessageId: String,
+    val frame: ByteArray?,
     val conversationId: UUID,
+    val projectId: UUID,
+    val provider: ProviderId,
     val startsConversation: Boolean,
     val sentDraft: String,
     val sentAttachmentIds: Set<UUID>,
-    val replayed: Boolean = false,
-    val trustedAccepted: Boolean = false,
+    val attempt: Int? = null,
+    val rejectedByHost: Boolean = false,
+    val writeFailed: Boolean = false,
+    val lastWrittenGeneration: Long? = null,
+    val startedAtNanos: Long = System.nanoTime(),
 ) {
-    fun replayed(): PendingSendContext = copy(replayed = true)
+    fun replayed(generation: Long = 0L): PendingSendContext = copy(
+        rejectedByHost = false,
+        writeFailed = false,
+        lastWrittenGeneration = generation,
+    )
 
-    fun accepted(): PendingSendContext = copy(trustedAccepted = true)
-}
+    fun rejected(): PendingSendContext = copy(rejectedByHost = true, writeFailed = false)
 
-internal fun pendingSendResolution(
-    pending: PendingSendContext,
-    conversation: Conversation?,
-): PendingStartResolution {
-    if (!pending.startsConversation) return PendingStartResolution.UNRESOLVED
-    if (conversation?.id != pending.conversationId) return PendingStartResolution.UNRESOLVED
-    return if (pending.trustedAccepted) {
-        PendingStartResolution.LANDED
-    } else {
-        PendingStartResolution.UNRESOLVED
-    }
+    val retryableFailure: Boolean get() = rejectedByHost || writeFailed
 }
 
 internal fun RemoteUiState.removeSentComposer(pending: PendingSendContext): RemoteUiState = copy(
@@ -103,7 +115,46 @@ internal fun RemoteUiState.removeSentComposer(pending: PendingSendContext): Remo
     promptAttachments = promptAttachments.filterNot { it.id in pending.sentAttachmentIds },
 )
 
-internal fun pendingSendAllowsNavigation(pending: PendingSendContext?): Boolean = pending == null
+internal fun RemoteUiState.completePendingSend(
+    pending: PendingSendContext,
+    clearComposer: Boolean,
+): RemoteUiState = (if (clearComposer) removeSentComposer(pending) else this).copy(
+    pendingCommands = pendingCommands - pending.commandId,
+    creatingConversation = false,
+    selectedConversationId = if (clearComposer && pending.startsConversation) {
+        pending.conversationId
+    } else {
+        selectedConversationId
+    },
+    showingNewConversation = if (clearComposer && pending.startsConversation) {
+        false
+    } else {
+        showingNewConversation
+    },
+    sendStatus = SendStatus.IDLE,
+    sendFailure = null,
+)
+
+internal fun pendingSendAllowsNavigation(pending: PendingSendContext?): Boolean =
+    pending == null || pending.retryableFailure
+
+internal fun retryableSendRejection(code: String): Boolean = code == "command_failed"
+
+internal fun projectTreeScope(hostId: UUID, provider: ProviderId, projectId: UUID) =
+    ProjectTreeScope(hostId, provider, projectId)
+
+internal fun RemoteUiState.expandSelectedProject(): RemoteUiState {
+    val hostId = snapshot?.hostId ?: activeHostId ?: return this
+    val provider = selectedProvider ?: return this
+    val projectId = selectedProjectId ?: return this
+    return copy(
+        expandedProjectScopes = expandedProjectScopes + projectTreeScope(hostId, provider, projectId),
+        projectExpansionInitialized = true,
+    )
+}
+
+internal fun RemoteUiState.ensureDefaultProjectExpanded(): RemoteUiState =
+    if (projectExpansionInitialized) this else expandSelectedProject()
 
 internal fun RemoteUiState.completeProjectSync(
     commandId: UUID,
@@ -123,15 +174,31 @@ internal data class ProviderProjectSelection(
     val projectId: UUID?,
 )
 
+private data class ConversationPageScope(
+    val hostId: UUID,
+    val provider: ProviderId,
+    val projectId: UUID,
+    val conversationId: UUID,
+)
+
 internal fun providerProjectSelection(
     projects: List<ProjectSummary>,
     selectedProvider: ProviderId?,
     selectedProjectId: UUID?,
+    recentProjectIds: List<UUID> = emptyList(),
 ): ProviderProjectSelection {
-    val provider = selectedProvider ?: projects.firstOrNull()?.enabledProviders?.firstOrNull()
+    val selectedProject = projects.find { it.id == selectedProjectId }
+    val provider = selectedProvider
+        ?.takeIf { candidate -> projects.any { candidate in it.enabledProviders } }
+        ?: selectedProject?.enabledProviders?.firstOrNull()
+        ?: projects.firstNotNullOfOrNull { it.enabledProviders.firstOrNull() }
     val projectId = selectedProjectId?.takeIf { selected ->
         projects.any { project ->
             project.id == selected && (provider == null || provider in project.enabledProviders)
+        }
+    } ?: recentProjectIds.firstOrNull { recent ->
+        projects.any { project ->
+            project.id == recent && (provider == null || provider in project.enabledProviders)
         }
     } ?: projects.firstOrNull { provider == null || provider in it.enabledProviders }?.id
     return ProviderProjectSelection(provider, projectId)
@@ -145,10 +212,12 @@ internal fun retainedConversationSelection(
     preserveMissing: Boolean,
 ): UUID? {
     val selected = selectedConversationId ?: return null
-    val conversation = conversations.find { it.id == selected }
+    val conversation = conversations.find {
+        it.id == selected && it.projectId == projectId && it.provider == provider
+    }
     return when {
         conversation == null && preserveMissing -> selected
-        conversation != null && conversation.projectId == projectId && conversation.provider == provider -> selected
+        conversation != null -> selected
         else -> null
     }
 }
@@ -157,10 +226,66 @@ internal fun mergeConversation(
     current: List<Conversation>,
     incoming: Conversation,
 ): List<Conversation> {
-    val existing = current.find { it.id == incoming.id }
-    if (existing != null && existing.revision > incoming.revision) return current
-    return current.filterNot { it.id == incoming.id } + incoming
+    val existingIndex = current.indexOfFirst {
+        it.id == incoming.id && it.projectId == incoming.projectId && it.provider == incoming.provider
+    }
+    if (existingIndex >= 0 && current[existingIndex].revision > incoming.revision) return current
+    val updated = current.toMutableList()
+    if (existingIndex >= 0) updated.removeAt(existingIndex)
+    var low = 0
+    var high = updated.size
+    while (low < high) {
+        val middle = (low + high) ushr 1
+        if (conversationComparator.compare(updated[middle], incoming) <= 0) {
+            low = middle + 1
+        } else {
+            high = middle
+        }
+    }
+    updated.add(low, incoming)
+    return updated
 }
+
+private val conversationComparator = compareByDescending<Conversation> { it.updatedAtMs }
+    .thenBy { it.projectId }
+    .thenBy { it.provider.wire }
+    .thenBy { it.id }
+
+private val timelineComparator = compareBy<TimelineItem> { it.createdAtMs }.thenBy { it.id }
+
+internal fun mergeTimelinePage(
+    current: List<TimelineItem>,
+    incoming: List<TimelineItem>,
+): List<TimelineItem> {
+    if (incoming.isEmpty()) return current
+    val merged = current.toMutableList()
+    val positions = current.withIndex().associateTo(HashMap(current.size + incoming.size)) {
+        (it.value.conversationId to it.value.id) to it.index
+    }
+    var changed = false
+    incoming.forEach { item ->
+        val key = item.conversationId to item.id
+        val index = positions[key]
+        if (index == null) {
+            positions[key] = merged.size
+            merged += item
+            changed = true
+        } else if (
+            merged[index].revision < item.revision ||
+            (merged[index].revision == item.revision && merged[index] != item)
+        ) {
+            merged[index] = item
+            changed = true
+        }
+    }
+    if (!changed) return current
+    merged.sortWith(timelineComparator)
+    return merged
+}
+
+internal fun indexTimelineByConversation(
+    timeline: List<TimelineItem>,
+): Map<UUID, List<TimelineItem>> = timeline.groupBy(TimelineItem::conversationId)
 
 class RemoteViewModel(application: Application) : AndroidViewModel(application), RemoteClient.Listener {
     private val credentialStore = CredentialStore(application)
@@ -172,12 +297,16 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
         ?.let { hostId -> initialCredentials.find { it.hostId == hostId } }
         ?: initialCredentials.firstOrNull()
     private val initialRestored = initialCredential?.let(clientStateStore::load)
+    private var scopedDrafts = initialRestored?.drafts.orEmpty().toMutableMap()
     private val mutableState = MutableStateFlow(
         RemoteUiState(
             phase = if (initialRestored?.snapshot != null) "离线缓存 · 正在恢复连接" else "未连接",
             credentials = initialCredentials,
             activeHostId = initialCredential?.hostId,
             snapshot = initialRestored?.snapshot,
+            timelineByConversation = initialRestored?.snapshot?.timeline
+                ?.let(::indexTimelineByConversation)
+                .orEmpty(),
             selectedConversationId = initialRestored?.selectedConversationId,
             selectedProjectId = initialRestored?.selectedProjectId,
             selectedProvider = initialRestored?.selectedProvider,
@@ -187,6 +316,8 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
             draft = initialRestored?.draft.orEmpty(),
             pinnedProjects = initialRestored?.pinnedProjects.orEmpty(),
             recentProjects = initialRestored?.recentProjects.orEmpty(),
+            expandedProjectScopes = initialRestored?.expandedProjectScopes.orEmpty(),
+            projectExpansionInitialized = initialRestored?.projectExpansionWasPersisted == true,
         ),
     )
     val state: StateFlow<RemoteUiState> = mutableState.asStateFlow()
@@ -195,12 +326,26 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
     private var pendingSend: PendingSendContext? = null
     private var awaitingAuthoritativeSnapshot = initialRestored?.snapshot != null
     private var snapshotPersistJob: Job? = null
+    private var selectionPersistJob: Job? = null
+    private val selectionPersistVersion = AtomicLong()
+    private val selectionPersistLock = Any()
+    private var latestSavedSelectionVersion = -1L
+    private var activeConnectionGeneration: Long? = null
+    private val projectSyncGeneration = mutableMapOf<ProjectTreeScope, Long>()
+    private val projectSyncCommands = mutableMapOf<UUID, ProjectTreeScope>()
+    private val projectRefreshGeneration = mutableMapOf<ProviderId, Long>()
+    private val sendTraceStartedAtNanos = linkedMapOf<UUID, Long>()
+    private val requestedConversationPages = mutableSetOf<ConversationPageScope>()
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) = client.networkAvailable()
     }
 
     init {
-        mutableState.update { defaults(it, preserveMissingConversation = true) }
+        mutableState.update {
+            restoreDraft(
+                defaults(it, preserveMissingConversation = true).ensureDefaultProjectExpanded(),
+            )
+        }
         connectivity.registerDefaultNetworkCallback(networkCallback)
         initialCredential?.let(::connect)
     }
@@ -216,18 +361,34 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                 showError(error.message ?: "配对链接无效")
                 return
             }
+        rememberDraft(state.value)
+        flushState()
+        scopedDrafts = mutableMapOf()
         pendingSend = null
         draftConversationId = null
+        activeConnectionGeneration = null
+        projectSyncGeneration.clear()
+        projectSyncCommands.clear()
+        projectRefreshGeneration.clear()
+        sendTraceStartedAtNanos.clear()
+        requestedConversationPages.clear()
         awaitingAuthoritativeSnapshot = false
         snapshotPersistJob?.cancel()
+        selectionPersistJob?.cancel()
         mutableState.update {
             it.copy(
                 error = null,
                 snapshot = null,
+                timelineByConversation = emptyMap(),
                 activeHostId = target.hostId,
                 selectedConversationId = null,
+                draft = "",
                 attachments = emptyMap(),
                 promptAttachments = emptyList(),
+                expandedProjectScopes = emptySet(),
+                projectExpansionInitialized = false,
+                sendStatus = SendStatus.IDLE,
+                sendFailure = null,
                 connecting = true,
                 retryEnabled = true,
             )
@@ -239,19 +400,33 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
     fun connect(credential: StoredCredential) {
         if (!pendingSendAllowsNavigation(pendingSend)) return
         if (state.value.connecting && state.value.activeHostId == credential.hostId) return
+        rememberDraft(state.value)
+        flushState()
         if (state.value.activeHostId != credential.hostId) {
             pendingSend = null
             draftConversationId = null
+            sendTraceStartedAtNanos.clear()
         }
+        activeConnectionGeneration = null
+        projectSyncGeneration.clear()
+        projectSyncCommands.clear()
+        projectRefreshGeneration.clear()
+        requestedConversationPages.clear()
         val restored = clientStateStore.load(credential)
+        scopedDrafts = restored.drafts.toMutableMap()
         awaitingAuthoritativeSnapshot = restored.snapshot != null
         snapshotPersistJob?.cancel()
+        selectionPersistJob?.cancel()
         mutableState.update {
-            defaults(
+            restoreDraft(
+                defaults(
                 it.copy(
                     phase = if (restored.snapshot != null) "离线缓存 · 正在恢复连接" else "正在连接",
                     error = null,
                     snapshot = restored.snapshot,
+                    timelineByConversation = restored.snapshot?.timeline
+                        ?.let(::indexTimelineByConversation)
+                        .orEmpty(),
                     activeHostId = credential.hostId,
                     selectedConversationId = restored.selectedConversationId,
                     selectedProjectId = restored.selectedProjectId,
@@ -264,6 +439,8 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                     promptAttachments = emptyList(),
                     pinnedProjects = restored.pinnedProjects,
                     recentProjects = restored.recentProjects,
+                    expandedProjectScopes = restored.expandedProjectScopes,
+                    projectExpansionInitialized = restored.projectExpansionWasPersisted,
                     connecting = true,
                     retryEnabled = true,
                     reconnectAttempt = 0,
@@ -271,8 +448,11 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                     historyExhausted = emptySet(),
                     pendingCommands = emptySet(),
                     pendingApprovals = emptySet(),
+                    sendStatus = SendStatus.IDLE,
+                    sendFailure = null,
                 ),
-                preserveMissingConversation = true,
+                    preserveMissingConversation = true,
+                ).ensureDefaultProjectExpanded(),
             )
         }
         clientStateStore.saveLastHost(credential.hostId)
@@ -296,7 +476,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                 connecting = false,
                 retryEnabled = false,
                 pendingCommands = pending
-                    ?.takeUnless(PendingSendContext::trustedAccepted)
+                    ?.takeUnless(PendingSendContext::retryableFailure)
                     ?.commandId
                     ?.let(::setOf)
                     .orEmpty(),
@@ -326,6 +506,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
         }
         if (state.value.activeHostId == credential.hostId) {
             client.forgetTarget()
+            scopedDrafts = mutableMapOf()
             mutableState.update {
                 RemoteUiState(credentials = it.credentials.filterNot { item -> item.hostId == credential.hostId })
             }
@@ -338,25 +519,26 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
 
     fun showNewConversation() {
         if (!pendingSendAllowsNavigation(pendingSend)) return
+        abandonRetryableSendForNavigation()
         draftConversationId = UUID.randomUUID()
-        mutableState.update {
+        updateDraftScope {
             defaults(
                 it.copy(
                     showingNewConversation = true,
                     selectedConversationId = null,
-                    draft = "",
                     attachments = emptyMap(),
                     promptAttachments = emptyList(),
                 ),
-            )
+            ).expandSelectedProject()
         }
         persistSelection()
     }
 
     fun showConversationList() {
         if (!pendingSendAllowsNavigation(pendingSend)) return
+        abandonRetryableSendForNavigation()
         draftConversationId = null
-        mutableState.update {
+        updateDraftScope {
             it.copy(
                 showingNewConversation = false,
                 selectedConversationId = null,
@@ -368,23 +550,50 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
     }
 
     fun selectConversation(id: UUID) {
+        val current = state.value
+        val projectId = current.selectedProjectId ?: return
+        val provider = current.selectedProvider ?: return
+        selectConversation(projectId, provider, id)
+    }
+
+    fun selectConversation(projectId: UUID, provider: ProviderId, id: UUID) {
         if (!pendingSendAllowsNavigation(pendingSend)) return
+        val conversation = state.value.snapshot?.conversations?.find {
+            it.id == id && it.projectId == projectId && it.provider == provider
+        } ?: return
+        val project = state.value.snapshot?.projects?.find {
+            it.id == projectId && it.valid && provider in it.enabledProviders
+        } ?: return
+        abandonRetryableSendForNavigation()
         draftConversationId = null
-        mutableState.update {
-            it.copy(
-                selectedConversationId = id,
-                showingNewConversation = false,
-                attachments = emptyMap(),
-                promptAttachments = emptyList(),
-            )
+        updateDraftScope { current ->
+            defaults(
+                current.copy(
+                    selectedProjectId = project.id,
+                    selectedProvider = provider,
+                    selectedConversationId = id,
+                    showingNewConversation = false,
+                    attachments = emptyMap(),
+                    promptAttachments = emptyList(),
+                    recentProjects = (listOf(project.id) + current.recentProjects.filterNot { it == project.id }).take(8),
+                ),
+            ).expandSelectedProject()
         }
         persistSelection()
+        requestInitialConversationPage(conversation)
         requestConversationImages(id)
     }
 
     fun selectProject(id: UUID) {
         if (!pendingSendAllowsNavigation(pendingSend)) return
-        mutableState.update { current ->
+        val before = state.value
+        val provider = before.selectedProvider ?: return
+        val projectIsAuthorized = before.snapshot?.projects?.any {
+            it.id == id && it.valid && provider in it.enabledProviders
+        } == true
+        if (!projectIsAuthorized) return
+        abandonRetryableSendForNavigation()
+        updateDraftScope { current ->
             defaults(
                 current.copy(
                     selectedProjectId = id,
@@ -395,16 +604,23 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                     promptAttachments = emptyList(),
                     recentProjects = (listOf(id) + current.recentProjects.filterNot { it == id }).take(8),
                 ),
-            )
+            ).expandSelectedProject()
         }
         persistSelection()
-        syncSelectedProject()
+        if (before.selectedProjectId != id) syncSelectedProject()
     }
 
     fun selectProvider(provider: ProviderId) {
         if (!pendingSendAllowsNavigation(pendingSend)) return
-        mutableState.update { current ->
-            defaults(
+        val before = state.value
+        if (before.selectedProvider == provider) return
+        val providerAvailable = before.snapshot?.projects?.any {
+            it.valid && provider in it.enabledProviders
+        } == true
+        if (!providerAvailable) return
+        abandonRetryableSendForNavigation()
+        updateDraftScope { current ->
+            val updated = defaults(
                 current.copy(
                     selectedProvider = provider,
                     selectedConversationId = null,
@@ -413,10 +629,20 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                     selectedPermission = null,
                     promptAttachments = emptyList(),
                 ),
-            )
+            ).expandSelectedProject()
+            updated.selectedProjectId?.let { selectedProjectId ->
+                updated.copy(
+                    recentProjects = (
+                        listOf(selectedProjectId) + updated.recentProjects.filterNot { it == selectedProjectId }
+                        ).take(8),
+                )
+            } ?: updated
         }
         persistSelection()
-        if (state.value.online) client.send(WireProtocol.refreshProjects(provider))
+        if (state.value.online) {
+            refreshProjects(provider)
+            syncSelectedProject()
+        }
     }
 
     fun selectModel(model: String?) {
@@ -442,6 +668,25 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
 
     fun setProjectSearch(value: String) = mutableState.update { it.copy(projectSearch = value) }
 
+    fun toggleProjectExpanded(id: UUID) {
+        val current = state.value
+        val hostId = current.snapshot?.hostId ?: return
+        val provider = current.selectedProvider ?: return
+        if (current.snapshot.projects.none { it.id == id && it.valid && provider in it.enabledProviders }) return
+        val scope = projectTreeScope(hostId, provider, id)
+        mutableState.update {
+            it.copy(
+                expandedProjectScopes = if (scope in it.expandedProjectScopes) {
+                    it.expandedProjectScopes - scope
+                } else {
+                    it.expandedProjectScopes + scope
+                },
+                projectExpansionInitialized = true,
+            )
+        }
+        persistSelection()
+    }
+
     fun toggleProjectPin(id: UUID) {
         mutableState.update {
             it.copy(
@@ -451,9 +696,41 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
         persistSelection()
     }
 
+    private fun RemoteUiState.activeDraftScope(): DraftScope? = draftScope(
+        hostId = snapshot?.hostId ?: activeHostId ?: return null,
+        provider = selectedProvider,
+        projectId = selectedProjectId,
+        conversationId = selectedConversationId.takeUnless { showingNewConversation },
+    )
+
+    private fun rememberDraft(current: RemoteUiState) {
+        val scope = current.activeDraftScope() ?: return
+        if (current.draft.isEmpty()) {
+            scopedDrafts.remove(scope)
+        } else {
+            scopedDrafts[scope] = current.draft
+        }
+    }
+
+    private fun restoreDraft(current: RemoteUiState): RemoteUiState = current.copy(
+        draft = current.activeDraftScope()?.let(scopedDrafts::get).orEmpty(),
+    )
+
+    private fun updateDraftScope(transform: (RemoteUiState) -> RemoteUiState) {
+        mutableState.update { current ->
+            rememberDraft(current)
+            val previousScope = current.activeDraftScope()
+            val updated = transform(current)
+            if (updated.activeDraftScope() == previousScope) updated else restoreDraft(updated)
+        }
+    }
+
     fun setDraft(value: String) {
+        state.value.activeDraftScope()?.let { scope ->
+            if (value.isEmpty()) scopedDrafts.remove(scope) else scopedDrafts[scope] = value
+        }
         mutableState.update { it.copy(draft = value) }
-        persistSelection()
+        persistSelection(debounce = true)
     }
 
     fun addPromptAttachments(uris: List<Uri>) {
@@ -493,66 +770,158 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
         if (pendingSend != null) return
         val text = current.draft.trim()
         if (text.isEmpty()) return
-        val commandId = UUID.randomUUID()
-        var startConversationId: UUID? = null
-        val bytes = current.selectedConversationId?.let { conversationId ->
-            WireProtocol.sendMessage(
-                commandId = commandId,
-                conversationId = conversationId,
-                clientMessageId = UUID.randomUUID().toString(),
-                text = text,
-                attachments = current.promptAttachments,
-            )
-        } ?: run {
+        val projectId = current.selectedProjectId ?: return
+        val provider = current.selectedProvider ?: return
+        val startsConversation = current.selectedConversationId == null
+        val conversationId = current.selectedConversationId ?: run {
             if (!current.showingNewConversation) return
-            val conversationId = draftConversationId ?: UUID.randomUUID().also { draftConversationId = it }
-            startConversationId = conversationId
-            WireProtocol.startConversation(
-                commandId = commandId,
-                conversationId = conversationId,
-                projectId = current.selectedProjectId ?: return,
-                provider = current.selectedProvider ?: return,
-                model = current.selectedModel,
-                effort = current.selectedEffort,
-                permissionMode = current.selectedPermission,
-                text = text,
-                attachments = current.promptAttachments,
-            )
+            draftConversationId ?: UUID.randomUUID().also { draftConversationId = it }
         }
-        val conversationId = startConversationId ?: current.selectedConversationId ?: return
+        val existingConversationMatchesScope = current.snapshot?.conversations?.any {
+            it.id == conversationId && it.projectId == projectId && it.provider == provider
+        } == true
+        if (!startsConversation && !existingConversationMatchesScope) return
+        val commandId = UUID.randomUUID()
+        val clientMessageId = UUID.randomUUID().toString()
+        val startedAtNanos = System.nanoTime()
+        mutableState.update {
+            it.copy(sendStatus = SendStatus.SENDING, sendFailure = null, error = null)
+        }
+        rememberSendTrace(commandId, startedAtNanos)
+        logLocalSendTrace(commandId, clientMessageId, conversationId, "click", startedAtNanos)
         pendingSend = PendingSendContext(
             commandId = commandId,
-            frame = bytes,
+            clientMessageId = clientMessageId,
+            frame = null,
             conversationId = conversationId,
-            startsConversation = startConversationId != null,
+            projectId = projectId,
+            provider = provider,
+            startsConversation = startsConversation,
             sentDraft = current.draft,
             sentAttachmentIds = current.promptAttachments.mapTo(mutableSetOf(), PromptAttachment::id),
+            attempt = 0,
+            startedAtNanos = startedAtNanos,
         )
-        if (queue(commandId, bytes)) {
-            mutableState.update { it.copy(creatingConversation = current.selectedConversationId == null) }
-        } else {
-            pendingSend = null
+        logLocalSendTrace(commandId, clientMessageId, conversationId, "local_pending", startedAtNanos)
+        viewModelScope.launch {
+            val bytes = withContext(Dispatchers.Default) {
+                if (!startsConversation) {
+                    WireProtocol.sendMessage(
+                        commandId = commandId,
+                        conversationId = conversationId,
+                        clientMessageId = clientMessageId,
+                        text = text,
+                        attachments = current.promptAttachments,
+                        attempt = 0,
+                    )
+                } else {
+                    WireProtocol.startConversation(
+                        commandId = commandId,
+                        clientMessageId = clientMessageId,
+                        conversationId = conversationId,
+                        projectId = projectId,
+                        provider = provider,
+                        model = current.selectedModel,
+                        effort = current.selectedEffort,
+                        permissionMode = current.selectedPermission,
+                        text = text,
+                        attachments = current.promptAttachments,
+                        attempt = 0,
+                    )
+                }
+            }
+            val pending = pendingSend?.takeIf { it.commandId == commandId } ?: return@launch
+            pendingSend = pending.copy(frame = bytes)
+            writePendingSend(isReplay = false)
         }
     }
 
     fun steer() {
         val current = state.value
         val conversationId = current.selectedConversationId ?: return
+        val projectId = current.selectedProjectId ?: return
+        val provider = current.selectedProvider ?: return
+        val conversationMatchesScope = current.snapshot?.conversations?.any {
+            it.id == conversationId && it.projectId == projectId && it.provider == provider
+        } == true
+        if (!conversationMatchesScope) return
         if (pendingSend != null) return
         val text = current.draft.trim()
         if (text.isEmpty()) return
         val commandId = UUID.randomUUID()
+        val clientMessageId = commandId.toString()
+        val startedAtNanos = System.nanoTime()
+        mutableState.update {
+            it.copy(sendStatus = SendStatus.SENDING, sendFailure = null, error = null)
+        }
+        rememberSendTrace(commandId, startedAtNanos)
+        logLocalSendTrace(commandId, clientMessageId, conversationId, "click", startedAtNanos)
         val bytes = WireProtocol.steer(commandId, conversationId, text)
         pendingSend = PendingSendContext(
             commandId = commandId,
+            clientMessageId = clientMessageId,
             frame = bytes,
             conversationId = conversationId,
+            projectId = projectId,
+            provider = provider,
             startsConversation = false,
             sentDraft = current.draft,
             sentAttachmentIds = emptySet(),
+            startedAtNanos = startedAtNanos,
         )
-        if (!queue(commandId, bytes)) {
-            pendingSend = null
+        logLocalSendTrace(commandId, clientMessageId, conversationId, "local_pending", startedAtNanos)
+        writePendingSend(isReplay = false)
+    }
+
+    fun retryPendingSend() {
+        val existing = pendingSend ?: return
+        if (!existing.retryableFailure) return
+        val originalFrame = existing.frame ?: return
+        val startedAtNanos = System.nanoTime()
+        val nextAttempt = existing.attempt?.let { attempt ->
+            require(attempt < Int.MAX_VALUE) { "发送重试次数过多" }
+            attempt + 1
+        }
+        val pending = existing.copy(
+            frame = if (nextAttempt == null) existing.frame else null,
+            attempt = nextAttempt,
+            rejectedByHost = false,
+            writeFailed = false,
+            lastWrittenGeneration = null,
+            startedAtNanos = startedAtNanos,
+        )
+        pendingSend = pending
+        mutableState.update {
+            it.copy(sendStatus = SendStatus.SENDING, sendFailure = null, error = null)
+        }
+        rememberSendTrace(pending.commandId, startedAtNanos)
+        logLocalSendTrace(
+            pending.commandId,
+            pending.clientMessageId,
+            pending.conversationId,
+            "click",
+            startedAtNanos,
+        )
+        logLocalSendTrace(
+            pending.commandId,
+            pending.clientMessageId,
+            pending.conversationId,
+            "local_pending",
+            startedAtNanos,
+        )
+        if (nextAttempt == null) {
+            writePendingSend(isReplay = true)
+            return
+        }
+        viewModelScope.launch {
+            val retriedFrame = withContext(Dispatchers.Default) {
+                WireProtocol.withSendAttempt(originalFrame, nextAttempt)
+            }
+            val active = pendingSend?.takeIf {
+                it.commandId == pending.commandId && it.attempt == nextAttempt
+            } ?: return@launch
+            pendingSend = active.copy(frame = retriedFrame)
+            writePendingSend(isReplay = true)
         }
     }
 
@@ -593,18 +962,21 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                 ?.filter { it.conversationId == conversationId }
                 ?.minWithOrNull(compareBy<TimelineItem> { it.createdAtMs }.thenBy { it.id })
                 ?.let { TimelinePageCursor(it.createdAtMs, it.id) }
-        client.send(
+        if (!client.send(
             WireProtocol.getConversationPage(
                 conversationId,
                 before,
                 100,
             ),
-        )
+        )) {
+            showError("历史记录请求未能写入 WebSocket")
+        }
     }
 
     fun clearError() = mutableState.update { it.copy(error = null) }
 
     override fun onConnecting(target: ConnectionTarget) = onMain {
+        activeConnectionGeneration = null
         mutableState.update {
             it.copy(
                 phase = "正在连接 ${target.origin}",
@@ -630,6 +1002,8 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
             else -> client.isCurrent(connectionGeneration)
         }
         if (!belongsToActiveConnection) return@onMain
+        activeConnectionGeneration = connectionGeneration
+        var selectionNeedsPersist = false
         when (event) {
             is ServerEvent.Paired -> {
                 upsertCredential(event.credential)
@@ -639,40 +1013,53 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
             is ServerEvent.SnapshotReceived -> {
                 awaitingAuthoritativeSnapshot = false
                 snapshotPersistJob?.cancel()
-                clientStateStore.saveSnapshot(event.snapshot.hostId, event.encoded)
+                snapshotPersistJob = viewModelScope.launch(Dispatchers.IO) {
+                    clientStateStore.saveSnapshot(event.snapshot.hostId, event.encoded)
+                }
                 if (client.isConnected(connectionGeneration)) {
                     applySnapshot(event.snapshot)
-                    reconcilePendingSend(event.snapshot.conversations.find { it.id == pendingSend?.conversationId })
-                    state.value.selectedProvider?.let { client.send(WireProtocol.refreshProjects(it)) }
+                    reconcilePendingSend(event.snapshot.conversations.findPendingConversation())
+                    state.value.selectedProvider?.let(::refreshProjects)
                     replayPendingSend()
+                    selectionNeedsPersist = true
                 }
             }
             is ServerEvent.ProjectsUpdated -> {
-                applyProjects(
-                    event,
-                    syncCurrentProject = client.isConnected(connectionGeneration),
-                )
+                applyProjects(event)
                 scheduleSnapshotPersist()
+                selectionNeedsPersist = true
             }
-            is ServerEvent.ProjectSyncCompleted -> mutableState.update {
-                it.completeProjectSync(
-                    event.commandId,
-                    event.conversationsSynced,
-                    event.fullHistoryFallback,
-                )
+            is ServerEvent.ProjectSyncCompleted -> {
+                projectSyncCommands.remove(event.commandId)
+                mutableState.update {
+                    it.completeProjectSync(
+                        event.commandId,
+                        event.conversationsSynced,
+                        event.fullHistoryFallback,
+                    )
+                }
             }
             is ServerEvent.ConversationPage -> {
                 mutableState.update { current ->
                     val snapshot = current.snapshot ?: return@update current
-                    val timeline = event.items.fold(snapshot.timeline, ::upsertTimeline)
+                    val pageItems = event.items.filter { it.conversationId == event.conversationId }
+                    val timeline = mergeTimelinePage(snapshot.timeline, pageItems)
+                    val conversationTimeline = mergeTimelinePage(
+                        current.timelineByConversation[event.conversationId].orEmpty(),
+                        pageItems,
+                    )
                     if (event.nextBefore == null) {
                         current.copy(
                             snapshot = snapshot.copy(timeline = timeline),
+                            timelineByConversation = current.timelineByConversation +
+                                (event.conversationId to conversationTimeline),
                             historyExhausted = current.historyExhausted + event.conversationId,
                         )
                     } else {
                         current.copy(
                             snapshot = snapshot.copy(timeline = timeline),
+                            timelineByConversation = current.timelineByConversation +
+                                (event.conversationId to conversationTimeline),
                             historyBefore = current.historyBefore + (event.conversationId to event.nextBefore),
                         )
                     }
@@ -686,11 +1073,14 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                     )
                 }
                 scheduleSnapshotPersist()
+                selectionNeedsPersist = true
             }
             is ServerEvent.ConversationUpserted -> {
+                val activatesDraft = event.conversation.id == draftConversationId &&
+                    event.conversation.projectId == state.value.selectedProjectId &&
+                    event.conversation.provider == state.value.selectedProvider
                 mutateSnapshot { snapshot ->
                     val conversations = mergeConversation(snapshot.conversations, event.conversation)
-                        .sortedByDescending(Conversation::updatedAtMs)
                     snapshot.copy(
                         projects = snapshot.projects.map { project ->
                             if (project.id != event.conversation.projectId) {
@@ -708,24 +1098,41 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                         conversations = conversations,
                     )
                 }
-                if (event.conversation.id == draftConversationId) {
+                if (activatesDraft) {
                     draftConversationId = null
-                    mutableState.update {
-                        it.copy(
+                    mutableState.update { current ->
+                        rememberDraft(current)
+                        val previousScope = current.activeDraftScope()
+                        val updated = current.copy(
                             selectedConversationId = event.conversation.id,
                             showingNewConversation = false,
                             creatingConversation = false,
                         )
+                        if (previousScope != updated.activeDraftScope()) {
+                            previousScope?.let(scopedDrafts::remove)
+                            rememberDraft(updated)
+                        }
+                        updated
                     }
                 }
                 reconcilePendingSend(
-                    state.value.snapshot?.conversations?.find { it.id == event.conversation.id },
+                    state.value.snapshot?.conversations?.findPendingConversation(),
                 )
                 scheduleSnapshotPersist()
+                selectionNeedsPersist = activatesDraft
             }
             is ServerEvent.TimelineUpserted -> {
-                mutateSnapshot { snapshot ->
-                    snapshot.copy(timeline = upsertTimeline(snapshot.timeline, event.item))
+                mutableState.update { current ->
+                    val snapshot = current.snapshot ?: return@update current
+                    current.copy(
+                        snapshot = snapshot.copy(timeline = upsertTimeline(snapshot.timeline, event.item)),
+                        timelineByConversation = current.timelineByConversation + (
+                            event.item.conversationId to upsertTimeline(
+                                current.timelineByConversation[event.item.conversationId].orEmpty(),
+                                event.item,
+                            )
+                            ),
+                    )
                 }
                 val approval = event.item.content as? TimelineContent.Approval
                 if (approval?.resolvedOption != null) {
@@ -737,6 +1144,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                 scheduleSnapshotPersist()
             }
             is ServerEvent.ConversationRemoved -> {
+                val removedSelection = state.value.selectedConversationId == event.conversationId
                 mutateSnapshot { snapshot ->
                     val removed = snapshot.conversations.find { it.id == event.conversationId }
                     val conversations = snapshot.conversations.filterNot { it.id == event.conversationId }
@@ -756,7 +1164,11 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                         timeline = snapshot.timeline.filterNot { it.conversationId == event.conversationId },
                     )
                 }
+                mutableState.update {
+                    it.copy(timelineByConversation = it.timelineByConversation - event.conversationId)
+                }
                 scheduleSnapshotPersist()
+                selectionNeedsPersist = removedSelection
             }
             is ServerEvent.AttachmentReceived -> mutableState.update { current ->
                 if (event.attachment.conversationId != current.selectedConversationId) current else {
@@ -774,35 +1186,36 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                     )
                 }
             }
+            is ServerEvent.SendTrace -> logServerSendTrace(event)
             is ServerEvent.CommandAccepted -> {
                 val pending = pendingSend
                 if (pending?.commandId == event.commandId) {
-                    if (pending.startsConversation) {
-                        pendingSend = pending.accepted()
-                        mutableState.update {
-                            it.copy(pendingCommands = it.pendingCommands - event.commandId)
-                        }
-                        reconcilePendingSend(
-                            state.value.snapshot?.conversations?.find { it.id == pending.conversationId },
-                        )
-                        if (
-                            pendingSend != null &&
-                            state.value.snapshot?.conversations?.none { it.id == pending.conversationId } == true
-                        ) {
-                            client.send(WireProtocol.getSnapshot())
-                        }
-                    } else {
-                        finishPendingSend(clearComposer = true)
-                    }
+                    finishPendingSend(clearComposer = true)
+                    selectionNeedsPersist = true
                 } else {
                     mutableState.update { it.copy(pendingCommands = it.pendingCommands - event.commandId) }
                 }
             }
             is ServerEvent.CommandRejected -> {
                 event.commandId?.let { rejected ->
+                    sendTraceStartedAtNanos.remove(rejected)
+                    projectSyncCommands.remove(rejected)?.let { scope ->
+                        projectSyncGeneration.remove(scope)
+                    }
                     mutableState.update { it.copy(pendingCommands = it.pendingCommands - rejected) }
-                    if (pendingSend?.commandId == rejected) {
-                        finishPendingSend(clearComposer = false)
+                    pendingSend?.takeIf { it.commandId == rejected }?.let { pending ->
+                        if (pending.attempt != null && retryableSendRejection(event.code)) {
+                            pendingSend = pending.rejected()
+                            mutableState.update {
+                                it.copy(
+                                    sendStatus = SendStatus.FAILED,
+                                    sendFailure = "Host 拒绝发送，草稿已保留",
+                                    creatingConversation = false,
+                                )
+                            }
+                        } else {
+                            finishPendingSend(clearComposer = false)
+                        }
                     }
                 }
                 mutableState.update {
@@ -846,22 +1259,40 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                 "协议错误：${event.message}（Host 支持 v${event.supportedVersion}）",
             )
         }
-        persistSelection()
+        if (selectionNeedsPersist) persistSelection()
     }
 
     override fun onDisconnected(message: String) = onMain {
+        activeConnectionGeneration = null
+        projectSyncGeneration.clear()
+        projectSyncCommands.clear()
+        projectRefreshGeneration.clear()
+        requestedConversationPages.clear()
+        val pending = pendingSend
         mutableState.update {
             it.copy(
                 phase = "连接已断开，等待重连",
                 online = false,
                 connecting = false,
-                pendingCommands = pendingSend
-                    ?.takeUnless(PendingSendContext::trustedAccepted)
+                pendingCommands = pending
+                    ?.takeUnless(PendingSendContext::retryableFailure)
                     ?.commandId
                     ?.let(::setOf)
                     .orEmpty(),
                 pendingApprovals = emptySet(),
-                creatingConversation = pendingSend?.startsConversation == true && draftConversationId != null,
+                creatingConversation = pending?.startsConversation == true && draftConversationId != null,
+                sendStatus = when {
+                    pending == null -> SendStatus.IDLE
+                    pending.retryableFailure -> SendStatus.FAILED
+                    else -> SendStatus.QUEUED
+                },
+                sendFailure = pending?.takeIf(PendingSendContext::retryableFailure)?.let {
+                    if (it.rejectedByHost) {
+                        "Host 拒绝发送，草稿已保留"
+                    } else {
+                        "WebSocket 写入失败，草稿和附件已保留"
+                    }
+                },
                 error = message,
             )
         }
@@ -884,9 +1315,20 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
     override fun onError(message: String) = onMain { showError(message) }
 
     override fun onCleared() {
+        flushState()
         connectivity.unregisterNetworkCallback(networkCallback)
         client.close()
         super.onCleared()
+    }
+
+    fun flushState() {
+        selectionPersistJob?.cancel()
+        persistSelectionSnapshot(
+            current = state.value,
+            drafts = scopedDrafts.toMap(),
+            commit = true,
+            version = selectionPersistVersion.incrementAndGet(),
+        )
     }
 
     private fun applySnapshot(snapshot: Snapshot) {
@@ -894,7 +1336,8 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
         if (active != null && active.displayName != snapshot.hostName) {
             upsertCredential(active.copy(displayName = snapshot.hostName))
         }
-        mutableState.update { current ->
+        val sortedTimeline = snapshot.timeline.sortedWith(timelineComparator)
+        updateDraftScope { current ->
             defaults(
                 current.copy(
                     phase = "已连接 ${snapshot.hostName}",
@@ -903,9 +1346,10 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                     retryEnabled = true,
                     reconnectAttempt = 0,
                     snapshot = snapshot.copy(
-                        conversations = snapshot.conversations.sortedByDescending(Conversation::updatedAtMs),
-                        timeline = snapshot.timeline.sortedWith(timelineComparator),
+                        conversations = snapshot.conversations.sortedWith(conversationComparator),
+                        timeline = sortedTimeline,
                     ),
+                    timelineByConversation = indexTimelineByConversation(sortedTimeline),
                     attachments = emptyMap(),
                     historyBefore = emptyMap(),
                     historyExhausted = emptySet(),
@@ -914,12 +1358,18 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                     creatingConversation = false,
                     error = null,
                 ),
-            )
+            ).ensureDefaultProjectExpanded()
         }
-        state.value.selectedConversationId?.let(::requestConversationImages)
+        val selectedConversation = state.value.snapshot?.conversations?.find {
+            it.id == state.value.selectedConversationId &&
+                it.projectId == state.value.selectedProjectId &&
+                it.provider == state.value.selectedProvider
+        }
+        selectedConversation?.let(::requestInitialConversationPage)
+        selectedConversation?.id?.let(::requestConversationImages)
     }
 
-    private fun applyProjects(event: ServerEvent.ProjectsUpdated, syncCurrentProject: Boolean) {
+    private fun applyProjects(event: ServerEvent.ProjectsUpdated) {
         mutateSnapshot { snapshot ->
             val incomingIds = event.projects.map(ProjectSummary::id).toSet()
             val projects = snapshot.projects.map { project ->
@@ -944,7 +1394,6 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                 ),
             )
         }
-        if (syncCurrentProject && event.provider == state.value.selectedProvider) syncSelectedProject()
     }
 
     private fun defaults(
@@ -957,6 +1406,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
             validProjects,
             current.selectedProvider,
             current.selectedProjectId,
+            current.recentProjects,
         )
         val projectId = selection.projectId
         val project = validProjects.find { it.id == projectId }
@@ -1001,8 +1451,25 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
         if (!current.online) return
         val projectId = current.selectedProjectId ?: return
         val provider = current.selectedProvider ?: return
+        val hostId = current.snapshot?.hostId ?: return
+        val generation = activeConnectionGeneration ?: return
+        val scope = projectTreeScope(hostId, provider, projectId)
+        if (projectSyncGeneration[scope] == generation) return
         val commandId = UUID.randomUUID()
-        queue(commandId, WireProtocol.syncProject(commandId, projectId, provider))
+        if (queue(commandId, WireProtocol.syncProject(commandId, projectId, provider))) {
+            projectSyncGeneration[scope] = generation
+            projectSyncCommands[commandId] = scope
+        }
+    }
+
+    private fun refreshProjects(provider: ProviderId) {
+        val generation = activeConnectionGeneration ?: return
+        if (projectRefreshGeneration[provider] == generation) return
+        if (client.send(WireProtocol.refreshProjects(provider))) {
+            projectRefreshGeneration[provider] = generation
+        } else {
+            showError("项目刷新请求未能写入 WebSocket")
+        }
     }
 
     private fun queue(commandId: UUID, bytes: ByteArray): Boolean {
@@ -1015,45 +1482,121 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
         return true
     }
 
+    private fun writePendingSend(isReplay: Boolean) {
+        val pending = pendingSend ?: return
+        val frame = pending.frame ?: return
+        val generation = activeConnectionGeneration
+        mutableState.update {
+            it.copy(
+                pendingCommands = it.pendingCommands + pending.commandId,
+                sendStatus = SendStatus.SENDING,
+                sendFailure = null,
+                creatingConversation = pending.startsConversation && draftConversationId != null,
+            )
+        }
+        if (generation == null || !client.send(frame)) {
+            pendingSend = pending.copy(writeFailed = true)
+            mutableState.update {
+                it.copy(
+                    pendingCommands = it.pendingCommands - pending.commandId,
+                    sendStatus = SendStatus.FAILED,
+                    sendFailure = "WebSocket 写入失败，草稿和附件已保留",
+                    creatingConversation = false,
+                )
+            }
+            showError("WebSocket 写入失败；请在连接恢复后重试")
+            return
+        }
+        pendingSend = if (isReplay) {
+            pending.replayed(generation)
+        } else {
+            pending.copy(
+                lastWrittenGeneration = generation,
+                rejectedByHost = false,
+                writeFailed = false,
+            )
+        }
+        logLocalSendTrace(
+            pending.commandId,
+            pending.clientMessageId,
+            pending.conversationId,
+            "websocket_write",
+            pending.startedAtNanos,
+        )
+        mutableState.update {
+            it.copy(
+                sendStatus = SendStatus.QUEUED,
+                sendFailure = null,
+                creatingConversation = pending.startsConversation && draftConversationId != null,
+            )
+        }
+    }
+
     private fun reconcilePendingSend(conversation: Conversation?) {
         val pending = pendingSend ?: return
         if (pending.startsConversation && conversation?.id == pending.conversationId) {
             draftConversationId = null
-            mutableState.update {
-                it.copy(
+            mutableState.update { current ->
+                rememberDraft(current)
+                val previousScope = current.activeDraftScope()
+                val updated = current.copy(
                     selectedConversationId = pending.conversationId,
                     showingNewConversation = false,
                     creatingConversation = false,
                 )
+                if (previousScope != updated.activeDraftScope()) {
+                    previousScope?.let(scopedDrafts::remove)
+                    rememberDraft(updated)
+                }
+                updated
             }
         }
-        when (pendingSendResolution(pending, conversation)) {
-            PendingStartResolution.LANDED -> finishPendingSend(clearComposer = true)
-            PendingStartResolution.UNRESOLVED -> Unit
+    }
+
+    private fun abandonRetryableSendForNavigation() {
+        val pending = pendingSend?.takeIf(PendingSendContext::retryableFailure) ?: return
+        pendingSend = null
+        sendTraceStartedAtNanos.remove(pending.commandId)
+        mutableState.update {
+            it.copy(
+                pendingCommands = it.pendingCommands - pending.commandId,
+                creatingConversation = false,
+                sendStatus = SendStatus.IDLE,
+                sendFailure = null,
+            )
+        }
+    }
+
+    private fun List<Conversation>.findPendingConversation(): Conversation? {
+        val pending = pendingSend ?: return null
+        return find {
+            it.id == pending.conversationId &&
+                it.projectId == pending.projectId &&
+                it.provider == pending.provider
         }
     }
 
     private fun replayPendingSend() {
-        val pending = pendingSend?.takeUnless(PendingSendContext::trustedAccepted) ?: return
-        if (client.send(pending.frame)) {
-            pendingSend = pending.replayed()
-            mutableState.update {
-                it.copy(
-                    pendingCommands = it.pendingCommands + pending.commandId,
-                    creatingConversation = pending.startsConversation && draftConversationId != null,
-                )
-            }
-        }
+        val pending = pendingSend
+            ?.takeUnless(PendingSendContext::rejectedByHost)
+            ?: return
+        val generation = activeConnectionGeneration ?: return
+        if (pending.lastWrittenGeneration == generation) return
+        writePendingSend(isReplay = true)
     }
 
     private fun finishPendingSend(clearComposer: Boolean) {
         val pending = pendingSend ?: return
         pendingSend = null
-        mutableState.update {
-            (if (clearComposer) it.removeSentComposer(pending) else it).copy(
-                pendingCommands = it.pendingCommands - pending.commandId,
-                creatingConversation = false,
-            )
+        mutableState.update { current ->
+            rememberDraft(current)
+            val previousScope = current.activeDraftScope()
+            val completed = current.completePendingSend(pending, clearComposer)
+            if (clearComposer && pending.startsConversation && previousScope != completed.activeDraftScope()) {
+                previousScope?.let(scopedDrafts::remove)
+            }
+            rememberDraft(completed)
+            completed
         }
     }
 
@@ -1065,10 +1608,33 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
     }
 
     private fun requestConversationImages(conversationId: UUID) {
-        state.value.snapshot?.timeline
+        state.value.timelineByConversation[conversationId]
             ?.asSequence()
-            ?.filter { it.conversationId == conversationId }
             ?.forEach(::requestImage)
+    }
+
+    private fun requestInitialConversationPage(conversation: Conversation) {
+        val current = state.value
+        if (!current.online || activeConnectionGeneration == null) return
+        if (
+            current.selectedConversationId != conversation.id ||
+            current.selectedProjectId != conversation.projectId ||
+            current.selectedProvider != conversation.provider
+        ) {
+            return
+        }
+        val hostId = current.snapshot?.hostId ?: return
+        val scope = ConversationPageScope(
+            hostId = hostId,
+            provider = conversation.provider,
+            projectId = conversation.projectId,
+            conversationId = conversation.id,
+        )
+        if (!requestedConversationPages.add(scope)) return
+        if (!client.send(WireProtocol.getConversationPage(conversation.id, before = null, limit = 100))) {
+            requestedConversationPages.remove(scope)
+            showError("对话历史请求未能写入 WebSocket")
+        }
     }
 
     private fun attachmentName(uri: Uri): String {
@@ -1087,12 +1653,12 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
     }
 
     private fun mutateSnapshot(transform: (Snapshot) -> Snapshot) {
-        mutableState.update { current ->
-            val snapshot = current.snapshot ?: return@update current
+        updateDraftScope { current ->
+            val snapshot = current.snapshot ?: return@updateDraftScope current
             defaults(
                 current.copy(snapshot = transform(snapshot)),
                 preserveMissingConversation = awaitingAuthoritativeSnapshot,
-            )
+            ).ensureDefaultProjectExpanded()
         }
     }
 
@@ -1101,25 +1667,115 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
         snapshotPersistJob = viewModelScope.launch {
             delay(SNAPSHOT_PERSIST_DELAY_MS)
             val snapshot = state.value.snapshot ?: return@launch
-            val encoded = withContext(Dispatchers.Default) { WireProtocol.encodeSnapshot(snapshot) }
-            clientStateStore.saveSnapshot(snapshot.hostId, encoded)
+            withContext(Dispatchers.IO) {
+                val encoded = WireProtocol.encodeSnapshot(snapshot)
+                clientStateStore.saveSnapshot(snapshot.hostId, encoded)
+            }
         }
     }
 
-    private fun persistSelection() {
-        val current = state.value
-        val hostId = current.activeHostId ?: return
-        clientStateStore.saveSelection(
-            hostId = hostId,
-            selectedConversationId = current.selectedConversationId,
-            selectedProjectId = current.selectedProjectId,
-            selectedProvider = current.selectedProvider,
-            selectedModel = current.selectedModel,
-            selectedEffort = current.selectedEffort,
-            selectedPermission = current.selectedPermission,
-            draft = current.draft,
-            pinnedProjects = current.pinnedProjects,
-            recentProjects = current.recentProjects,
+    private fun persistSelection(debounce: Boolean = true) {
+        selectionPersistJob?.cancel()
+        val version = selectionPersistVersion.incrementAndGet()
+        selectionPersistJob = viewModelScope.launch {
+            if (debounce) delay(SELECTION_PERSIST_DELAY_MS)
+            val current = state.value
+            val drafts = scopedDrafts.toMap()
+            withContext(Dispatchers.IO) {
+                persistSelectionSnapshot(current, drafts, commit = false, version = version)
+            }
+        }
+    }
+
+    private fun persistSelectionSnapshot(
+        current: RemoteUiState,
+        drafts: Map<DraftScope, String>,
+        commit: Boolean,
+        version: Long,
+    ) {
+        synchronized(selectionPersistLock) {
+            if (version < latestSavedSelectionVersion) return
+            val hostId = current.activeHostId
+            if (hostId == null) {
+                latestSavedSelectionVersion = version
+                return
+            }
+            clientStateStore.saveSelection(
+                hostId = hostId,
+                selectedConversationId = current.selectedConversationId,
+                selectedProjectId = current.selectedProjectId,
+                selectedProvider = current.selectedProvider,
+                selectedModel = current.selectedModel,
+                selectedEffort = current.selectedEffort,
+                selectedPermission = current.selectedPermission,
+                draft = current.draft,
+                pinnedProjects = current.pinnedProjects,
+                recentProjects = current.recentProjects,
+                expandedProjectScopes = current.expandedProjectScopes,
+                scopedDrafts = drafts,
+                commit = commit,
+            )
+            latestSavedSelectionVersion = version
+        }
+    }
+
+    private fun logLocalSendTrace(
+        commandId: UUID,
+        clientMessageId: String,
+        conversationId: UUID,
+        stage: String,
+        startedAtNanos: Long,
+    ) = logSendTrace(
+        commandId = commandId,
+        clientMessageId = clientMessageId,
+        conversationId = conversationId,
+        stage = stage,
+        elapsedMs = ((System.nanoTime() - startedAtNanos) / 1_000_000L).coerceAtLeast(0L),
+    )
+
+    private fun rememberSendTrace(commandId: UUID, startedAtNanos: Long) {
+        sendTraceStartedAtNanos[commandId] = startedAtNanos
+        while (sendTraceStartedAtNanos.size > MAX_SEND_TRACE_CONTEXTS) {
+            sendTraceStartedAtNanos.remove(sendTraceStartedAtNanos.keys.first())
+        }
+    }
+
+    private fun logServerSendTrace(event: ServerEvent.SendTrace) {
+        val startedAtNanos = sendTraceStartedAtNanos[event.commandId]
+        val endToEndElapsedMs = startedAtNanos?.let {
+            ((System.nanoTime() - it) / 1_000_000L).coerceAtLeast(0L)
+        }
+        logSendTrace(
+            commandId = event.commandId,
+            clientMessageId = event.clientMessageId,
+            conversationId = event.conversationId,
+            stage = event.stage,
+            elapsedMs = endToEndElapsedMs,
+            hostElapsedMs = event.elapsedMs,
+        )
+        if (event.stage == "first_provider_event") {
+            sendTraceStartedAtNanos.remove(event.commandId)
+        }
+    }
+
+    private fun logSendTrace(
+        commandId: UUID,
+        clientMessageId: String,
+        conversationId: UUID,
+        stage: String,
+        elapsedMs: Long?,
+        hostElapsedMs: Long? = null,
+    ) {
+        val entry = JSONObject()
+            .put("commandId", commandId.toString())
+            .put("clientMessageId", clientMessageId)
+            .put("conversationId", conversationId.toString())
+            .put("stage", stage)
+            .put("elapsedMs", elapsedMs ?: JSONObject.NULL)
+        if (hostElapsedMs != null) entry.put("hostElapsedMs", hostElapsedMs)
+        Log.i(
+            SEND_TRACE_TAG,
+            entry.toString(),
         )
     }
 
@@ -1131,8 +1787,9 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
 
     companion object {
         private const val SNAPSHOT_PERSIST_DELAY_MS = 200L
-        private val timelineComparator = compareBy<TimelineItem> { it.createdAtMs }.thenBy { it.id }
-
+        private const val SELECTION_PERSIST_DELAY_MS = 350L
+        private const val SEND_TRACE_TAG = "GAR.SendTrace"
+        private const val MAX_SEND_TRACE_CONTEXTS = 32
         private fun replaceCapability(
             current: List<ProviderCapability>,
             incoming: ProviderCapability,
@@ -1144,9 +1801,30 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
             current: List<TimelineItem>,
             incoming: TimelineItem,
         ): List<TimelineItem> {
-            val existing = current.find { it.id == incoming.id }
-            if (existing != null && existing.revision > incoming.revision) return current
-            return (current.filterNot { it.id == incoming.id } + incoming).sortedWith(timelineComparator)
+            val existingIndex = current.indexOfFirst {
+                it.conversationId == incoming.conversationId && it.id == incoming.id
+            }
+            if (existingIndex >= 0) {
+                val existing = current[existingIndex]
+                if (existing.revision > incoming.revision) return current
+                if (existing.createdAtMs == incoming.createdAtMs && existing.id == incoming.id) {
+                    return current.toMutableList().apply { set(existingIndex, incoming) }
+                }
+            }
+            val updated = current.toMutableList()
+            if (existingIndex >= 0) updated.removeAt(existingIndex)
+            var low = 0
+            var high = updated.size
+            while (low < high) {
+                val middle = (low + high) ushr 1
+                if (timelineComparator.compare(updated[middle], incoming) <= 0) {
+                    low = middle + 1
+                } else {
+                    high = middle
+                }
+            }
+            updated.add(low, incoming)
+            return updated
         }
     }
 }

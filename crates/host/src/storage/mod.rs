@@ -109,8 +109,13 @@ pub struct StoredAttachment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoredCommand {
     Missing,
-    Pending,
-    Complete(Box<ServerMessage>),
+    Pending {
+        attempt: u32,
+    },
+    Complete {
+        attempt: u32,
+        result: Box<ServerMessage>,
+    },
 }
 
 pub struct Storage {
@@ -132,6 +137,7 @@ impl Storage {
         migrate_2(&connection)?;
         migrate_3(&connection)?;
         migrate_4(&connection)?;
+        migrate_5(&connection)?;
         let storage = Self {
             connection: Mutex::new(connection),
         };
@@ -357,25 +363,43 @@ impl Storage {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         let result = connection
             .query_row(
-                "SELECT result_json FROM used_commands WHERE device_id = ?1 AND command_id = ?2",
+                "SELECT attempt, result_json FROM used_commands WHERE device_id = ?1 AND command_id = ?2",
                 params![device_id.to_string(), command_id.to_string()],
-                |row| row.get::<_, Option<String>>(0),
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Option<String>>(1)?)),
             )
             .optional()?;
         match result {
             None => Ok(StoredCommand::Missing),
-            Some(None) => Ok(StoredCommand::Pending),
-            Some(Some(value)) => Ok(StoredCommand::Complete(Box::new(
-                serde_json::from_str(&value).context("decode stored command result")?,
-            ))),
+            Some((attempt, None)) => Ok(StoredCommand::Pending { attempt }),
+            Some((attempt, Some(value))) => Ok(StoredCommand::Complete {
+                attempt,
+                result: Box::new(
+                    serde_json::from_str(&value).context("decode stored command result")?,
+                ),
+            }),
         }
     }
 
-    pub fn begin_command(&self, device_id: DeviceId, command_id: CommandId) -> Result<()> {
+    pub fn begin_command(
+        &self,
+        device_id: DeviceId,
+        command_id: CommandId,
+        attempt: u32,
+    ) -> Result<()> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         connection.execute(
-            "INSERT OR IGNORE INTO used_commands(device_id, command_id, created_at_ms) VALUES(?1, ?2, ?3)",
-            params![device_id.to_string(), command_id.to_string(), now_ms()],
+            "INSERT INTO used_commands(device_id, command_id, attempt, created_at_ms, result_json)
+             VALUES(?1, ?2, ?3, ?4, NULL)
+             ON CONFLICT(device_id, command_id) DO UPDATE SET
+                 attempt = excluded.attempt,
+                 created_at_ms = excluded.created_at_ms,
+                 result_json = NULL",
+            params![
+                device_id.to_string(),
+                command_id.to_string(),
+                attempt,
+                now_ms()
+            ],
         )?;
         Ok(())
     }
@@ -384,13 +408,20 @@ impl Storage {
         &self,
         device_id: DeviceId,
         command_id: CommandId,
+        attempt: u32,
         result: &ServerMessage,
     ) -> Result<()> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         let result_json = serde_json::to_string(result).context("encode command result")?;
         if connection.execute(
-            "UPDATE used_commands SET result_json = ?3 WHERE device_id = ?1 AND command_id = ?2",
-            params![device_id.to_string(), command_id.to_string(), result_json],
+            "UPDATE used_commands SET result_json = ?4
+             WHERE device_id = ?1 AND command_id = ?2 AND attempt = ?3",
+            params![
+                device_id.to_string(),
+                command_id.to_string(),
+                attempt,
+                result_json
+            ],
         )? == 0
         {
             bail!("command was not started");
@@ -834,6 +865,11 @@ impl Storage {
     }
 
     pub fn attachment(&self, id: AttachmentId) -> Result<StoredAttachment> {
+        self.find_attachment(id)?
+            .ok_or_else(|| anyhow!("attachment {id} was not found"))
+    }
+
+    pub fn find_attachment(&self, id: AttachmentId) -> Result<Option<StoredAttachment>> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         let row = connection
             .query_row(
@@ -851,9 +887,11 @@ impl Storage {
                     ))
                 },
             )
-            .optional()?
-            .ok_or_else(|| anyhow!("attachment {id} was not found"))?;
-        Ok(StoredAttachment {
+            .optional()?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(StoredAttachment {
             metadata: AttachmentMetadata {
                 id,
                 conversation_id: ConversationId(parse_uuid(&row.0)?),
@@ -864,7 +902,7 @@ impl Storage {
                 created_at_ms: row.6,
             },
             managed_path: PathBuf::from(row.5),
-        })
+        }))
     }
 
     fn interrupt_orphaned_conversations(&self) -> Result<()> {
@@ -1122,6 +1160,21 @@ fn migrate_4(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_5(connection: &Connection) -> Result<()> {
+    if !column_exists(connection, "used_commands", "attempt")? {
+        connection.execute(
+            "ALTER TABLE used_commands ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    connection.execute(
+        "INSERT INTO host_meta(key, value) VALUES('schema_version', '5')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [],
+    )?;
+    Ok(())
+}
+
 fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     let names = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -1191,6 +1244,7 @@ CREATE TABLE IF NOT EXISTS attachments (
 CREATE TABLE IF NOT EXISTS used_commands (
     device_id TEXT NOT NULL REFERENCES paired_devices(id) ON DELETE CASCADE,
     command_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL,
     PRIMARY KEY(device_id, command_id)
 );
@@ -1351,13 +1405,13 @@ mod tests {
             StoredCommand::Missing
         );
         storage
-            .begin_command(device.id, command)
+            .begin_command(device.id, command, 0)
             .expect("begin command");
         let response = ServerMessage::CommandAccepted {
             command_id: command,
         };
         storage
-            .finish_command(device.id, command, &response)
+            .finish_command(device.id, command, 0, &response)
             .expect("finish command");
         drop(storage);
         let storage = Storage::open(temp.path().join("state.db")).expect("reopen storage");
@@ -1365,7 +1419,10 @@ mod tests {
             storage
                 .command_state(device.id, command)
                 .expect("stored result"),
-            StoredCommand::Complete(Box::new(response))
+            StoredCommand::Complete {
+                attempt: 0,
+                result: Box::new(response),
+            }
         );
     }
 
@@ -1378,7 +1435,7 @@ mod tests {
             .expect("exchange token");
         let command = CommandId::new();
         storage
-            .begin_command(device.id, command)
+            .begin_command(device.id, command, 0)
             .expect("begin command");
 
         drop(storage);
@@ -1387,7 +1444,7 @@ mod tests {
             storage
                 .command_state(device.id, command)
                 .expect("pending command"),
-            StoredCommand::Pending
+            StoredCommand::Pending { attempt: 0 }
         );
     }
 

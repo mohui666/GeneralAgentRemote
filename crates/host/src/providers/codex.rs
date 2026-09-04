@@ -12,7 +12,7 @@ use std::{
         Arc, Mutex, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use agent_remote_protocol::{
@@ -43,6 +43,7 @@ const CLIENT_NAME: &str = "agent_remote_messenger";
 const CLIENT_TITLE: &str = "Agent Remote Messenger";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const APP_SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const SESSION_DISCOVERY_TTL: Duration = Duration::from_secs(2);
 pub(crate) const CANONICAL_ITEM_PREFIX: &str = "codex:v1:";
 
 type DynWriter = Box<dyn AsyncWrite + Send + Unpin>;
@@ -75,6 +76,7 @@ impl CodexProvider {
                 emitted_images: Mutex::new(HashSet::new()),
                 canonical_item_ids: Mutex::new(CanonicalItemIds::default()),
                 model_cache: RwLock::new(Vec::new()),
+                session_discovery: AsyncMutex::new(None),
             }),
         }
     }
@@ -143,6 +145,60 @@ impl CodexProvider {
         } else {
             Ok(cached)
         }
+    }
+
+    async fn discover_sessions(&self) -> Result<Vec<DiscoveredSession>> {
+        let wire = self.connection().await?;
+        let mut cache = self.shared.session_discovery.lock().await;
+        if let Some(cache) = cache.as_ref()
+            && cache.generation == wire.generation
+            && cache.fetched_at.elapsed() < SESSION_DISCOVERY_TTL
+        {
+            return Ok(cache.sessions.clone());
+        }
+        let mut cursor = None;
+        let mut sessions = Vec::new();
+        loop {
+            let response: ThreadListResponse = wire
+                .request(
+                    "thread/list",
+                    &ThreadListParams {
+                        cursor: cursor.as_deref(),
+                        limit: Some(100),
+                        sort_key: "updated_at",
+                        sort_direction: "desc",
+                        source_kinds: &["cli", "vscode", "appServer"],
+                        archived: false,
+                        cwd: None,
+                    },
+                )
+                .await?;
+            sessions.extend(response.data.into_iter().map(|thread| {
+                let title = thread
+                    .name
+                    .filter(|name| !name.trim().is_empty())
+                    .or_else(|| (!thread.preview.trim().is_empty()).then_some(thread.preview))
+                    .unwrap_or_else(|| "Codex session".to_owned());
+                DiscoveredSession {
+                    cwd: thread.cwd,
+                    summary: SessionSummary {
+                        native_session_id: thread.id,
+                        title,
+                        updated_at_ms: thread.updated_at.saturating_mul(1_000),
+                    },
+                }
+            }));
+            cursor = response.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        *cache = Some(SessionDiscoveryCache {
+            generation: wire.generation,
+            fetched_at: Instant::now(),
+            sessions: sessions.clone(),
+        });
+        Ok(sessions)
     }
 }
 
@@ -285,46 +341,66 @@ impl AgentProvider for CodexProvider {
         Ok(models)
     }
 
+    async fn list_models_for_projects(
+        &self,
+        projects: &[Project],
+    ) -> Result<HashMap<ProjectId, std::result::Result<Vec<ModelOption>, String>>> {
+        let Some(first_project) = projects.first() else {
+            return Ok(HashMap::new());
+        };
+        let models = self
+            .list_models(first_project)
+            .await
+            .map_err(|error| error.to_string());
+        Ok(projects
+            .iter()
+            .map(|project| (project.id, models.clone()))
+            .collect())
+    }
+
     async fn list_sessions(&self, project: &Project) -> Result<Vec<SessionSummary>> {
-        let wire = self.connection().await?;
-        let project_path = path_string(&project.canonical_path);
-        let mut cursor = None;
-        let mut sessions = Vec::new();
-        loop {
-            let response: ThreadListResponse = wire
-                .request(
-                    "thread/list",
-                    &ThreadListParams {
-                        cursor: cursor.as_deref(),
-                        limit: Some(100),
-                        sort_key: "updated_at",
-                        sort_direction: "desc",
-                        source_kinds: &["cli", "vscode", "appServer"],
-                        archived: false,
-                        cwd: &project_path,
-                    },
-                )
-                .await?;
-            for thread in response.data {
-                if !thread_matches_project(&thread, &project.canonical_path) {
-                    continue;
-                }
-                let title = thread
-                    .name
-                    .filter(|name| !name.trim().is_empty())
-                    .or_else(|| (!thread.preview.trim().is_empty()).then_some(thread.preview))
-                    .unwrap_or_else(|| "Codex session".to_owned());
-                sessions.push(SessionSummary {
-                    native_session_id: thread.id,
-                    title,
-                    updated_at_ms: thread.updated_at.saturating_mul(1_000),
-                });
-            }
-            cursor = response.next_cursor;
-            if cursor.is_none() {
-                break;
-            }
+        let mut grouped = self
+            .list_sessions_for_projects(std::slice::from_ref(project))
+            .await?;
+        grouped
+            .remove(&project.id)
+            .unwrap_or_else(|| Ok(Vec::new()))
+            .map_err(anyhow::Error::msg)
+    }
+
+    async fn list_sessions_for_projects(
+        &self,
+        projects: &[Project],
+    ) -> Result<HashMap<ProjectId, std::result::Result<Vec<SessionSummary>, String>>> {
+        if projects.is_empty() {
+            return Ok(HashMap::new());
         }
+        let mut sessions = projects
+            .iter()
+            .map(|project| (project.id, Ok(Vec::new())))
+            .collect::<HashMap<_, _>>();
+        let mut unmatched = 0_u64;
+        for discovered in self.discover_sessions().await? {
+            let Some(project) = projects
+                .iter()
+                .find(|project| cwd_matches_project(&discovered.cwd, &project.canonical_path))
+            else {
+                unmatched += 1;
+                continue;
+            };
+            sessions
+                .entry(project.id)
+                .or_insert_with(|| Ok(Vec::new()))
+                .as_mut()
+                .expect("Codex project discovery starts successfully")
+                .push(discovered.summary);
+        }
+        tracing::debug!(
+            provider = "codex",
+            authorized_projects = projects.len(),
+            unmatched_threads = unmatched,
+            "classified Codex threads by normalized authorized project cwd"
+        );
         Ok(sessions)
     }
 
@@ -421,6 +497,7 @@ impl AgentProvider for CodexProvider {
                 },
             )
             .await?;
+        *self.shared.session_discovery.lock().await = None;
         Ok(CommandAck)
     }
 
@@ -438,6 +515,7 @@ impl AgentProvider for CodexProvider {
             )
             .await?;
         validate_thread_project(&response.thread, &request.project.canonical_path)?;
+        *self.shared.session_discovery.lock().await = None;
         let selected_model = Some(response.model.clone());
         let selected_effort = request.effort.clone().or(response.reasoning_effort.clone());
         let permission_mode =
@@ -574,6 +652,7 @@ impl AgentProvider for CodexProvider {
             .await?;
         self.shared
             .set_active_turn(request.native_session_id, response.turn.id, wire.generation);
+        *self.shared.session_discovery.lock().await = None;
         Ok(CommandAck)
     }
 
@@ -702,6 +781,19 @@ struct Shared {
     emitted_images: Mutex<HashSet<ItemKey>>,
     canonical_item_ids: Mutex<CanonicalItemIds>,
     model_cache: RwLock<Vec<ModelOption>>,
+    session_discovery: AsyncMutex<Option<SessionDiscoveryCache>>,
+}
+
+struct SessionDiscoveryCache {
+    generation: u64,
+    fetched_at: Instant,
+    sessions: Vec<DiscoveredSession>,
+}
+
+#[derive(Clone)]
+struct DiscoveredSession {
+    cwd: String,
+    summary: SessionSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2206,7 +2298,8 @@ struct ThreadListParams<'a> {
     sort_direction: &'static str,
     source_kinds: &'a [&'static str],
     archived: bool,
-    cwd: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -2619,17 +2712,21 @@ fn path_string(path: &Path) -> String {
 }
 
 fn thread_matches_project(thread: &CodexThread, project: &Path) -> bool {
-    let thread_path = PathBuf::from(&thread.cwd);
+    cwd_matches_project(&thread.cwd, project)
+}
+
+fn cwd_matches_project(cwd: &str, project: &Path) -> bool {
+    let thread_path = PathBuf::from(cwd);
     match (thread_path.canonicalize(), project.canonicalize()) {
         (Ok(thread), Ok(project)) => thread == project,
         _ => {
             #[cfg(windows)]
             {
-                thread.cwd.eq_ignore_ascii_case(&path_string(project))
+                cwd.eq_ignore_ascii_case(&path_string(project))
             }
             #[cfg(not(windows))]
             {
-                thread.cwd == path_string(project)
+                cwd == path_string(project)
             }
         }
     }
@@ -3712,6 +3809,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_discovery_lists_once_and_groups_only_authorized_normalized_cwds() {
+        let provider = test_provider();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path_a = temp.path().join("a");
+        let path_b = temp.path().join("b");
+        let outside = temp.path().join("outside");
+        for path in [&path_a, &path_b, &outside] {
+            std::fs::create_dir(path).expect("project dir");
+        }
+        let projects = vec![
+            Project {
+                id: ProjectId::new(),
+                display_name: "A".to_owned(),
+                canonical_path: path_a.canonicalize().expect("canonical A"),
+                enabled_providers: vec![ProviderId::Codex],
+            },
+            Project {
+                id: ProjectId::new(),
+                display_name: "B".to_owned(),
+                canonical_path: path_b.canonicalize().expect("canonical B"),
+                enabled_providers: vec![ProviderId::Codex],
+            },
+        ];
+        let server = install_duplex(&provider).await;
+        let (server_read, mut server_write) = split(server);
+        let mut server_read = BufReader::new(server_read);
+        let task_provider = provider.clone();
+        let task_projects = projects.clone();
+        let discovery = tokio::spawn(async move {
+            task_provider
+                .list_sessions_for_projects(&task_projects)
+                .await
+        });
+
+        let request = read_json(&mut server_read).await;
+        assert_eq!(request["method"], "thread/list");
+        assert!(request["params"].get("cwd").is_none());
+        let id = request["id"].clone();
+        server_write
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "id": id,
+                        "result": {
+                            "data": [
+                                {"id":"thread-a","cwd":path_string(&projects[0].canonical_path),"name":"A thread","updatedAt":3},
+                                {"id":"thread-b","cwd":path_string(&projects[1].canonical_path),"name":"B thread","updatedAt":2},
+                                {"id":"thread-hidden","cwd":path_string(&outside),"name":"Hidden","updatedAt":1}
+                            ],
+                            "nextCursor": null
+                        }
+                    })
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("thread/list response");
+        let grouped = discovery.await.expect("discovery task").expect("discovery");
+        assert_eq!(
+            grouped[&projects[0].id].as_ref().expect("project A")[0].native_session_id,
+            "thread-a"
+        );
+        assert_eq!(
+            grouped[&projects[1].id].as_ref().expect("project B")[0].native_session_id,
+            "thread-b"
+        );
+        assert_eq!(
+            grouped
+                .values()
+                .map(|sessions| sessions.as_ref().expect("project discovery").len())
+                .sum::<usize>(),
+            2
+        );
+
+        let cached = tokio::time::timeout(
+            Duration::from_millis(100),
+            provider.list_sessions_for_projects(&projects),
+        )
+        .await
+        .expect("cached discovery attempted another request")
+        .expect("cached discovery");
+        assert_eq!(
+            cached
+                .values()
+                .map(|sessions| sessions.as_ref().expect("cached discovery").len())
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn initialize_is_followed_by_initialized_without_experimental_opt_in() {
         let provider = test_provider();
         let (client, server) = duplex(32 * 1024);
@@ -3988,7 +4177,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paginated_models_keep_dynamic_effort_order() {
+    async fn paginated_models_are_fetched_once_and_shared_across_projects() {
         let provider = test_provider();
         let server = install_duplex(&provider).await;
         let (server_read, mut server_write) = split(server);
@@ -4032,11 +4221,17 @@ mod tests {
                 .await
                 .expect("write second model page");
         });
-        let models = provider
-            .list_models(&test_project())
+        let projects = [test_project(), test_project()];
+        let models_by_project = provider
+            .list_models_for_projects(&projects)
             .await
             .expect("list models");
         mock.await.expect("mock server");
+        assert_eq!(models_by_project.len(), 2);
+        let models = models_by_project[&projects[0].id]
+            .as_ref()
+            .expect("first project models");
+        assert_eq!(models, models_by_project[&projects[1].id].as_ref().unwrap());
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "model-a");
         assert_eq!(

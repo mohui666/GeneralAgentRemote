@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 agent-remote-protocol = { path = "../protocol" }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys.workspace = true
@@ -23,6 +24,7 @@ web-sys = { workspace = true, features = [
     "CloseEvent",
     "ClipboardEvent",
     "DataTransfer",
+    "Document",
     "DragEvent",
     "ErrorEvent",
     "Event",
@@ -36,11 +38,15 @@ web-sys = { workspace = true, features = [
     "HtmlTextAreaElement",
     "Location",
     "MessageEvent",
+    "Navigator",
+    "Performance",
     "Storage",
     "Url",
     "UrlSearchParams",
     "WebSocket",
     "Window",
+    "Clipboard",
+    "console",
 ] }
 yew.workspace = true
 

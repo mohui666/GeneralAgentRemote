@@ -17,6 +17,7 @@ use agent_remote_protocol::{
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use futures_util::{StreamExt, stream};
 use tokio::sync::{Notify, broadcast};
 
 use crate::storage::Project;
@@ -274,7 +275,40 @@ pub trait AgentProvider: Send + Sync {
     fn subscribe(&self) -> broadcast::Receiver<ProviderEvent>;
     async fn health(&self) -> ProviderHealth;
     async fn list_models(&self, project: &Project) -> Result<Vec<ModelOption>>;
+    async fn list_models_for_projects(
+        &self,
+        projects: &[Project],
+    ) -> Result<HashMap<ProjectId, std::result::Result<Vec<ModelOption>, String>>> {
+        let results = stream::iter(projects.iter().cloned().map(|project| async move {
+            let project_id = project.id;
+            (project_id, self.list_models(&project).await)
+        }))
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await;
+        Ok(results
+            .into_iter()
+            .map(|(project_id, result)| (project_id, result.map_err(|error| error.to_string())))
+            .collect())
+    }
     async fn list_sessions(&self, project: &Project) -> Result<Vec<SessionSummary>>;
+    async fn list_sessions_for_projects(
+        &self,
+        projects: &[Project],
+    ) -> Result<HashMap<ProjectId, std::result::Result<Vec<SessionSummary>, String>>> {
+        let results = stream::iter(projects.iter().cloned().map(|project| async move {
+            let project_id = project.id;
+            (project_id, self.list_sessions(&project).await)
+        }))
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await;
+        let mut sessions = HashMap::with_capacity(results.len());
+        for (project_id, result) in results {
+            sessions.insert(project_id, result.map_err(|error| error.to_string()));
+        }
+        Ok(sessions)
+    }
     fn permission_modes(&self) -> Vec<PermissionModeOption> {
         Vec::new()
     }

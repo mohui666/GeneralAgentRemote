@@ -33,8 +33,8 @@ import java.nio.charset.StandardCharsets
 import java.util.UUID
 
 object WireProtocol {
-    const val VERSION = 1
-    const val SUBPROTOCOL = "agent-remote.cbor.v1"
+    const val VERSION = 2
+    const val SUBPROTOCOL = "agent-remote.cbor.v2"
     private val mapper = ObjectMapper(CBORFactory())
 
     fun pair(target: ConnectionTarget, deviceName: String): ByteArray = command("pair") {
@@ -84,6 +84,7 @@ object WireProtocol {
 
     fun startConversation(
         commandId: UUID,
+        clientMessageId: String,
         conversationId: UUID,
         projectId: UUID,
         provider: ProviderId,
@@ -92,8 +93,11 @@ object WireProtocol {
         permissionMode: String?,
         text: String,
         attachments: List<PromptAttachment>,
+        attempt: Int = 0,
     ): ByteArray = command("start_conversation") {
+        require(attempt >= 0) { "发送 attempt 不能为负数" }
         setUuid("command_id", commandId)
+        put("client_message_id", clientMessageId)
         setUuid("conversation_id", conversationId)
         setUuid("project_id", projectId)
         put("provider", provider.wire)
@@ -102,6 +106,7 @@ object WireProtocol {
         putNullable("permission_mode", permissionMode)
         put("text", text)
         putAttachments(attachments)
+        put("attempt", attempt)
     }
 
     fun sendMessage(
@@ -110,14 +115,29 @@ object WireProtocol {
         clientMessageId: String,
         text: String,
         attachments: List<PromptAttachment>,
+        attempt: Int = 0,
     ): ByteArray =
         command("send_message") {
+            require(attempt >= 0) { "发送 attempt 不能为负数" }
             setUuid("command_id", commandId)
             setUuid("conversation_id", conversationId)
             put("client_message_id", clientMessageId)
             put("text", text)
             putAttachments(attachments)
+            put("attempt", attempt)
         }
+
+    fun withSendAttempt(frame: ByteArray, attempt: Int): ByteArray {
+        require(attempt >= 0) { "发送 attempt 不能为负数" }
+        val envelope = mapper.readTree(frame) as? ObjectNode ?: error("发送帧不是 CBOR 对象")
+        require(envelope.required("protocol_version").asInt() == VERSION) { "发送帧协议版本不匹配" }
+        val message = envelope.required("message") as? ObjectNode ?: error("发送消息不是 CBOR 对象")
+        require(message.requiredText("type") in setOf("start_conversation", "send_message")) {
+            "只有发送消息可以更新 attempt"
+        }
+        message.put("attempt", attempt)
+        return mapper.writeValueAsBytes(envelope)
+    }
 
     fun steer(commandId: UUID, conversationId: UUID, text: String): ByteArray =
         command("steer") {
@@ -199,14 +219,20 @@ object WireProtocol {
                     ),
                 )
             }
-            "authenticated" -> ServerEvent.Authenticated(
-                hostId = message.requiredUuid("host_id"),
-                deviceId = message.requiredUuid("device_id"),
-            )
-            "snapshot" -> ServerEvent.SnapshotReceived(
-                parseSnapshot(message.required("snapshot")),
-                bytes.copyOf(),
-            )
+            "authenticated" -> {
+                val hostId = message.requiredUuid("host_id")
+                val deviceId = message.requiredUuid("device_id")
+                require(hostId == target.hostId) { "认证响应属于其他 Host" }
+                target.credential?.let { credential ->
+                    require(deviceId == credential.deviceId) { "认证响应属于其他设备" }
+                }
+                ServerEvent.Authenticated(hostId = hostId, deviceId = deviceId)
+            }
+            "snapshot" -> {
+                val snapshot = parseSnapshot(message.required("snapshot"))
+                require(snapshot.hostId == target.hostId) { "快照属于其他 Host" }
+                ServerEvent.SnapshotReceived(snapshot, bytes.copyOf())
+            }
             "projects_updated" -> ServerEvent.ProjectsUpdated(
                 provider = ProviderId.fromWire(message.requiredText("provider")),
                 projects = message.requiredArray("projects").map(::parseProject),
@@ -252,10 +278,21 @@ object WireProtocol {
                     ),
                 )
             }
-            "host_status" -> ServerEvent.HostStatus(
-                hostId = message.requiredUuid("host_id"),
-                online = message.required("online").asBoolean(),
-                message = message.textOrNull("message"),
+            "host_status" -> {
+                val hostId = message.requiredUuid("host_id")
+                require(hostId == target.hostId) { "Host 状态属于其他 Host" }
+                ServerEvent.HostStatus(
+                    hostId = hostId,
+                    online = message.required("online").asBoolean(),
+                    message = message.textOrNull("message"),
+                )
+            }
+            "send_trace" -> ServerEvent.SendTrace(
+                commandId = message.requiredUuid("command_id"),
+                clientMessageId = message.requiredText("client_message_id"),
+                conversationId = message.requiredUuid("conversation_id"),
+                stage = message.requiredText("stage"),
+                elapsedMs = message.required("elapsed_ms").asLong(),
             )
             "command_accepted" -> ServerEvent.CommandAccepted(
                 message.requiredUuid("command_id"),

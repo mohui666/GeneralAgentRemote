@@ -1,6 +1,8 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
-use agent_remote_protocol::{HostId, RelayFrame, ServerMessage, decode, encode};
+use agent_remote_protocol::{
+    HostId, RelayFrame, ServerMessage, decode_relay, encode, encode_relay,
+};
 use axum::{
     Router,
     extract::{
@@ -20,7 +22,7 @@ use uuid::Uuid;
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 64;
 const MAX_RELAY_MESSAGE_BYTES: usize = 12 * 1024 * 1024;
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
-const APP_SUBPROTOCOL: &str = "agent-remote.cbor.v1";
+const APP_SUBPROTOCOL: &str = "agent-remote.cbor.v2";
 const RELAY_SUBPROTOCOL: &str = "agent-remote-relay.cbor.v1";
 
 #[derive(Clone)]
@@ -243,7 +245,7 @@ async fn client_upgrade(
 
 async fn host_socket(state: RelayState, mut socket: WebSocket) {
     let registration = match tokio::time::timeout(REGISTRATION_TIMEOUT, socket.recv()).await {
-        Ok(Some(Ok(Message::Binary(bytes)))) => decode::<RelayFrame>(&bytes),
+        Ok(Some(Ok(Message::Binary(bytes)))) => decode_relay(&bytes),
         Ok(Some(Ok(_))) => {
             send_relay_error(
                 &mut socket,
@@ -326,7 +328,7 @@ async fn host_socket(state: RelayState, mut socket: WebSocket) {
                 let Some(inbound) = inbound else { break };
                 match inbound {
                     Ok(Message::Binary(bytes)) => {
-                        let frame = match decode::<RelayFrame>(&bytes) {
+                        let frame = match decode_relay(&bytes) {
                             Ok(frame) => frame,
                             Err(error) => {
                                 let _ = send_relay_sink(&mut sink, RelayFrame::Error {
@@ -561,7 +563,7 @@ async fn send_offline_and_close(mut socket: WebSocket, host_id: HostId, message:
 }
 
 async fn send_relay(socket: &mut WebSocket, frame: RelayFrame) -> Result<(), ()> {
-    let payload = encode(&frame).map_err(|error| {
+    let payload = encode_relay(&frame).map_err(|error| {
         warn!(%error, "failed to encode relay frame");
     })?;
     socket
@@ -574,7 +576,7 @@ async fn send_relay_sink<S>(sink: &mut S, frame: RelayFrame) -> Result<(), ()>
 where
     S: futures_util::Sink<Message> + Unpin,
 {
-    let payload = encode(&frame).map_err(|error| {
+    let payload = encode_relay(&frame).map_err(|error| {
         warn!(%error, "failed to encode relay frame");
     })?;
     sink.send(Message::Binary(payload.into()))
@@ -620,7 +622,7 @@ where
 mod tests {
     use std::{fs, net::SocketAddr};
 
-    use agent_remote_protocol::{ClientCommand, PROTOCOL_VERSION};
+    use agent_remote_protocol::{ClientCommand, PROTOCOL_VERSION, decode};
     use futures_util::{SinkExt, StreamExt};
     use tempfile::TempDir;
     use tokio::{
@@ -713,7 +715,7 @@ mod tests {
     ) {
         socket
             .send(TungsteniteMessage::Binary(
-                encode(&frame).expect("encode frame").into(),
+                encode_relay(&frame).expect("encode frame").into(),
             ))
             .await
             .expect("send frame");
@@ -755,8 +757,8 @@ mod tests {
             },
         )
         .await;
-        let registered: RelayFrame =
-            decode(&receive_binary(&mut host).await).expect("decode registration");
+        let registered =
+            decode_relay(&receive_binary(&mut host).await).expect("decode registration");
         assert_eq!(registered, RelayFrame::HostRegistered { host_id });
         host
     }
@@ -784,7 +786,7 @@ mod tests {
             }
         );
 
-        let opened: RelayFrame = decode(&receive_binary(&mut host).await).expect("decode open");
+        let opened = decode_relay(&receive_binary(&mut host).await).expect("decode open");
         let connection_id = match opened {
             RelayFrame::OpenClient {
                 host_id: opened_host,
@@ -803,8 +805,7 @@ mod tests {
             ))
             .await
             .expect("send client payload");
-        let forwarded: RelayFrame =
-            decode(&receive_binary(&mut host).await).expect("decode payload");
+        let forwarded = decode_relay(&receive_binary(&mut host).await).expect("decode payload");
         assert_eq!(
             forwarded,
             RelayFrame::Payload {
@@ -854,7 +855,7 @@ mod tests {
             },
         )
         .await;
-        let error: RelayFrame = decode(&receive_binary(&mut host).await).expect("decode error");
+        let error = decode_relay(&receive_binary(&mut host).await).expect("decode error");
         assert!(matches!(error, RelayFrame::Error { code, .. } if code == "invalid_access_token"));
 
         let mut client = connect(
@@ -883,7 +884,7 @@ mod tests {
         )
         .await;
         let _: ServerMessage = decode(&receive_binary(&mut client).await).expect("decode online");
-        let _: RelayFrame = decode(&receive_binary(&mut host).await).expect("decode open");
+        let _ = decode_relay(&receive_binary(&mut host).await).expect("decode open");
 
         host.close(None).await.expect("close host");
         let offline: ServerMessage =

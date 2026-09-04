@@ -42,6 +42,7 @@ internal class RemoteClient(
     private var socket: WebSocket? = null
     private var target: ConnectionTarget? = null
     private var generation = 0L
+    private var authenticatedGeneration: Long? = null
     private var reconnectAttempt = 0
     private var reconnectFuture: ScheduledFuture<*>? = null
     private var retryEnabled = true
@@ -55,6 +56,7 @@ internal class RemoteClient(
             cancelReconnectLocked()
             target = newTarget
             generation += 1
+            authenticatedGeneration = null
             socket?.cancel()
             openLocked(generation, newTarget)
         }
@@ -74,6 +76,7 @@ internal class RemoteClient(
             retryEnabled = false
             cancelReconnectLocked()
             generation += 1
+            authenticatedGeneration = null
             socket?.close(1000, "user disconnected")
             socket = null
             if (clearTarget) target = null
@@ -89,6 +92,7 @@ internal class RemoteClient(
             reconnectAttempt = 0
             cancelReconnectLocked()
             generation += 1
+            authenticatedGeneration = null
             socket?.cancel()
             socket = null
             openLocked(generation, reconnectTarget)
@@ -109,6 +113,7 @@ internal class RemoteClient(
             retryEnabled = false
             cancelReconnectLocked()
             generation += 1
+            authenticatedGeneration = null
             socket?.cancel()
             socket = null
             target = null
@@ -126,13 +131,23 @@ internal class RemoteClient(
     }
 
     fun send(bytes: ByteArray): Boolean = synchronized(lock) {
-        socket?.send(bytes.toByteString()) ?: false
+        if (authenticatedGeneration != generation || closedByUser) return@synchronized false
+        val activeSocket = socket ?: return@synchronized false
+        val written = activeSocket.send(bytes.toByteString())
+        if (!written) {
+            authenticatedGeneration = null
+            activeSocket.cancel()
+        }
+        written
     }
 
     fun isCurrent(connectionGeneration: Long): Boolean = current(connectionGeneration)
 
     fun isConnected(connectionGeneration: Long): Boolean = synchronized(lock) {
-        generation == connectionGeneration && !closedByUser && socket != null
+        generation == connectionGeneration &&
+            authenticatedGeneration == connectionGeneration &&
+            !closedByUser &&
+            socket != null
     }
 
     fun targets(credential: StoredCredential): Boolean =
@@ -164,8 +179,9 @@ internal class RemoteClient(
                     if (firstFrame == null) {
                         listener.onError("连接缺少配对 token 或设备凭证")
                         webSocket.close(1008, "missing credentials")
-                    } else {
-                        webSocket.send(firstFrame.toByteString())
+                    } else if (!webSocket.send(firstFrame.toByteString())) {
+                        listener.onError("认证请求未能写入 WebSocket")
+                        webSocket.close(1011, "authentication write failed")
                     }
                 }
 
@@ -182,18 +198,22 @@ internal class RemoteClient(
                         synchronized(lock) {
                             if (generation == connectionGeneration) {
                                 reconnectAttempt = 0
+                                authenticatedGeneration = connectionGeneration
                                 target = connectionTarget.copy(
                                     pairToken = null,
                                     credential = event.credential,
                                 )
                             }
                         }
-                        webSocket.send(WireProtocol.getSnapshot().toByteString())
+                        sendInitialSnapshotRequest(webSocket, connectionGeneration)
                     } else if (event is ServerEvent.Authenticated) {
                         synchronized(lock) {
-                            if (generation == connectionGeneration) reconnectAttempt = 0
+                            if (generation == connectionGeneration) {
+                                reconnectAttempt = 0
+                                authenticatedGeneration = connectionGeneration
+                            }
                         }
-                        webSocket.send(WireProtocol.getSnapshot().toByteString())
+                        sendInitialSnapshotRequest(webSocket, connectionGeneration)
                     }
                     listener.onEvent(event, connectionGeneration)
                 }
@@ -220,6 +240,7 @@ internal class RemoteClient(
         val scheduled = synchronized(lock) {
             if (closedByUser || generation != connectionGeneration) return
             socket = null
+            authenticatedGeneration = null
             if (!retryEnabled || reconnectFuture != null) {
                 return@synchronized null
             }
@@ -236,6 +257,7 @@ internal class RemoteClient(
                     reconnectFuture = null
                     if (!closedByUser && retryEnabled && generation == connectionGeneration && socket == null) {
                         generation += 1
+                        authenticatedGeneration = null
                         openLocked(generation, reconnectTarget)
                     }
                 }
@@ -261,6 +283,18 @@ internal class RemoteClient(
 
     private fun currentTarget(fallback: ConnectionTarget): ConnectionTarget = synchronized(lock) {
         target ?: fallback
+    }
+
+    private fun sendInitialSnapshotRequest(webSocket: WebSocket, connectionGeneration: Long) {
+        if (!webSocket.send(WireProtocol.getSnapshot().toByteString())) {
+            synchronized(lock) {
+                if (generation == connectionGeneration && socket === webSocket) {
+                    authenticatedGeneration = null
+                }
+            }
+            listener.onError("初始状态请求未能写入 WebSocket")
+            webSocket.close(1011, "snapshot write failed")
+        }
     }
 
     private sealed interface RetrySchedule {

@@ -81,6 +81,8 @@ cargo xtask provider-smoke
 - `provider-smoke` 只有 `PASS` 才表示本机真实 Provider 可用；`SKIP` 不算验证。
 - 自动化构建不能替代真机或真实 Provider 验收，两类结果应分别记录。
 
+需要由 Codex/AI 在电脑端驱动一台已明确连接的 Android 设备时，使用 `cargo xtask android-device doctor|prepare|inspect|ui|scenario|logs|capture`。该工具只通过本地 adb 和稳定 accessibility ID 执行开发测试，不会把远程终端能力加入产品；完整命令见 [Android 文档](docs/android.md#aicli-device-test-driver)。
+
 ## 安全边界
 
 - 公网部署应使用 HTTPS/WSS；`--dev-insecure` 只适合受信任的开发网络。

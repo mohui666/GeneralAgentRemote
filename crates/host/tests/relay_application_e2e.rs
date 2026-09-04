@@ -360,7 +360,27 @@ async fn relay_websocket_runs_the_authenticated_application_flow_once() {
     assert!(snapshot.provider_capabilities.iter().any(|capability| {
         capability.provider == ProviderId::Codex
             && capability.project_id == project.id
-            && capability.health.state == ProviderState::Ready
+            && capability.health.state == ProviderState::Starting
+    }));
+    send_client(
+        &mut client,
+        &ClientCommand::RefreshProjects {
+            provider: ProviderId::Codex,
+        },
+    )
+    .await;
+    let refreshed = loop {
+        if let ServerMessage::ProjectsUpdated {
+            provider: ProviderId::Codex,
+            capabilities,
+            ..
+        } = receive_server(&mut client).await
+        {
+            break capabilities;
+        }
+    };
+    assert!(refreshed.iter().any(|capability| {
+        capability.project_id == project.id && capability.health.state == ProviderState::Ready
     }));
 
     let create_id = CommandId::new();
@@ -396,6 +416,7 @@ async fn relay_websocket_runs_the_authenticated_application_flow_once() {
     let send_id = CommandId::new();
     let send = ClientCommand::SendMessage {
         command_id: send_id,
+        attempt: 0,
         conversation_id,
         client_message_id: Some("relay-e2e".to_owned()),
         text: "hello through relay".to_owned(),

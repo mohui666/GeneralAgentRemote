@@ -5,7 +5,8 @@ use std::{
 };
 
 use agent_remote_protocol::{
-    ClientCommand, DeviceId, ProtocolError, ServerMessage, decode, encode,
+    ClientCommand, ConversationId, DeviceId, ProjectId, ProtocolError, ServerMessage, decode,
+    encode,
 };
 
 use crate::app::AppService;
@@ -65,7 +66,13 @@ pub struct AuthenticatedSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandSchedule {
     Concurrent,
-    Ordered,
+    Scoped(CommandScope),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommandScope {
+    Conversation(ConversationId),
+    ProjectSync(ProjectId),
 }
 
 impl ApplicationSession {
@@ -168,15 +175,24 @@ impl ApplicationSession {
 impl AuthenticatedSession {
     pub fn schedule(bytes: &[u8]) -> CommandSchedule {
         match decode::<ClientCommand>(bytes) {
-            Ok(
-                ClientCommand::SyncProject { .. }
-                | ClientCommand::CreateConversation { .. }
-                | ClientCommand::StartConversation { .. }
-                | ClientCommand::SendMessage { .. }
-                | ClientCommand::Steer { .. }
-                | ClientCommand::SetSessionOption { .. }
-                | ClientCommand::RenameConversation { .. },
-            ) => CommandSchedule::Ordered,
+            Ok(ClientCommand::SyncProject { project_id, .. }) => {
+                CommandSchedule::Scoped(CommandScope::ProjectSync(project_id))
+            }
+            Ok(ClientCommand::StartConversation {
+                conversation_id, ..
+            })
+            | Ok(ClientCommand::SendMessage {
+                conversation_id, ..
+            })
+            | Ok(ClientCommand::Steer {
+                conversation_id, ..
+            })
+            | Ok(ClientCommand::SetSessionOption {
+                conversation_id, ..
+            })
+            | Ok(ClientCommand::RenameConversation {
+                conversation_id, ..
+            }) => CommandSchedule::Scoped(CommandScope::Conversation(conversation_id)),
             _ => CommandSchedule::Concurrent,
         }
     }

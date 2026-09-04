@@ -15,6 +15,40 @@ adb install -r dist\android\agent-remote-debug.apk
 
 The checked-in project uses Gradle Wrapper 9.4.1, Android Gradle Plugin 9.2.0, compile/target SDK 37, and minimum Android 8.0 (API 26).
 
+## AI/CLI device test driver
+
+`cargo xtask android-device` is a computer-side development driver for an explicitly connected Android device. It is not part of the Host/Relay protocol and does not expose a terminal or unrestricted device control in the product.
+
+Start with:
+
+```powershell
+cargo xtask android-device doctor --json
+cargo xtask android-device prepare --port 7437 --json
+```
+
+When multiple devices are connected, add `--serial <id>` to every command. `prepare` runs the normal debug build and Android unit tests, installs the APK with state retained, configures `adb reverse`, and launches the app. Add `--fresh` to uninstall first and deliberately clear app credentials/cache.
+
+The stable command surface is:
+
+```text
+cargo xtask android-device doctor [--serial <id>] [--json]
+cargo xtask android-device prepare [--serial <id>] [--fresh] [--port 7437] [--json]
+cargo xtask android-device inspect [--serial <id>] [--output <dir>] [--json]
+cargo xtask android-device ui dump [--serial <id>] [--json]
+cargo xtask android-device ui click --id <stable-id> [--serial <id>] [--json]
+cargo xtask android-device ui text --id <stable-id> --value <text> [--serial <id>] [--json]
+cargo xtask android-device ui wait --id <stable-id> --state <visible|gone|enabled> [--timeout <sec>] [--serial <id>] [--json]
+cargo xtask android-device scenario --name <project-tree|send|reconnect|layout|send-latency> [--mode <mock|real>] [--serial <id>] [--json]
+cargo xtask android-device logs [--serial <id>] [--duration <sec>] [--output <dir>] [--json]
+cargo xtask android-device capture [--serial <id>] [--output <dir>] [--json]
+```
+
+`ui click`, `ui text`, and `ui wait` match only exact Compose test tags exposed as UIAutomator resource IDs (or the same accessibility description); they never locate controls by translated title text. Supported application IDs are `gar.drawer.open`, `gar.project.<projectId>`, `gar.project.<projectId>.toggle`, `gar.conversation.<conversationId>`, `gar.composer.input`, `gar.composer.send`, `gar.send.retry`, and `gar.connection.status`.
+
+`inspect`, `logs`, and `capture` default to `dist/android-device/`; `--output` is always a directory. Named scenarios write fixed, replaceable evidence under `dist/android-device/scenarios/<name>/`. The layout scenario captures portrait and landscape and restores the device's original rotation settings. The reconnect scenario force-stops and relaunches only this app. Each send scenario opens the drawer when necessary, starts a new lazy conversation, submits one explicit test message, and requires the correlated `click → local_pending → websocket_write → host_received → provider_received → first_provider_event` trace. `mock` expects the already-running Host to use a test Provider setup; `real` expects a deliberately configured real Provider. The driver never silently substitutes one for the other.
+
+With `--json`, stdout contains one JSON result object. A successful command exits `0`; argument, adb, locator, scenario, or artifact failures emit `{ "ok": false, ... }` and exit `1`. Send trace output contains only IDs, stages, and elapsed milliseconds—not prompt text, tokens, credentials, or attachment contents. Set the `ADB` environment variable to select a particular adb executable; otherwise the driver uses `adb` from `PATH`.
+
 ## USB test loop
 
 USB port reversal lets a connected phone reach a Host bound only to the computer's loopback interface. Enable USB debugging, accept the computer's RSA prompt, then run:

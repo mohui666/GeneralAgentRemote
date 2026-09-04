@@ -60,6 +60,16 @@ impl AttachmentStore {
         bytes: &[u8],
         declared_mime: Option<&str>,
     ) -> Result<StoredAttachment> {
+        self.import_bytes_with_id(conversation_id, AttachmentId::new(), bytes, declared_mime)
+    }
+
+    pub fn import_bytes_with_id(
+        &self,
+        conversation_id: ConversationId,
+        id: AttachmentId,
+        bytes: &[u8],
+        declared_mime: Option<&str>,
+    ) -> Result<StoredAttachment> {
         if bytes.len() as u64 > self.max_image_bytes {
             bail!(
                 "image exceeds the configured {} byte limit",
@@ -76,7 +86,6 @@ impl AttachmentStore {
         let reader = ImageReader::with_format(BufReader::new(Cursor::new(bytes)), format);
         let image = reader.decode().context("image failed to decode")?;
         let (width, height) = image.dimensions();
-        let id = AttachmentId::new();
         let managed_path = self.root.join(format!("{id}.{extension}"));
         fs::write(&managed_path, bytes)
             .with_context(|| format!("write managed attachment {}", managed_path.display()))?;

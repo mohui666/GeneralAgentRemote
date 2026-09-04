@@ -31,8 +31,8 @@ turn/interrupt
 ```
 
 - Picker entries come from paginated `model/list`. The wire `model` ID, advertised `supportedReasoningEfforts`, `defaultReasoningEffort`, and `hidden` flag are authoritative.
-- `thread/list` requests `cli`, `vscode`, and `appServer` sources, filters by the canonical cwd, and re-checks each returned cwd.
-- Project sync reads each changed thread through `thread/read`. The installed schema exposes no incremental history cursor, so the adapter performs an idempotent full-thread read and the Host merges stable native item IDs.
+- `thread/list` requests `cli`, `vscode`, and `appServer` sources once with pagination, then the Host classifies each result by exact normalized cwd against authorized projects. Unmatched threads are excluded; absolute unmatched paths are never sent to clients.
+- Project sync imports lightweight conversation metadata only. When a conversation is opened and its history is stale, the Host uses `thread/read`; the installed schema exposes no incremental history cursor, so Codex currently returns an idempotent full-thread read whose stable native item IDs are merged locally.
 - Conversation rename uses `thread/name/set`. A locally generated first-message title remains until Codex reports a non-empty Provider title; a user title is never overwritten by later sync.
 - Prompt input accepts only the adapter-advertised PNG/JPEG/WebP/GIF set (up to four images, 10 MiB each and 10 MiB total). Permission choices are adapter capability data rather than client constants because app-server does not enumerate them.
 - `turn/steer` requires the active `expectedTurnId`; the control is unavailable when no current turn exists.
@@ -42,6 +42,8 @@ turn/interrupt
 - Unknown fields and notification methods are tolerated and kept out of user-visible state.
 
 The exact local schema was generated with `codex app-server generate-json-schema`; it takes precedence over older README examples. Experimental thread item paging, process APIs, and remote-control APIs are not used.
+
+Codex itself remains the only authority for physical session files and resolves its normal store from its own configuration or `CODEX_HOME`. GeneralAgentRemote passes the authorized project cwd to start/resume/turn calls for logical ownership and execution, but it does not create a per-project session store or scan, parse, copy, move, or rewrite `.codex/sessions`.
 
 ## Grok Build 1.0.13 and ACP v1
 

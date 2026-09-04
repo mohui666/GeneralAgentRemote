@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use agent_remote_protocol::{RelayFrame, decode, encode};
+use agent_remote_protocol::{RelayFrame, decode_relay, encode, encode_relay};
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -15,11 +15,14 @@ use uuid::Uuid;
 use crate::{
     app::AppService,
     transport::session::{
-        ApplicationSession, AuthRateLimiter, AuthenticatedSession, CommandSchedule,
+        ApplicationSession, AuthRateLimiter, AuthenticatedSession, CommandSchedule, CommandScope,
     },
 };
 
 const RELAY_SUBPROTOCOL: &str = "agent-remote-relay.cbor.v1";
+const COMMAND_QUEUE_CAPACITY: usize = 32;
+const RESPONSE_QUEUE_CAPACITY: usize = 128;
+const SCOPED_WORKER_IDLE: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct RelayClientConfig {
@@ -31,7 +34,7 @@ pub struct RelayClientConfig {
 struct RelayApplicationClient {
     generation: u64,
     session: ApplicationSession,
-    ordered_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    scoped_txs: HashMap<CommandScope, mpsc::WeakSender<Vec<u8>>>,
 }
 
 struct RelayCommandResponse {
@@ -94,7 +97,7 @@ pub async fn run_once(service: Arc<AppService>, config: &RelayClientConfig) -> R
     let limiter = Arc::new(AuthRateLimiter::default());
     let mut clients: HashMap<Uuid, RelayApplicationClient> = HashMap::new();
     let mut next_client_generation = 0_u64;
-    let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+    let (response_tx, mut response_rx) = mpsc::channel(RESPONSE_QUEUE_CAPACITY);
     let mut updates = service.subscribe();
     loop {
         tokio::select! {
@@ -102,7 +105,7 @@ pub async fn run_once(service: Arc<AppService>, config: &RelayClientConfig) -> R
                 let Some(incoming) = incoming else { bail!("relay closed the WebSocket") };
                 match incoming? {
                     Message::Binary(bytes) => {
-                        let frame = decode::<RelayFrame>(&bytes)?;
+                        let frame = decode_relay(&bytes)?;
                         match frame {
                             RelayFrame::OpenClient { host_id, connection_id } if host_id == service.host_id() => {
                                 next_client_generation += 1;
@@ -113,7 +116,7 @@ pub async fn run_once(service: Arc<AppService>, config: &RelayClientConfig) -> R
                                         Arc::clone(&limiter),
                                         format!("relay:{connection_id}"),
                                     ),
-                                    ordered_tx: None,
+                                    scoped_txs: HashMap::new(),
                                 });
                                 send_frame(&mut sink, RelayFrame::ClientOpened { connection_id }).await?;
                             }
@@ -130,20 +133,30 @@ pub async fn run_once(service: Arc<AppService>, config: &RelayClientConfig) -> R
                                                         connection_id,
                                                         generation,
                                                         payload,
-                                                    });
+                                                    }).await;
                                                 });
                                             }
-                                            CommandSchedule::Ordered => {
-                                                let ordered_tx = client.ordered_tx.get_or_insert_with(|| {
-                                                    spawn_ordered_worker(
+                                            CommandSchedule::Scoped(scope) => {
+                                                client.scoped_txs.retain(|_, sender| sender.strong_count() > 0);
+                                                let scoped_tx = client.scoped_txs
+                                                    .get(&scope)
+                                                    .and_then(mpsc::WeakSender::upgrade)
+                                                    .unwrap_or_else(|| {
+                                                        let sender = spawn_scoped_worker(
                                                         authenticated,
                                                         connection_id,
                                                         generation,
                                                         response_tx.clone(),
-                                                    )
-                                                });
-                                                if ordered_tx.send(payload).is_err() {
+                                                        );
+                                                        client.scoped_txs.insert(scope, sender.downgrade());
+                                                        sender
+                                                    });
+                                                if scoped_tx.try_send(payload).is_err() {
                                                     clients.remove(&connection_id);
+                                                    send_frame(&mut sink, RelayFrame::Close {
+                                                        connection_id,
+                                                        reason: "command scope queue is full; reconnect and retry unacknowledged commands".to_owned(),
+                                                    }).await?;
                                                 }
                                             }
                                         }
@@ -219,21 +232,52 @@ pub async fn run_once(service: Arc<AppService>, config: &RelayClientConfig) -> R
     }
 }
 
-fn spawn_ordered_worker(
+fn spawn_scoped_worker(
     session: AuthenticatedSession,
     connection_id: Uuid,
     generation: u64,
-    response_tx: mpsc::UnboundedSender<RelayCommandResponse>,
-) -> mpsc::UnboundedSender<Vec<u8>> {
-    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    response_tx: mpsc::Sender<RelayCommandResponse>,
+) -> mpsc::Sender<Vec<u8>> {
+    let (command_tx, mut command_rx) = mpsc::channel::<Vec<u8>>(COMMAND_QUEUE_CAPACITY);
+    let keepalive = command_tx.clone();
     tokio::spawn(async move {
-        while let Some(payload) = command_rx.recv().await {
-            let payload = session.process(&payload).await;
-            let _ = response_tx.send(RelayCommandResponse {
-                connection_id,
-                generation,
-                payload,
-            });
+        let _keepalive = keepalive;
+        loop {
+            match tokio::time::timeout(SCOPED_WORKER_IDLE, command_rx.recv()).await {
+                Ok(Some(payload)) => {
+                    let payload = session.process(&payload).await;
+                    if response_tx
+                        .send(RelayCommandResponse {
+                            connection_id,
+                            generation,
+                            payload,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    command_rx.close();
+                    while let Some(payload) = command_rx.recv().await {
+                        let payload = session.process(&payload).await;
+                        if response_tx
+                            .send(RelayCommandResponse {
+                                connection_id,
+                                generation,
+                                payload,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    break;
+                }
+            }
         }
     });
     command_tx
@@ -254,7 +298,8 @@ where
     S: futures_util::Sink<Message> + Unpin,
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    sink.send(Message::Binary(encode(&frame)?.into())).await?;
+    sink.send(Message::Binary(encode_relay(&frame)?.into()))
+        .await?;
     Ok(())
 }
 
@@ -268,7 +313,7 @@ where
             .await
             .context("relay closed during registration")??
         {
-            Message::Binary(bytes) => return Ok(decode(&bytes)?),
+            Message::Binary(bytes) => return Ok(decode_relay(&bytes)?),
             Message::Ping(_) | Message::Pong(_) => continue,
             Message::Close(_) => bail!("relay closed during registration"),
             Message::Text(_) | Message::Frame(_) => {
