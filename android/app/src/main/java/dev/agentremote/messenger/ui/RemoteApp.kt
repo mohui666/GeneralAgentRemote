@@ -13,6 +13,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -47,6 +48,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
@@ -101,11 +104,14 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -115,6 +121,7 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -123,6 +130,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.window.Dialog
@@ -394,6 +402,9 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
     }
     var menuExpanded by rememberSaveable { mutableStateOf(false) }
     var sortMode by rememberSaveable { mutableStateOf(HomeSort.AGENT) }
+    var searchOpen by rememberSaveable(
+        state.activeHostId, state.selectedProvider, state.selectedProjectId, state.selectedConversationId,
+    ) { mutableStateOf(false) }
 
     ModalNavigationDrawer(
         drawerState = drawerState,
@@ -435,6 +446,7 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
                     title = if (state.showingNewConversation) "新对话" else "会话",
                     subtitle = listOfNotNull(state.selectedProvider?.label, snapshot.projects.find { it.id == state.selectedProjectId }?.displayName).joinToString(" · "),
                     onRename = viewModel::renameConversation,
+                    onSearch = { searchOpen = !searchOpen },
                     online = state.online,
                     menuExpanded = menuExpanded,
                     sortMode = sortMode,
@@ -464,7 +476,9 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
             Box(Modifier.fillMaxSize().padding(padding)) {
                 when {
                     state.showingNewConversation -> NewConversationScreen(state, viewModel)
-                    selectedConversation != null -> ConversationScreen(state, selectedConversation, viewModel)
+                    selectedConversation != null -> ConversationScreen(
+                        state, selectedConversation, viewModel, searchOpen, onCloseSearch = { searchOpen = false },
+                    )
                     else -> RemoteHomeScreen(state, sortMode, viewModel, viewModel::toggleProjectExpanded)
                 }
             }
@@ -473,6 +487,8 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
     BackHandler(enabled = drawerState.isOpen || state.showingNewConversation || selectedConversation != null) {
         if (drawerState.isOpen) {
             scope.launch { drawerState.close() }
+        } else if (searchOpen) {
+            searchOpen = false
         } else {
             viewModel.showConversationList()
         }
@@ -968,6 +984,7 @@ private fun RemoteTopBar(
     title: String,
     subtitle: String,
     onRename: (String) -> Unit,
+    onSearch: () -> Unit,
     online: Boolean,
     menuExpanded: Boolean,
     sortMode: HomeSort,
@@ -998,6 +1015,12 @@ private fun RemoteTopBar(
                     Text(subtitle.ifBlank { hostName }, color = RemoteMuted, style = MaterialTheme.typography.labelSmall,
                         maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
+            }
+            if (conversation != null) {
+                FloatingIconButton(
+                    RemoteGlyph.Search, "搜索当前对话", onSearch,
+                    modifier = Modifier.testTag("gar.timeline.search.open"),
+                )
             }
             Box(Modifier.padding(8.dp).testTag("gar.connection.status").semantics {
                 contentDescription = "$hostName · ${if (online) "在线" else "离线"}"
@@ -1367,6 +1390,8 @@ private fun ConversationScreen(
     state: RemoteUiState,
     conversation: Conversation,
     viewModel: RemoteViewModel,
+    searchOpen: Boolean,
+    onCloseSearch: () -> Unit,
 ) {
     val snapshot = requireNotNull(state.snapshot)
     val capability = remember(snapshot.providerCapabilities, conversation.projectId, conversation.provider) {
@@ -1375,21 +1400,66 @@ private fun ConversationScreen(
         }
     }
     val timeline = state.timelineByConversation[conversation.id].orEmpty()
-    val timelineGrouper = remember(conversation.id) { TimelineBlockGrouper() }
+    val conversationScope = "${snapshot.hostId}/${conversation.provider.wire}/${conversation.projectId}/${conversation.id}"
+    val timelineGrouper = remember(conversationScope) { TimelineBlockGrouper() }
     val timelineBlocks = remember(timeline) { timelineGrouper.update(timeline) }
-    val listState = rememberSaveable(conversation.id, saver = LazyListState.Saver) { LazyListState() }
+    val listState = rememberSaveable(conversationScope, saver = LazyListState.Saver) { LazyListState() }
     val scrollScope = rememberCoroutineScope()
-    var followingTail by remember(conversation.id) { mutableStateOf(true) }
+    var followingTail by remember(conversationScope) { mutableStateOf(true) }
+    var navigatingHistory by remember(conversationScope) { mutableStateOf(false) }
+    val dragging by listState.interactionSource.collectIsDraggedAsState()
+    val currentlyDragging by rememberUpdatedState(dragging)
+    val currentlySearching by rememberUpdatedState(searchOpen)
+    var query by rememberSaveable(conversationScope) { mutableStateOf("") }
+    var selectedMatch by rememberSaveable(conversationScope) { mutableStateOf<String?>(null) }
+    val matches = remember(timeline, query) { messageSearchMatches(timeline, query) }
+    val matchIndex = matches.indexOfFirst { it.toString() == selectedMatch }.coerceAtLeast(0)
+    val activeMatch = if (searchOpen) matches.getOrNull(matchIndex) else null
+    val approvals = remember(timeline, conversation.running) { unresolvedApprovalItems(timeline, conversation.running) }
+    val compactSearch = searchOpen && LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val openApproval = {
+        navigatingHistory = true
+        onCloseSearch()
+        followingTail = false
+        val index = approvals.firstOrNull()?.let { timelineBlockIndex(timelineBlocks, it.id) } ?: -1
+        if (index >= 0) scrollScope.launch { listState.animateScrollToItem(index + 1) }
+        Unit
+    }
+    val approvalUnavailableReason = when {
+        !conversation.running -> "本轮已结束，无法再确认"
+        !state.online -> "连接后可确认"
+        else -> null
+    }
+    val tail = timeline.lastOrNull()?.let { it.id to it.revision }
+    var lastReadTail by remember(conversationScope) { mutableStateOf(tail) }
+    val hasNewContent = lastReadTail != null && tail != lastReadTail
+    LaunchedEffect(tail, followingTail) {
+        if (followingTail) lastReadTail = tail
+    }
     LaunchedEffect(listState) {
-        snapshotFlow { listState.isScrollInProgress to !listState.canScrollForward }
+        snapshotFlow { Triple(currentlyDragging, !listState.canScrollForward, currentlySearching) }
             .distinctUntilChanged()
-            .collect { (scrolling, atBottom) ->
-                if (scrolling) followingTail = atBottom else if (atBottom) followingTail = true
+            .collect { (isDragging, atBottom, searching) ->
+                if (searching) followingTail = false
+                else if (isDragging) {
+                    navigatingHistory = false
+                    followingTail = atBottom
+                } else if (atBottom && !navigatingHistory) followingTail = true
             }
     }
-    LaunchedEffect(timelineBlocks.lastOrNull()?.key, timeline.lastOrNull()?.revision) {
-        if (followingTail && timelineBlocks.isNotEmpty()) {
+    LaunchedEffect(timelineBlocks.lastOrNull()?.key, timeline.lastOrNull()?.revision, searchOpen) {
+        if (followingTail && !searchOpen && timelineBlocks.isNotEmpty()) {
             listState.scrollToItem(timelineBlocks.size + 1)
+        }
+    }
+    LaunchedEffect(activeMatch) {
+        activeMatch?.let { itemId ->
+            val index = timelineBlockIndex(timelineBlocks, itemId)
+            if (index >= 0) {
+                navigatingHistory = true
+                followingTail = false
+                listState.animateScrollToItem(index + 1)
+            }
         }
     }
     Column(
@@ -1397,6 +1467,31 @@ private fun ConversationScreen(
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
     ) {
+        if (searchOpen) {
+            ConversationSearchBar(
+                query = query,
+                onQuery = { query = it; selectedMatch = null },
+                matchIndex = matchIndex,
+                matchCount = matches.size,
+                onPrevious = { selectedMatch = matches[(matchIndex - 1 + matches.size) % matches.size].toString() },
+                onNext = { selectedMatch = matches[(matchIndex + 1) % matches.size].toString() },
+                onClose = onCloseSearch,
+                approvalCount = approvals.size,
+                onApproval = openApproval,
+            )
+        }
+        if (approvals.isNotEmpty() && !compactSearch) {
+            Row(
+                Modifier.fillMaxWidth().background(RemoteWarning.copy(alpha = 0.08f))
+                    .padding(start = 18.dp, end = 8.dp).testTag("gar.timeline.approvals"),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("${approvals.size} 项等待确认", color = RemoteWarning, modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.labelMedium)
+                TextButton(onClick = openApproval,
+                    modifier = Modifier.testTag("gar.timeline.approvals.open")) { Text("查看") }
+            }
+        }
         if (timeline.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -1438,21 +1533,29 @@ private fun ConversationScreen(
                                     state.attachments[it.attachmentId]
                                 },
                                 approvalPending = (block.item.content as? TimelineContent.Approval)?.approvalId in state.pendingApprovals,
+                                approvalUnavailableReason = approvalUnavailableReason,
+                                highlighted = block.item.id == activeMatch,
                                 onApproval = viewModel::resolveApproval,
                             )
                             is TimelineBlock.Activity -> ActivityTimelineCard(
                                 items = block.items,
                                 attachments = state.attachments,
                                 pendingApprovals = state.pendingApprovals,
+                                approvalUnavailableReason = approvalUnavailableReason,
                                 onApproval = viewModel::resolveApproval,
                             )
                         }
                     }
                     item("timeline-end") { Spacer(Modifier.height(1.dp)) }
                 }
-                if (!followingTail && listState.canScrollForward) {
+                if ((!followingTail || searchOpen) && listState.canScrollForward) {
                     OutlinedButton(
-                        onClick = { followingTail = true; scrollScope.launch { listState.animateScrollToItem(timelineBlocks.size + 1) } },
+                        onClick = {
+                            navigatingHistory = false
+                            onCloseSearch()
+                            followingTail = true
+                            scrollScope.launch { listState.animateScrollToItem(timelineBlocks.size + 1) }
+                        },
                         modifier = Modifier.align(Alignment.BottomEnd).padding(12.dp).testTag("gar.timeline.latest"),
                         shape = RoundedCornerShape(10.dp),
                         colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(containerColor = RemoteSurface),
@@ -1460,7 +1563,7 @@ private fun ConversationScreen(
                     ) {
                         RemoteIcon(RemoteGlyph.Latest, null, Modifier.size(16.dp))
                         Spacer(Modifier.width(6.dp))
-                        Text("最新消息", style = MaterialTheme.typography.labelMedium)
+                        Text(if (hasNewContent) "有新内容 ↓" else "回到最新", style = MaterialTheme.typography.labelMedium)
                     }
                 }
                 CodexScrollbar(
@@ -1469,7 +1572,7 @@ private fun ConversationScreen(
                 )
             }
         }
-        Composer(
+        if (!compactSearch) Composer(
             draft = state.draft,
             running = conversation.running,
             online = state.online,
@@ -1494,6 +1597,82 @@ private fun ConversationScreen(
             onAttachments = viewModel::addPromptAttachments,
             onRemoveAttachment = viewModel::removePromptAttachment,
         )
+    }
+}
+
+@Composable
+private fun ConversationSearchBar(
+    query: String,
+    onQuery: (String) -> Unit,
+    matchIndex: Int,
+    matchCount: Int,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit,
+    onClose: () -> Unit,
+    approvalCount: Int,
+    onApproval: () -> Unit,
+) {
+    val focusRequester = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    val compact = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    LaunchedEffect(Unit) { focusRequester.requestFocus() }
+    val searchField: @Composable (Modifier) -> Unit = { modifier ->
+        OutlinedTextField(
+            value = query,
+            onValueChange = onQuery,
+            placeholder = { Text("搜索已加载消息") },
+            singleLine = true,
+            leadingIcon = { RemoteIcon(RemoteGlyph.Search, null, Modifier.size(18.dp), RemoteMuted) },
+            trailingIcon = {
+                IconButton(onClick = { keyboard?.hide(); onClose() }, modifier = Modifier.testTag("gar.timeline.search.close")) {
+                    RemoteIcon(RemoteGlyph.Close, "关闭搜索", Modifier.size(20.dp), RemoteMuted)
+                }
+            },
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+            keyboardActions = KeyboardActions(onSearch = { keyboard?.hide() }),
+            modifier = modifier.focusRequester(focusRequester).testTag("gar.timeline.search.input"),
+        )
+    }
+    val controls: @Composable (Modifier) -> Unit = { modifier ->
+        Row(modifier, verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                when {
+                    query.isBlank() -> if (compact) "已加载消息" else "搜索已加载的用户和 Agent 消息"
+                    matchCount == 0 -> if (compact) "无匹配" else "已加载消息中没有匹配项"
+                    compact -> "${matchIndex + 1}/$matchCount · 已加载"
+                    else -> "${matchIndex + 1} / $matchCount 条匹配 · 已加载消息"
+                },
+                modifier = Modifier.weight(1f).testTag("gar.timeline.search.count"),
+                color = RemoteMuted,
+                style = MaterialTheme.typography.labelSmall,
+            )
+            IconButton(onClick = { keyboard?.hide(); onPrevious() }, enabled = matchCount > 0,
+                modifier = Modifier.testTag("gar.timeline.search.previous")) {
+                RemoteIcon(RemoteGlyph.Send, "上一条匹配", Modifier.size(18.dp), RemoteMuted)
+            }
+            IconButton(onClick = { keyboard?.hide(); onNext() }, enabled = matchCount > 0,
+                modifier = Modifier.testTag("gar.timeline.search.next")) {
+                RemoteIcon(RemoteGlyph.Latest, "下一条匹配", Modifier.size(18.dp), RemoteMuted)
+            }
+            if (compact && approvalCount > 0) {
+                TextButton(onClick = { keyboard?.hide(); onApproval() },
+                    modifier = Modifier.testTag("gar.timeline.approvals.open")) {
+                    Text("确认 $approvalCount", color = RemoteWarning)
+                }
+            }
+        }
+    }
+    if (compact) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            searchField(Modifier.weight(1f))
+            controls(Modifier.width(if (approvalCount > 0) 250.dp else 180.dp).padding(start = 8.dp))
+        }
+    } else {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
+            searchField(Modifier.fillMaxWidth())
+            controls(Modifier.fillMaxWidth())
+        }
     }
 }
 
@@ -2152,6 +2331,7 @@ private fun ActivityTimelineCard(
     items: List<TimelineItem>,
     attachments: Map<UUID, ByteArray>,
     pendingApprovals: Set<UUID>,
+    approvalUnavailableReason: String?,
     onApproval: (UUID, String) -> Unit,
 ) {
     var expanded by rememberSaveable(items.first().id) { mutableStateOf(false) }
@@ -2193,6 +2373,7 @@ private fun ActivityTimelineCard(
                                 attachments[it.attachmentId]
                             },
                             approvalPending = (item.content as? TimelineContent.Approval)?.approvalId in pendingApprovals,
+                            approvalUnavailableReason = approvalUnavailableReason,
                             onApproval = onApproval,
                         )
                     }
@@ -2208,44 +2389,52 @@ private fun TimelineCard(
     providerLabel: String = "Agent",
     attachment: ByteArray?,
     approvalPending: Boolean,
+    approvalUnavailableReason: String? = null,
+    highlighted: Boolean = false,
     onApproval: (UUID, String) -> Unit,
 ) {
-    when (val content = item.content) {
-        is TimelineContent.UserMessage -> MessageBubble(content.text, user = true, messageId = item.id, createdAtMs = item.createdAtMs)
-        is TimelineContent.AgentMessage -> MessageBubble(
-            text = content.text,
-            user = false,
-            messageId = item.id,
-            createdAtMs = item.createdAtMs,
-            label = when (content.phase) {
-                "final" -> providerLabel
-                "reasoning_summary" -> "推理摘要"
-                else -> providerLabel
-            },
-        )
-        is TimelineContent.Progress -> GenericTimelineCard(
-            title = "${content.kind} · ${content.label}",
-            status = content.status,
-            body = content.detail,
-        )
-        is TimelineContent.Plan -> GenericTimelineCard(
-            title = "计划",
-            body = content.steps.joinToString("\n") { "${statusMark(it.status)} ${it.text}" },
-        )
-        is TimelineContent.ToolCall -> ToolTimelineCard(content)
-        is TimelineContent.Command -> CodeTimelineCard(content)
-        is TimelineContent.FileChange -> GenericTimelineCard(
-            title = "文件 · ${content.changeKind}",
-            status = content.status,
-            body = content.relativePath,
-        )
-        is TimelineContent.Approval -> ApprovalCard(content, approvalPending, onApproval)
-        is TimelineContent.Image -> ImageCard(content.alt, attachment)
-        is TimelineContent.Error -> GenericTimelineCard(
-            title = "错误 · ${content.code}",
-            body = content.message,
-            error = true,
-        )
+    Column(
+        if (highlighted) Modifier.fillMaxWidth()
+            .border(1.dp, RemoteAccent, RoundedCornerShape(10.dp)).padding(6.dp)
+            .testTag("gar.timeline.search.match.${item.id}") else Modifier.fillMaxWidth(),
+    ) {
+        when (val content = item.content) {
+            is TimelineContent.UserMessage -> MessageBubble(content.text, user = true, messageId = item.id, createdAtMs = item.createdAtMs)
+            is TimelineContent.AgentMessage -> MessageBubble(
+                text = content.text,
+                user = false,
+                messageId = item.id,
+                createdAtMs = item.createdAtMs,
+                label = when (content.phase) {
+                    "final" -> providerLabel
+                    "reasoning_summary" -> "推理摘要"
+                    else -> providerLabel
+                },
+            )
+            is TimelineContent.Progress -> GenericTimelineCard(
+                title = "${content.kind} · ${content.label}",
+                status = content.status,
+                body = content.detail,
+            )
+            is TimelineContent.Plan -> GenericTimelineCard(
+                title = "计划",
+                body = content.steps.joinToString("\n") { "${statusMark(it.status)} ${it.text}" },
+            )
+            is TimelineContent.ToolCall -> ToolTimelineCard(content)
+            is TimelineContent.Command -> CodeTimelineCard(content)
+            is TimelineContent.FileChange -> GenericTimelineCard(
+                title = "文件 · ${content.changeKind}",
+                status = content.status,
+                body = content.relativePath,
+            )
+            is TimelineContent.Approval -> ApprovalCard(content, approvalPending, approvalUnavailableReason, onApproval)
+            is TimelineContent.Image -> ImageCard(content.alt, attachment)
+            is TimelineContent.Error -> GenericTimelineCard(
+                title = "错误 · ${content.code}",
+                body = content.message,
+                error = true,
+            )
+        }
     }
 }
 
@@ -2403,6 +2592,7 @@ private fun CodeTimelineCard(content: TimelineContent.Command) {
 private fun ApprovalCard(
     content: TimelineContent.Approval,
     pending: Boolean,
+    unavailableReason: String?,
     onApproval: (UUID, String) -> Unit,
 ) {
     Surface(
@@ -2412,7 +2602,11 @@ private fun ApprovalCard(
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(17.dp), verticalArrangement = Arrangement.spacedBy(11.dp)) {
-            Text(if (content.resolvedOption == null) "等待你的确认" else "已处理", color = RemoteWarning, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.titleMedium)
+            Text(when {
+                content.resolvedOption != null -> "已处理"
+                unavailableReason != null -> unavailableReason
+                else -> "等待你的确认"
+            }, color = RemoteWarning, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.titleMedium)
             Text(content.prompt)
             if (content.resolvedOption != null) {
                 Text("已选择：${content.options.find { it.id == content.resolvedOption }?.label ?: content.resolvedOption}", color = RemoteMuted, fontWeight = FontWeight.Medium)
@@ -2420,7 +2614,7 @@ private fun ApprovalCard(
                 content.options.forEach { option ->
                     OutlinedButton(
                         onClick = { onApproval(content.approvalId, option.id) },
-                        enabled = !pending,
+                        enabled = !pending && unavailableReason == null,
                         modifier = Modifier.fillMaxWidth().height(48.dp),
                         shape = RoundedCornerShape(12.dp),
                         border = BorderStroke(1.dp, RemoteWarning.copy(alpha = 0.4f)),

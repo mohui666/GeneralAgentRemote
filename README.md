@@ -15,6 +15,8 @@
 - 模型、effort、权限模式和附件限制全部来自当前 Provider capability
 - 实时显示消息；计划、工具、命令、文件变化、审批和错误归并为可折叠活动
 - 支持追加指令、停止任务、局域网直连和公网 Relay
+- Web 与 Android 支持当前对话内搜索、命中定位、阅读历史时的新内容提示，以及未处理审批直达入口
+- Web 代码块可单独复制；ACP 图片输入按当前 Agent 实际能力开放（含 Grok 1.0.13 能力漏报修正）
 
 ```text
 Android / Browser ── Direct WebSocket ───────────────┐
@@ -165,3 +167,5 @@ Codex 和 OpenCode 的 Host 真实回合勾选来自 2026-09-04 的既有记录�
 ## 文档
 
 [Host 设置](docs/setup.md) · [Android](docs/android.md) · [公网 Relay](docs/public-relay.md) · [架构](docs/architecture.md) · [Provider 兼容性](docs/provider-compatibility.md)
+
+本轮交互改进、同类产品参考与验证边界见 [聊天体验改进](docs/chat-ux.md)。

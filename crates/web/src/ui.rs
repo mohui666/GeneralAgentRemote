@@ -20,7 +20,7 @@ use yew::{Component, Context, Html, InputEvent, MouseEvent, NodeRef, TargetCast,
 use crate::{
     ConversationSortMode, DraftScope, conversation_belongs_to_project, draft_scope,
     increment_send_attempt, is_collapsible_activity, markdown_to_safe_html,
-    retryable_send_rejection, sort_conversations,
+    retryable_send_rejection, sort_conversations, timeline_item_matches_query,
 };
 
 const CREDENTIALS_KEY: &str = "agent_remote_credentials_v1";
@@ -201,6 +201,13 @@ pub struct App {
     timeline_ref: NodeRef,
     follow_timeline_tail: bool,
     timeline_anchor: Option<TimelineAnchor>,
+    unread_timeline_items: HashSet<TimelineItemId>,
+    timeline_search_open: bool,
+    timeline_search: String,
+    timeline_search_ref: NodeRef,
+    focus_timeline_search: bool,
+    selected_search_result: Option<TimelineItemId>,
+    timeline_jump_target: Option<TimelineItemId>,
     copy_feedback: Option<String>,
     sync_in_flight: HashMap<CommandId, ProjectTreeScope>,
     refresh_in_flight: HashSet<ProviderId>,
@@ -244,6 +251,11 @@ pub enum Msg {
     CloseSessionSettings,
     TimelineScrolled,
     JumpToLatest,
+    OpenTimelineSearch,
+    CloseTimelineSearch,
+    TimelineSearchChanged(String),
+    NavigateTimelineSearch(bool),
+    JumpToItem(TimelineItemId),
     CopyFinished(bool),
     DismissFeedback,
     CloseOverlays,
@@ -419,6 +431,13 @@ impl Component for App {
             timeline_ref: NodeRef::default(),
             follow_timeline_tail: true,
             timeline_anchor: None,
+            unread_timeline_items: HashSet::new(),
+            timeline_search_open: false,
+            timeline_search: String::new(),
+            timeline_search_ref: NodeRef::default(),
+            focus_timeline_search: false,
+            selected_search_result: None,
+            timeline_jump_target: None,
             copy_feedback: None,
             sync_in_flight: HashMap::new(),
             refresh_in_flight: HashSet::new(),
@@ -487,6 +506,7 @@ impl Component for App {
             });
             return true;
         }
+        let previous_scope = self.current_draft_scope();
         match message {
             Msg::Opened(generation) => {
                 if generation != self.connection_generation {
@@ -730,7 +750,7 @@ impl Component for App {
                     .timeline_ref
                     .cast::<HtmlElement>()
                     .is_some_and(|element| element.scroll_top() <= 48);
-                if near_top && !self.follow_timeline_tail {
+                if near_top && !self.follow_timeline_tail && !self.timeline_search_open {
                     self.load_older();
                 } else if was_following == self.follow_timeline_tail {
                     return false;
@@ -739,6 +759,37 @@ impl Component for App {
             Msg::JumpToLatest => {
                 self.follow_timeline_tail = true;
                 self.timeline_anchor = None;
+                self.timeline_jump_target = None;
+                self.unread_timeline_items.clear();
+            }
+            Msg::OpenTimelineSearch => {
+                self.timeline_search_open = self.selected_conversation.is_some();
+                self.focus_timeline_search = self.timeline_search_open;
+            }
+            Msg::CloseTimelineSearch => self.close_timeline_search(),
+            Msg::TimelineSearchChanged(query) => {
+                self.timeline_search = query;
+                self.selected_search_result = self.timeline_search_results().first().copied();
+                self.queue_timeline_jump(self.selected_search_result);
+            }
+            Msg::NavigateTimelineSearch(previous) => {
+                let results = self.timeline_search_results();
+                if !results.is_empty() {
+                    let current = self
+                        .selected_search_result
+                        .and_then(|selected| results.iter().position(|id| *id == selected));
+                    let next = match current {
+                        Some(index) if previous => (index + results.len() - 1) % results.len(),
+                        Some(index) => (index + 1) % results.len(),
+                        None if previous => results.len() - 1,
+                        None => 0,
+                    };
+                    self.selected_search_result = Some(results[next]);
+                    self.queue_timeline_jump(self.selected_search_result);
+                }
+            }
+            Msg::JumpToItem(item_id) => {
+                self.queue_timeline_jump(Some(item_id));
             }
             Msg::DismissFeedback => self.copy_feedback = None,
             Msg::CloseOverlays => {
@@ -747,6 +798,7 @@ impl Component for App {
                 self.sidebar_open = false;
                 self.fullscreen_image = None;
                 self.editing_title = false;
+                self.close_timeline_search();
                 if let Some(document) = window().and_then(|browser| browser.document())
                     && let Ok(Some(menu)) = document.query_selector(".host-switcher[open]")
                 {
@@ -990,6 +1042,12 @@ impl Component for App {
             Msg::CloseImage => self.fullscreen_image = None,
             Msg::CopyText(_) | Msg::PersistCache(_) | Msg::FlushCache => unreachable!(),
         }
+        if previous_scope != self.current_draft_scope() {
+            self.close_timeline_search();
+            self.unread_timeline_items.clear();
+            self.timeline_jump_target = None;
+            self.timeline_anchor = None;
+        }
         self.schedule_cache_persist(context);
         true
     }
@@ -1011,9 +1069,14 @@ impl Component for App {
             .and_then(|id| snapshot.projects.iter().find(|project| project.id == id));
         let providers = available_providers(snapshot);
         html! {
-            <main class={classes!("app-shell", self.sidebar_collapsed.then_some("sidebar-collapsed"))} onkeydown={link.batch_callback(|event: web_sys::KeyboardEvent| {
-                (event.key() == "Escape").then_some(Msg::CloseOverlays)
-            })}>
+            <main class={classes!("app-shell", self.sidebar_collapsed.then_some("sidebar-collapsed"))} onkeydown={link.batch_callback({ let has_conversation = self.selected_conversation.is_some(); move |event: web_sys::KeyboardEvent| {
+                if has_conversation && (event.ctrl_key() || event.meta_key()) && event.key().eq_ignore_ascii_case("f") {
+                    event.prevent_default();
+                    Some(Msg::OpenTimelineSearch)
+                } else {
+                    (event.key() == "Escape").then_some(Msg::CloseOverlays)
+                }
+            }})}>
                 {if self.sidebar_open { html! {<button class="drawer-scrim" aria-label="关闭侧边栏" onclick={link.callback(|_| Msg::CloseSidebar)}></button>} } else {html! {}}}
                 <aside class={classes!("sidebar", self.sidebar_open.then_some("open"))}>
                     <details key={snapshot.host_id.to_string()} class="host-switcher">
@@ -1078,7 +1141,15 @@ impl Component for App {
 
     fn rendered(&mut self, _context: &Context<Self>, _first_render: bool) {
         self.restore_timeline_anchor();
+        self.apply_timeline_jump();
         self.scroll_timeline_to_tail();
+        if self.focus_timeline_search {
+            self.focus_timeline_search = false;
+            if let Some(input) = self.timeline_search_ref.cast::<HtmlInputElement>() {
+                let _ = input.focus();
+                input.select();
+            }
+        }
     }
 
     fn destroy(&mut self, _context: &Context<Self>) {
@@ -1649,10 +1720,18 @@ impl App {
                     TimelineItemKind::Image { attachment_id, .. } => Some(*attachment_id),
                     _ => None,
                 };
+                let reading_history = self.selected_conversation == Some(item.conversation_id)
+                    && !self.follow_timeline_tail;
+                if reading_history {
+                    self.timeline_anchor = self.capture_timeline_anchor(item.conversation_id);
+                }
                 let changed = self.snapshot.as_mut().is_some_and(|snapshot| {
                     upsert_timeline_item(&mut snapshot.timeline, item.clone())
                 });
                 if changed {
+                    if reading_history {
+                        self.unread_timeline_items.insert(item.id);
+                    }
                     upsert_timeline_item(
                         self.timeline_by_conversation
                             .entry(item.conversation_id)
@@ -2105,6 +2184,52 @@ impl App {
         };
         let remaining = element.scroll_height() - element.scroll_top() - element.client_height();
         self.follow_timeline_tail = remaining <= 72;
+        if self.follow_timeline_tail {
+            self.unread_timeline_items.clear();
+        }
+    }
+
+    fn close_timeline_search(&mut self) {
+        self.timeline_search_open = false;
+        self.timeline_search.clear();
+        self.selected_search_result = None;
+        self.focus_timeline_search = false;
+    }
+
+    fn timeline_search_results(&self) -> Vec<TimelineItemId> {
+        self.selected_conversation
+            .and_then(|id| self.timeline_by_conversation.get(&id))
+            .into_iter()
+            .flatten()
+            .filter(|item| timeline_item_matches_query(&item.kind, &self.timeline_search))
+            .map(|item| item.id)
+            .collect()
+    }
+
+    fn queue_timeline_jump(&mut self, item_id: Option<TimelineItemId>) {
+        if let Some(item_id) = item_id {
+            self.follow_timeline_tail = false;
+            self.timeline_anchor = None;
+            self.timeline_jump_target = Some(item_id);
+        }
+    }
+
+    fn apply_timeline_jump(&mut self) {
+        let Some(item_id) = self.timeline_jump_target.take() else {
+            return;
+        };
+        if let Some(timeline) = self.timeline_ref.cast::<HtmlElement>()
+            && let Ok(Some(item)) =
+                timeline.query_selector(&format!("[data-timeline-id='{item_id}']"))
+        {
+            if let Ok(Some(group)) = item.closest(".activity-group") {
+                let _ = group.set_attribute("open", "");
+            }
+            let top = item.get_bounding_client_rect().top()
+                - timeline.get_bounding_client_rect().top()
+                + f64::from(timeline.scroll_top());
+            timeline.set_scroll_top((top - 20.0).max(0.0).round() as i32);
+        }
     }
 
     fn load_older(&mut self) {
@@ -3082,6 +3207,23 @@ impl App {
         });
         let running = conversation.state == ConversationState::Running
             || conversation.state == ConversationState::NeedsApproval;
+        let items = self
+            .timeline_by_conversation
+            .get(&conversation.id)
+            .map_or(&[][..], Vec::as_slice);
+        let unresolved_approvals = items
+            .iter()
+            .filter(|item| {
+                running
+                    && matches!(
+                        &item.kind,
+                        TimelineItemKind::Approval {
+                            resolved_option: None,
+                            ..
+                        }
+                    )
+            })
+            .collect::<Vec<_>>();
         html! {
             <>
                 <header class="chat-header">
@@ -3091,19 +3233,75 @@ impl App {
                             {if self.editing_title {html! {<div class="title-editor"><input value={self.title_draft.clone()} maxlength="80" oninput={link.callback(|event: InputEvent| Msg::TitleChanged(event.target_unchecked_into::<HtmlInputElement>().value()))}/><button onclick={link.callback(|_| Msg::SaveTitle)}>{"保存"}</button></div>}} else {html! {<button class="title-button" onclick={link.callback(|_| Msg::EditTitle)}><h1>{&conversation.title}</h1><span>{icon("edit")}</span></button>}}}
                         </div>
                         <div class="header-controls">
+                            <button class="header-action" aria-label="搜索当前对话" title="搜索当前对话 (Ctrl/Cmd+F)" aria-expanded={self.timeline_search_open.to_string()} onclick={link.callback(|_| Msg::OpenTimelineSearch)}>{icon("search")}</button>
                             <span class={classes!("state-pill", state_class(conversation.state))}>{state_label(conversation.state)}</span>
                         </div>
                     </div>
+                    {self.view_timeline_search(link, conversation.id)}
+                    {unresolved_approvals.first().map(|item| {
+                        let item_id = item.id;
+                        html! {<button class="pending-approval-banner" onclick={link.callback(move |_| Msg::JumpToItem(item_id))}>{icon("lock")}<span>{format!("{} 项审批待处理", unresolved_approvals.len())}</span><span>{"查看并处理"}</span>{icon("arrow-down")}</button>}
+                    }).unwrap_or_default()}
                 </header>
                 <div class="timeline-area">
-                <div class="timeline" ref={self.timeline_ref.clone()} onscroll={link.callback(|_| Msg::TimelineScrolled)}>
+                <div class="timeline" ref={self.timeline_ref.clone()} onscroll={link.callback(|_| Msg::TimelineScrolled)} onclick={link.batch_callback(|event: MouseEvent| {
+                    let target = event.target()?.dyn_into::<web_sys::Element>().ok()?;
+                    let button = target.closest(".code-copy").ok()??;
+                    let code = button.parent_element()?.query_selector("pre > code").ok()??;
+                    Some(Msg::CopyText(code.text_content().unwrap_or_default()))
+                })}>
                     {if self.history_exhausted.contains(&conversation.id) {html! {}} else {html! {<button class="load-older" disabled={!self.authenticated || self.history_loading.contains(&conversation.id)} onclick={link.callback(|_| Msg::LoadOlder)}>{if self.history_loading.contains(&conversation.id) {"正在加载…"} else {"查看更早的消息"}}</button>}}}
-                    {self.view_timeline(link, self.timeline_by_conversation.get(&conversation.id).map_or(&[][..], Vec::as_slice))}
+                    {self.view_timeline(link, items)}
                 </div>
-                {if !self.follow_timeline_tail {html! {<button class="jump-latest" onclick={link.callback(|_| Msg::JumpToLatest)}>{icon("arrow-down")}{"回到最新"}</button>}} else {html! {}}}
+                {if !self.follow_timeline_tail {html! {<button class="jump-latest" onclick={link.callback(|_| Msg::JumpToLatest)}>{icon("arrow-down")}{if self.unread_timeline_items.is_empty() {"回到最新".to_owned()} else {format!("{} 条新动态 · 回到最新", self.unread_timeline_items.len())}}</button>}} else {html! {}}}
                 </div>
                 {self.view_composer(link, running, capability)}
             </>
+        }
+    }
+
+    fn view_timeline_search(
+        &self,
+        link: &yew::html::Scope<Self>,
+        conversation_id: ConversationId,
+    ) -> Html {
+        if !self.timeline_search_open {
+            return html! {};
+        }
+        let results = self.timeline_search_results();
+        let position = self
+            .selected_search_result
+            .and_then(|selected| results.iter().position(|id| *id == selected));
+        let status = if self.timeline_search.trim().is_empty() {
+            "输入关键词".to_owned()
+        } else if results.is_empty() {
+            "没有匹配内容".to_owned()
+        } else {
+            format!(
+                "{} / {} 条",
+                position.map_or(0, |index| index + 1),
+                results.len()
+            )
+        };
+        html! {
+            <div class="timeline-search-panel" role="search" aria-label="搜索当前对话已加载内容">
+                <div class="timeline-search-controls">
+                    {icon("search")}
+                    <input ref={self.timeline_search_ref.clone()} aria-label="搜索消息和活动" placeholder="搜索消息和活动" value={self.timeline_search.clone()} oninput={link.callback(|event: InputEvent| Msg::TimelineSearchChanged(event.target_unchecked_into::<HtmlInputElement>().value()))} onkeydown={link.batch_callback(|event: web_sys::KeyboardEvent| {
+                        if event.is_composing() { return None; }
+                        match event.key().as_str() {
+                            "Enter" => { event.prevent_default(); Some(Msg::NavigateTimelineSearch(event.shift_key())) },
+                            "Escape" => { event.stop_propagation(); Some(Msg::CloseTimelineSearch) },
+                            _ => None,
+                        }
+                    })}/>
+                    <span class="search-result-count" role="status">{status}</span>
+                    <button aria-label="上一个匹配结果" title="上一个 (Shift+Enter)" disabled={results.is_empty()} onclick={link.callback(|_| Msg::NavigateTimelineSearch(true))}>{icon("arrow-up")}</button>
+                    <button aria-label="下一个匹配结果" title="下一个 (Enter)" disabled={results.is_empty()} onclick={link.callback(|_| Msg::NavigateTimelineSearch(false))}>{icon("arrow-down")}</button>
+                    <button aria-label="关闭对话搜索" title="关闭 (Esc)" onclick={link.callback(|_| Msg::CloseTimelineSearch)}>{icon("close")}</button>
+                </div>
+                <div class="timeline-search-scope"><span>{"仅搜索当前对话已加载的消息与活动"}</span>{if !self.history_exhausted.contains(&conversation_id) {html! {<button disabled={!self.authenticated || self.history_loading.contains(&conversation_id)} onclick={link.callback(|_| Msg::LoadOlder)}>{if self.history_loading.contains(&conversation_id) {"正在加载…"} else {"加载更早内容"}}</button>}} else {html! {}}}</div>
+            </div>
         }
     }
 
@@ -3299,14 +3497,17 @@ impl App {
     }
 
     fn view_timeline_item(&self, link: &yew::html::Scope<Self>, item: &TimelineItem) -> Html {
+        let is_match = self.timeline_search_open
+            && timeline_item_matches_query(&item.kind, &self.timeline_search);
+        let is_current = is_match && self.selected_search_result == Some(item.id);
         match &item.kind {
             TimelineItemKind::UserMessage { text } => {
                 let copy_text = text.clone();
-                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="bubble user"><div class="message-heading"><span>{"你"}</span><time class="message-time">{format_message_time(item.created_at_ms)}</time></div><button class="message-copy" aria-label="复制用户消息原文" title="复制原文" onclick={link.callback(move |_| Msg::CopyText(copy_text.clone()))}>{icon("copy")}</button><div class="markdown-body">{self.cached_markdown(item, text)}</div></article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} data-search-match={is_match.to_string()} data-search-current={is_current.to_string()} class="bubble user"><div class="message-heading"><span>{"你"}</span><time class="message-time">{format_message_time(item.created_at_ms)}</time></div><button class="message-copy" aria-label="复制用户消息原文" title="复制原文" onclick={link.callback(move |_| Msg::CopyText(copy_text.clone()))}>{icon("copy")}</button><div class="markdown-body">{self.cached_markdown(item, text)}</div></article> }
             }
             TimelineItemKind::AgentMessage { phase, text } => {
                 let copy_text = text.clone();
-                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class={classes!("bubble", "agent", format!("phase-{phase:?}").to_lowercase())}><button class="message-copy" aria-label="复制 Agent 消息原文" title="复制原文" onclick={link.callback(move |_| Msg::CopyText(copy_text.clone()))}>{icon("copy")}</button><div class="message-heading"><span>{provider_label(self.selected_provider)}</span><span class="message-phase">{if *phase == agent_remote_protocol::AgentMessagePhase::Commentary {"进展"} else {""}}</span><time class="message-time">{format_message_time(item.created_at_ms)}</time></div><div class="markdown-body">{self.cached_markdown(item, text)}</div></article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} data-search-match={is_match.to_string()} data-search-current={is_current.to_string()} class={classes!("bubble", "agent", format!("phase-{phase:?}").to_lowercase())}><button class="message-copy" aria-label="复制 Agent 消息原文" title="复制原文" onclick={link.callback(move |_| Msg::CopyText(copy_text.clone()))}>{icon("copy")}</button><div class="message-heading"><span>{provider_label(self.selected_provider)}</span><span class="message-phase">{if *phase == agent_remote_protocol::AgentMessagePhase::Commentary {"进展"} else {""}}</span><time class="message-time">{format_message_time(item.created_at_ms)}</time></div><div class="markdown-body">{self.cached_markdown(item, text)}</div></article> }
             }
             TimelineItemKind::Progress {
                 kind,
@@ -3314,10 +3515,10 @@ impl App {
                 label,
                 detail,
             } => {
-                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="process-card"><div class="process-title"><span>{format!("{kind:?}")}</span><b>{label}</b><em>{format!("{status:?}")}</em></div>{detail.as_ref().map(|value| html! {<pre>{value}</pre>}).unwrap_or_default()}</article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} data-search-match={is_match.to_string()} data-search-current={is_current.to_string()} class="process-card"><div class="process-title"><span>{format!("{kind:?}")}</span><b>{label}</b><em>{format!("{status:?}")}</em></div>{detail.as_ref().map(|value| html! {<pre>{value}</pre>}).unwrap_or_default()}</article> }
             }
             TimelineItemKind::Plan { steps } => {
-                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="process-card plan"><strong>{"计划"}</strong><ol>{for steps.iter().map(|step| html! {<li class={state_class_for_item(step.status)}>{&step.text}</li>})}</ol></article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} data-search-match={is_match.to_string()} data-search-current={is_current.to_string()} class="process-card plan"><strong>{"计划"}</strong><ol>{for steps.iter().map(|step| html! {<li class={state_class_for_item(step.status)}>{&step.text}</li>})}</ol></article> }
             }
             TimelineItemKind::ToolCall {
                 name,
@@ -3325,7 +3526,7 @@ impl App {
                 input_summary,
                 output_summary,
             } => {
-                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="process-card"><div class="process-title"><span>{"工具"}</span><b>{name}</b><em>{format!("{status:?}")}</em></div>{summary_pair(input_summary, output_summary)}</article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} data-search-match={is_match.to_string()} data-search-current={is_current.to_string()} class="process-card"><div class="process-title"><span>{"工具"}</span><b>{name}</b><em>{format!("{status:?}")}</em></div>{summary_pair(input_summary, output_summary)}</article> }
             }
             TimelineItemKind::Command {
                 command,
@@ -3338,14 +3539,14 @@ impl App {
                     || command.clone(),
                     |output| format!("{command}\n\n{output}"),
                 );
-                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="process-card command"><div class="process-title"><span>{"命令"}</span><b>{relative_cwd.as_deref().unwrap_or("项目根目录")}</b><em>{format!("{status:?}{}", exit_code.map(|code| format!(" · {code}")).unwrap_or_default())}</em><button class="command-copy" aria-label="复制命令和输出" onclick={link.callback(move |_| Msg::CopyText(copy_text.clone()))}>{"复制"}</button></div><code>{command}</code>{output.as_ref().map(|value| html! {<pre>{value}</pre>}).unwrap_or_default()}</article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} data-search-match={is_match.to_string()} data-search-current={is_current.to_string()} class="process-card command"><div class="process-title"><span>{"命令"}</span><b>{relative_cwd.as_deref().unwrap_or("项目根目录")}</b><em>{format!("{status:?}{}", exit_code.map(|code| format!(" · {code}")).unwrap_or_default())}</em><button class="command-copy" aria-label="复制命令和输出" onclick={link.callback(move |_| Msg::CopyText(copy_text.clone()))}>{"复制"}</button></div><code>{command}</code>{output.as_ref().map(|value| html! {<pre>{value}</pre>}).unwrap_or_default()}</article> }
             }
             TimelineItemKind::FileChange {
                 relative_path,
                 change_kind,
                 status,
             } => {
-                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="process-card"><div class="process-title"><span>{"文件"}</span><b>{relative_path}</b><em>{format!("{} · {status:?}", change_kind)}</em></div></article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} data-search-match={is_match.to_string()} data-search-current={is_current.to_string()} class="process-card"><div class="process-title"><span>{"文件"}</span><b>{relative_path}</b><em>{format!("{} · {status:?}", change_kind)}</em></div></article> }
             }
             TimelineItemKind::Approval {
                 approval_id,
@@ -3355,15 +3556,23 @@ impl App {
             } => {
                 let id = *approval_id;
                 let pending = self.pending_approvals.contains(&id);
-                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class={classes!("approval-card", pending.then_some("pending"))} aria-busy={pending.to_string()}><span class="item-label">{"需要权限"}</span><p>{prompt}</p><div class={classes!("approval-actions", pending.then_some("pending"))}>{if let Some(resolved) = resolved_option { html! {<b>{format!("已选择：{}", options.iter().find(|option| &option.id == resolved).map_or(resolved.as_str(), |option| option.label.as_str()))}</b>} } else { html! {{for options.iter().map(|option| { let value=option.id.clone(); html! {<button disabled={pending || !self.authenticated} onclick={link.callback(move |_| Msg::ResolveApproval(id, value.clone()))}>{if pending {"正在提交…"} else {option.label.as_str()}}</button>} })}} }}</div></article> }
+                let active = self
+                    .selected_conversation_ref()
+                    .is_some_and(|conversation| {
+                        matches!(
+                            conversation.state,
+                            ConversationState::Running | ConversationState::NeedsApproval
+                        )
+                    });
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} data-search-match={is_match.to_string()} data-search-current={is_current.to_string()} class={classes!("approval-card", pending.then_some("pending"))} aria-busy={pending.to_string()}><span class="item-label">{"需要权限"}</span><p>{prompt}</p><div class={classes!("approval-actions", pending.then_some("pending"))}>{if let Some(resolved) = resolved_option { html! {<b>{format!("已选择：{}", options.iter().find(|option| &option.id == resolved).map_or(resolved.as_str(), |option| option.label.as_str()))}</b>} } else if !active {html! {<span class="approval-expired">{"该回合已结束，审批已失效"}</span>}} else { html! {{for options.iter().map(|option| { let value=option.id.clone(); html! {<button disabled={pending || !self.authenticated} onclick={link.callback(move |_| Msg::ResolveApproval(id, value.clone()))}>{if pending {"正在提交…"} else {option.label.as_str()}}</button>} })}} }}</div></article> }
             }
             TimelineItemKind::Image { attachment_id, alt } => {
                 let id = *attachment_id;
                 let onclick = link.callback(move |_| Msg::OpenImage(id));
-                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="image-card" {onclick}>{self.attachments.get(attachment_id).map(|url| html! {<img src={url.clone()} alt={alt.clone()} />}).unwrap_or_else(|| html! {<div class="image-loading">{"正在读取图片…"}</div>})}<span>{alt}</span></article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} data-search-match={is_match.to_string()} data-search-current={is_current.to_string()} class="image-card" {onclick}>{self.attachments.get(attachment_id).map(|url| html! {<img src={url.clone()} alt={alt.clone()} />}).unwrap_or_else(|| html! {<div class="image-loading">{"正在读取图片…"}</div>})}<span>{alt}</span></article> }
             }
             TimelineItemKind::Error { code, message } => {
-                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="error-card"><b>{code}</b><p>{message}</p></article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} data-search-match={is_match.to_string()} data-search-current={is_current.to_string()} class="error-card"><b>{code}</b><p>{message}</p></article> }
             }
         }
     }

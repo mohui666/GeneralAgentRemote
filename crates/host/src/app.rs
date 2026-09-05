@@ -33,6 +33,7 @@ struct PendingApproval {
     provider: ProviderId,
     conversation_id: ConversationId,
     provider_request_id: String,
+    option_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1583,6 +1584,26 @@ impl AppService {
             .get(&approval_id)
             .cloned()
             .ok_or_else(|| anyhow!("approval {approval_id} is no longer pending"))?;
+        if !pending.option_ids.contains(&option_id) {
+            bail!("option {option_id} is not available for this approval");
+        }
+        let conversation = self.storage.conversation(pending.conversation_id)?;
+        self.authorized_project(conversation.project_id, pending.provider)?;
+        let item_id = self.item_id(pending.conversation_id, format!("approval:{approval_id}"))?;
+        let mut resolved_kind = self
+            .timeline_cache
+            .lock()
+            .expect("timeline mutex poisoned")
+            .get(&item_id)
+            .ok_or_else(|| anyhow!("approval timeline item is missing"))?
+            .kind
+            .clone();
+        if let TimelineItemKind::Approval {
+            resolved_option, ..
+        } = &mut resolved_kind
+        {
+            *resolved_option = Some(option_id.clone());
+        }
         let provider = self.providers.get(pending.provider)?;
         provider
             .resolve_approval(ResolveApproval {
@@ -1591,34 +1612,64 @@ impl AppService {
                 option_id: option_id.clone(),
             })
             .await?;
-        self.approvals
-            .lock()
-            .expect("approval mutex poisoned")
-            .remove(&approval_id);
-        let item_id = self
-            .provider_item_ids
-            .lock()
-            .expect("item mutex poisoned")
-            .get(&(pending.conversation_id, format!("approval:{approval_id}")))
-            .copied();
-        if let Some(item_id) = item_id {
+        // Share this short post-RPC critical section with approval and terminal
+        // events. Never hold the mutex while waiting for the provider.
+        let mut approvals = self.approvals.lock().expect("approval mutex poisoned");
+        approvals.remove(&approval_id);
+        let has_pending = approvals
+            .values()
+            .any(|approval| approval.conversation_id == pending.conversation_id);
+        {
             let mut cache = self.timeline_cache.lock().expect("timeline mutex poisoned");
             if let Some(mut item) = cache.get(&item_id).cloned() {
                 item.revision += 1;
-                if let TimelineItemKind::Approval {
-                    resolved_option, ..
-                } = &mut item.kind
-                {
-                    *resolved_option = Some(option_id);
-                }
+                item.kind = resolved_kind;
                 self.save_and_emit_item_locked(&mut cache, item)?;
             }
         }
         let mut conversation = self.storage.conversation(pending.conversation_id)?;
-        conversation.state = ConversationState::Running;
-        conversation.revision += 1;
-        conversation.updated_at_ms = now_ms();
-        self.save_and_emit_conversation(&conversation)?;
+        // Resolving an approval may complete the provider turn before its RPC
+        // returns. Preserve that terminal state and any other pending approval.
+        if conversation.state == ConversationState::NeedsApproval && !has_pending {
+            conversation.state = ConversationState::Running;
+            conversation.revision += 1;
+            conversation.updated_at_ms = now_ms();
+            self.save_and_emit_conversation(&conversation)?;
+        }
+        Ok(())
+    }
+
+    fn expire_approvals(
+        &self,
+        conversation_id: ConversationId,
+        approvals: &mut HashMap<ApprovalId, PendingApproval>,
+    ) -> Result<()> {
+        approvals.retain(|_, approval| approval.conversation_id != conversation_id);
+        let mut cache = self.timeline_cache.lock().expect("timeline mutex poisoned");
+        let expired = cache
+            .values()
+            .filter(|item| item.conversation_id == conversation_id)
+            .filter_map(|item| match &item.kind {
+                TimelineItemKind::Approval {
+                    prompt,
+                    resolved_option: None,
+                    ..
+                } => Some(TimelineItem {
+                    revision: item.revision + 1,
+                    kind: TimelineItemKind::Progress {
+                        kind: agent_remote_protocol::ProgressKind::Other("approval".to_owned()),
+                        label: "审批已失效".to_owned(),
+                        status: agent_remote_protocol::ItemStatus::Interrupted,
+                        detail: Some(prompt.clone()),
+                    },
+                    ..item.clone()
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for item in expired {
+            self.save_and_emit_item_locked(&mut cache, item)?;
+        }
         Ok(())
     }
 
@@ -1700,6 +1751,16 @@ impl AppService {
     }
 
     async fn apply_provider_event_inner(self: &Arc<Self>, event: ProviderEvent) -> Result<()> {
+        let mut approval_state = matches!(
+            &event.kind,
+            ProviderEventKind::Approval { .. }
+                | ProviderEventKind::SessionOptionsChanged { .. }
+                | ProviderEventKind::Completed
+                | ProviderEventKind::Interrupted
+                | ProviderEventKind::Failed { .. }
+                | ProviderEventKind::Crashed { .. }
+        )
+        .then(|| self.approvals.lock().expect("approval mutex poisoned"));
         let mut conversation = self.storage.conversation(event.conversation_id)?;
         if conversation.provider != event.provider || conversation.project_id != event.project_id {
             bail!("provider event did not match the conversation authority boundary");
@@ -1919,15 +1980,16 @@ impl AppService {
                     *ids.entry((event.conversation_id, provider_request_id.clone()))
                         .or_default()
                 };
-                self.approvals
-                    .lock()
-                    .expect("approval mutex poisoned")
+                approval_state
+                    .as_mut()
+                    .expect("approval state lock")
                     .insert(
                         approval_id,
                         PendingApproval {
                             provider: event.provider,
                             conversation_id: event.conversation_id,
                             provider_request_id,
+                            option_ids: options.iter().map(|option| option.id.clone()).collect(),
                         },
                     );
                 self.upsert_provider_item(
@@ -2007,6 +2069,10 @@ impl AppService {
             }
             ProviderEventKind::Completed => {
                 self.flush_stream_items(event.conversation_id)?;
+                self.expire_approvals(
+                    event.conversation_id,
+                    approval_state.as_mut().expect("approval state lock"),
+                )?;
                 conversation.state = ConversationState::Completed;
                 conversation.revision += 1;
                 conversation.updated_at_ms = now_ms();
@@ -2015,6 +2081,10 @@ impl AppService {
             }
             ProviderEventKind::Interrupted => {
                 self.flush_stream_items(event.conversation_id)?;
+                self.expire_approvals(
+                    event.conversation_id,
+                    approval_state.as_mut().expect("approval state lock"),
+                )?;
                 conversation.state = ConversationState::Interrupted;
                 conversation.revision += 1;
                 conversation.updated_at_ms = now_ms();
@@ -2026,10 +2096,18 @@ impl AppService {
                 message,
             } => {
                 self.flush_stream_items(event.conversation_id)?;
+                self.expire_approvals(
+                    event.conversation_id,
+                    approval_state.as_mut().expect("approval state lock"),
+                )?;
                 self.record_failure(&project, conversation, provider_item_id, &code, message)?;
             }
             ProviderEventKind::Crashed { message } => {
                 self.flush_stream_items(event.conversation_id)?;
+                self.expire_approvals(
+                    event.conversation_id,
+                    approval_state.as_mut().expect("approval state lock"),
+                )?;
                 self.record_failure(&project, conversation, None, "provider_crashed", message)?;
             }
         }
@@ -2913,6 +2991,7 @@ mod tests {
         projects: Mutex<HashMap<ConversationId, ProjectId>>,
         messages: Mutex<Vec<(ConversationId, String)>>,
         approvals: Mutex<Vec<String>>,
+        approval_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
         interruptions: Mutex<Vec<ConversationId>>,
         sessions: Mutex<Vec<SessionSummary>>,
         history: Mutex<HashMap<String, Vec<ProviderHistoryItem>>>,
@@ -2949,6 +3028,7 @@ mod tests {
                 projects: Mutex::new(HashMap::new()),
                 messages: Mutex::new(Vec::new()),
                 approvals: Mutex::new(Vec::new()),
+                approval_gate: Mutex::new(None),
                 interruptions: Mutex::new(Vec::new()),
                 sessions: Mutex::new(Vec::new()),
                 history: Mutex::new(HashMap::new()),
@@ -3166,6 +3246,10 @@ mod tests {
                 .lock()
                 .expect("approvals mutex")
                 .push(request.option_id);
+            let gate = self.approval_gate.lock().expect("approval gate").clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.expect("approval gate permit").forget();
+            }
             Ok(CommandAck)
         }
 
@@ -4126,6 +4210,177 @@ mod tests {
                 .as_slice(),
             &[conversation.id]
         );
+    }
+
+    async fn request_approval(
+        fixture: &Fixture,
+        conversation: &Conversation,
+        request_id: &str,
+    ) -> ApprovalId {
+        fixture
+            .service
+            .apply_provider_event_inner(ProviderEvent {
+                provider: conversation.provider,
+                project_id: conversation.project_id,
+                conversation_id: conversation.id,
+                kind: ProviderEventKind::Approval {
+                    provider_request_id: request_id.to_owned(),
+                    prompt: "Allow command?".to_owned(),
+                    options: vec![ApprovalOption {
+                        id: "accept".to_owned(),
+                        label: "Allow".to_owned(),
+                    }],
+                },
+            })
+            .await
+            .expect("approval event");
+        fixture.service.provider_approval_ids.lock().expect("ids")
+            [&(conversation.id, request_id.to_owned())]
+    }
+
+    #[tokio::test]
+    async fn approval_choices_are_validated_and_other_approvals_stay_pending() {
+        let fixture = fixture();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        let first = request_approval(&fixture, &conversation, "first").await;
+        let second = request_approval(&fixture, &conversation, "second").await;
+        assert!(
+            fixture
+                .service
+                .resolve_approval(first, "unknown".to_owned())
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .provider
+                .approvals
+                .lock()
+                .expect("approvals")
+                .is_empty()
+        );
+        fixture
+            .service
+            .resolve_approval(first, "accept".to_owned())
+            .await
+            .expect("first approval");
+        assert_eq!(
+            fixture
+                .service
+                .storage
+                .conversation(conversation.id)
+                .expect("conversation")
+                .state,
+            ConversationState::NeedsApproval
+        );
+        fixture
+            .service
+            .resolve_approval(second, "accept".to_owned())
+            .await
+            .expect("second approval");
+        assert_eq!(
+            fixture
+                .service
+                .storage
+                .conversation(conversation.id)
+                .expect("conversation")
+                .state,
+            ConversationState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn ended_turns_expire_pending_approvals_without_affecting_other_conversations() {
+        for terminal in [
+            ProviderEventKind::Completed,
+            ProviderEventKind::Interrupted,
+            ProviderEventKind::Failed {
+                provider_item_id: None,
+                code: "test".to_owned(),
+                message: "Failed".to_owned(),
+            },
+            ProviderEventKind::Crashed {
+                message: "Exited".to_owned(),
+            },
+        ] {
+            let fixture = fixture();
+            let conversation = create(&fixture.service, fixture.project_a.id).await;
+            let other = create(&fixture.service, fixture.project_b.id).await;
+            let approval = request_approval(&fixture, &conversation, "first").await;
+            let other_approval = request_approval(&fixture, &other, "second").await;
+            fixture
+                .service
+                .apply_provider_event_inner(ProviderEvent {
+                    provider: conversation.provider,
+                    project_id: conversation.project_id,
+                    conversation_id: conversation.id,
+                    kind: terminal,
+                })
+                .await
+                .expect("terminal event");
+            assert!(
+                fixture
+                    .service
+                    .resolve_approval(approval, "accept".to_owned())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                fixture
+                    .service
+                    .approvals
+                    .lock()
+                    .expect("pending")
+                    .contains_key(&other_approval)
+            );
+            let timeline = fixture.service.storage.list_timeline().expect("timeline");
+            let item = timeline
+                .iter()
+                .find(|item| item.conversation_id == conversation.id && item.revision == 2)
+                .expect("expired item");
+            assert!(
+                matches!(&item.kind, TimelineItemKind::Progress { status: ItemStatus::Interrupted, label, .. } if label == "审批已失效")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_response_does_not_overwrite_a_completed_turn() {
+        let fixture = fixture();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        let approval = request_approval(&fixture, &conversation, "first").await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *fixture.provider.approval_gate.lock().expect("gate") = Some(Arc::clone(&gate));
+        let mut resolving = Box::pin(
+            fixture
+                .service
+                .resolve_approval(approval, "accept".to_owned()),
+        );
+        assert!(futures_util::poll!(resolving.as_mut()).is_pending());
+        fixture
+            .service
+            .apply_provider_event_inner(ProviderEvent {
+                provider: conversation.provider,
+                project_id: conversation.project_id,
+                conversation_id: conversation.id,
+                kind: ProviderEventKind::Completed,
+            })
+            .await
+            .expect("completed event");
+        gate.add_permits(1);
+        resolving.await.expect("approval resolved");
+        assert_eq!(
+            fixture
+                .service
+                .storage
+                .conversation(conversation.id)
+                .expect("conversation")
+                .state,
+            ConversationState::Completed
+        );
+        assert!(fixture.service.storage.list_timeline().expect("timeline").iter().any(|item| {
+            matches!(&item.kind, TimelineItemKind::Approval { resolved_option: Some(option), .. } if option == "accept")
+        }));
     }
 
     #[tokio::test]

@@ -123,26 +123,69 @@ fn markdown_to_safe_html(markdown: &str) -> String {
         | Options::ENABLE_TABLES
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES;
-    let events = Parser::new_ext(markdown, options).map(|event| match event {
-        Event::Html(value) | Event::InlineHtml(value) => Event::Text(value),
-        Event::Start(Tag::Link {
-            link_type,
-            dest_url,
-            title,
-            id,
-        }) => Event::Start(Tag::Link {
-            link_type,
-            dest_url: safe_markdown_url(dest_url),
-            title,
-            id,
-        }),
-        Event::Start(Tag::Image { .. }) => Event::Text(CowStr::Borrowed("[图片：")),
-        Event::End(TagEnd::Image) => Event::Text(CowStr::Borrowed("]")),
-        event => event,
-    });
+    let events = Parser::new_ext(markdown, options)
+        .map(|event| match event {
+            Event::Html(value) | Event::InlineHtml(value) => Event::Text(value),
+            Event::Start(Tag::Link { link_type, dest_url, title, id }) => Event::Start(Tag::Link {
+                link_type,
+                dest_url: safe_markdown_url(dest_url),
+                title,
+                id,
+            }),
+            Event::Start(Tag::Image { .. }) => Event::Text(CowStr::Borrowed("[图片：")),
+            Event::End(TagEnd::Image) => Event::Text(CowStr::Borrowed("]")),
+            event => event,
+        })
+        .flat_map(|event| match event {
+            Event::Start(Tag::CodeBlock(_)) => [
+                Some(Event::Html(CowStr::Borrowed("<div class=\"code-block\"><button type=\"button\" class=\"code-copy\" aria-label=\"复制代码块\">复制代码</button>"))),
+                Some(event),
+            ],
+            Event::End(TagEnd::CodeBlock) => [Some(event), Some(Event::Html(CowStr::Borrowed("</div>")))],
+            _ => [Some(event), None],
+        }).flatten();
     let mut html = String::new();
     pulldown_cmark::html::push_html(&mut html, events);
     html
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn timeline_item_matches_query(kind: &TimelineItemKind, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return false;
+    }
+    let contains = |text: &str| text.to_lowercase().contains(&query);
+    let optional = |text: &Option<String>| text.as_deref().is_some_and(contains);
+    match kind {
+        TimelineItemKind::UserMessage { text } | TimelineItemKind::AgentMessage { text, .. } => {
+            contains(text)
+        }
+        TimelineItemKind::Progress { label, detail, .. } => contains(label) || optional(detail),
+        TimelineItemKind::Plan { steps } => steps.iter().any(|step| contains(&step.text)),
+        TimelineItemKind::ToolCall {
+            name,
+            input_summary,
+            output_summary,
+            ..
+        } => contains(name) || optional(input_summary) || optional(output_summary),
+        TimelineItemKind::Command {
+            command,
+            relative_cwd,
+            output,
+            ..
+        } => contains(command) || optional(relative_cwd) || optional(output),
+        TimelineItemKind::FileChange {
+            relative_path,
+            change_kind,
+            ..
+        } => contains(relative_path) || contains(change_kind),
+        TimelineItemKind::Approval {
+            prompt, options, ..
+        } => contains(prompt) || options.iter().any(|option| contains(&option.label)),
+        TimelineItemKind::Image { alt, .. } => contains(alt),
+        TimelineItemKind::Error { code, message } => contains(code) || contains(message),
+    }
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -174,13 +217,13 @@ pub fn run() {
 mod tests {
     use agent_remote_protocol::{
         ClientCommand, CommandId, Conversation, ConversationId, ConversationState,
-        ConversationTitleSource, ProjectId, ProviderId,
+        ConversationTitleSource, ItemStatus, ProjectId, ProviderId, TimelineItemKind,
     };
 
     use super::{
         ConversationSortMode, conversation_belongs_to_project, draft_scope, increment_send_attempt,
         markdown_to_safe_html, retryable_send_rejection, sort_conversations,
-        sort_conversations_newest_first,
+        sort_conversations_newest_first, timeline_item_matches_query,
     };
 
     #[test]
@@ -413,5 +456,40 @@ mod tests {
         assert!(!rendered.contains("tracker.invalid"));
         assert!(rendered.contains("[图片：跟踪图]"));
         assert!(rendered.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn code_copy_buttons_wrap_code_without_changing_or_trusting_its_text() {
+        let rendered = markdown_to_safe_html(
+            "```html\n<button onclick=\"steal()\">你好 & goodbye</button>\n```\n\n    second();\n",
+        );
+        assert_eq!(rendered.matches("class=\"code-copy\"").count(), 2);
+        assert!(rendered.contains(
+            "&lt;button onclick=\"steal()\"&gt;你好 &amp; goodbye&lt;/button&gt;\n</code>"
+        ));
+        assert!(rendered.contains("<code>second();\n</code>"));
+        assert!(!rendered.contains("<button onclick="));
+        assert!(!markdown_to_safe_html("`inline code`").contains("code-copy"));
+    }
+
+    #[test]
+    fn timeline_search_matches_message_text_and_command_output_without_case_sensitivity() {
+        let message = TimelineItemKind::UserMessage {
+            text: "检查 WebSocket 连接".to_owned(),
+        };
+        assert!(timeline_item_matches_query(&message, " websocket "));
+        assert!(timeline_item_matches_query(&message, "连接"));
+        assert!(!timeline_item_matches_query(&message, "missing"));
+        assert!(!timeline_item_matches_query(&message, "  "));
+        let command = TimelineItemKind::Command {
+            command: "cargo test".to_owned(),
+            relative_cwd: Some("crates/web".to_owned()),
+            status: ItemStatus::Completed,
+            exit_code: Some(0),
+            output: Some("PASSED: 搜索测试".to_owned()),
+        };
+        assert!(timeline_item_matches_query(&command, "passed"));
+        assert!(timeline_item_matches_query(&command, "crates/web"));
+        assert!(timeline_item_matches_query(&command, "搜索测试"));
     }
 }

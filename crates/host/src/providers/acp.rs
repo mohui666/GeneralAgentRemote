@@ -19,14 +19,14 @@ use agent_client_protocol::{
         v1::{
             AuthenticateRequest, BooleanConfigOptionCapabilities, CancelNotification,
             ClientCapabilities, ClientSessionCapabilities, CloseSessionRequest, ContentBlock,
-            CreateTerminalRequest, CreateTerminalResponse, FileSystemCapabilities, Implementation,
-            InitializeRequest, InitializeResponse, KillTerminalRequest, KillTerminalResponse,
-            ListSessionsRequest, LoadSessionRequest, Meta, NewSessionRequest, PermissionOptionId,
-            PlanEntryStatus, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
-            ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
-            RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
-            SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
-            SessionConfigOptionCategory, SessionConfigOptionValue,
+            CreateTerminalRequest, CreateTerminalResponse, FileSystemCapabilities, ImageContent,
+            Implementation, InitializeRequest, InitializeResponse, KillTerminalRequest,
+            KillTerminalResponse, ListSessionsRequest, LoadSessionRequest, Meta, NewSessionRequest,
+            PermissionOptionId, PlanEntryStatus, PromptRequest, ReadTextFileRequest,
+            ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+            RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+            ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind,
+            SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
             SessionConfigOptionsCapabilities, SessionConfigSelectOptions, SessionId,
             SessionModeState, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
             StopReason, TerminalExitStatus, TerminalOutputRequest, TerminalOutputResponse,
@@ -36,9 +36,9 @@ use agent_client_protocol::{
     },
 };
 use agent_remote_protocol::{
-    AgentMessagePhase, ApprovalOption, ConversationId, EffortOption, ItemStatus, ModelOption,
-    PlanStep, ProjectId, ProviderHealth, ProviderId, ProviderState, SessionOption,
-    SessionOptionValue, SessionSummary, TimelineItemKind,
+    AgentMessagePhase, ApprovalOption, AttachmentCapability, ConversationId, EffortOption,
+    ItemStatus, ModelOption, PlanStep, ProjectId, ProviderHealth, ProviderId, ProviderState,
+    SessionOption, SessionOptionValue, SessionSummary, TimelineItemKind,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -59,9 +59,13 @@ use super::{
     ProviderHistoryPage, ReadSessionHistory, ResolveApproval, ResumeSession, SendMessage,
     SessionOptionsSnapshot, SetSessionOption, SteerMessage,
 };
-use crate::storage::{Project, now_ms};
+use crate::{
+    attachments::DEFAULT_MAX_IMAGE_BYTES,
+    storage::{Project, now_ms},
+};
 
 const GROK_EXTENSION_VERSION: &str = "1.0.13";
+const GROK_IMAGE_CAPABILITY_FIX_VERSION: &str = "1.0.13";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AcpFlavor {
@@ -394,6 +398,7 @@ struct Negotiated {
     supports_load: bool,
     supports_resume: bool,
     supports_close: bool,
+    supports_images: bool,
     models: Vec<GrokModel>,
     current_model: Option<String>,
 }
@@ -1135,6 +1140,28 @@ impl AgentProvider for AcpProvider {
         self.shared.events.subscribe()
     }
 
+    fn attachment_capability(&self) -> AttachmentCapability {
+        let supports_images = self
+            .shared
+            .negotiated
+            .read()
+            .expect("ACP capabilities poisoned")
+            .as_ref()
+            .is_some_and(|negotiated| negotiated.supports_images);
+        if !supports_images {
+            return AttachmentCapability::default();
+        }
+        AttachmentCapability {
+            allowed_mime_types: ["image/png", "image/jpeg", "image/webp", "image/gif"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            max_count: 4,
+            max_bytes: DEFAULT_MAX_IMAGE_BYTES,
+            max_total_bytes: DEFAULT_MAX_IMAGE_BYTES,
+        }
+    }
+
     async fn health(&self) -> ProviderHealth {
         if let Some(health) = self
             .shared
@@ -1372,6 +1399,12 @@ impl AgentProvider for AcpProvider {
         let (project_id, connection, binding) = self
             .connection_for_bound_session(&request.native_session_id, request.conversation_id)
             .await?;
+        if !request.attachments.is_empty() && !connection.negotiated.supports_images {
+            bail!(
+                "{} does not accept prompt images",
+                self.shared.config.display_name
+            );
+        }
         if self.shared.config.flavor == AcpFlavor::Standard {
             if request.model.is_some() && request.model != binding.model {
                 bail!("model changes must use the Provider session option");
@@ -1397,6 +1430,16 @@ impl AgentProvider for AcpProvider {
             }
         }
 
+        let mut prompt = vec![ContentBlock::Text(TextContent::new(request.text))];
+        for attachment in request.attachments {
+            let bytes = tokio::fs::read(&attachment.path)
+                .await
+                .context("read managed prompt image")?;
+            prompt.push(ContentBlock::Image(ImageContent::new(
+                BASE64.encode(bytes),
+                attachment.mime_type,
+            )));
+        }
         if !self
             .shared
             .start_turn(project_id, &request.native_session_id)
@@ -1409,7 +1452,7 @@ impl AgentProvider for AcpProvider {
         let conversation_id = request.conversation_id;
         let pending_response = connection_to_agent.send_request(PromptRequest::new(
             SessionId::new(session_id.clone()),
-            vec![ContentBlock::Text(TextContent::new(request.text))],
+            prompt,
         ));
         tokio::spawn(async move {
             let result = pending_response.block_task().await;
@@ -2563,6 +2606,11 @@ fn negotiate(response: &InitializeResponse, flavor: AcpFlavor) -> Result<Negotia
         .map(parse_model_state)
         .unwrap_or_default();
     let capabilities = &response.agent_capabilities;
+    // Grok 1.0.13 accepts standard ImageContent but omits image(true) from
+    // initialize. Verified against its ACP implementation and a real vision turn.
+    // Keep this correction scoped to that exact Grok build, not other ACP agents.
+    let supports_images = capabilities.prompt_capabilities.image
+        || (grok_shell && version.as_deref() == Some(GROK_IMAGE_CAPABILITY_FIX_VERSION));
     Ok(Negotiated {
         version,
         grok_shell,
@@ -2570,6 +2618,7 @@ fn negotiate(response: &InitializeResponse, flavor: AcpFlavor) -> Result<Negotia
         supports_load: capabilities.load_session,
         supports_resume: capabilities.session_capabilities.resume.is_some(),
         supports_close: capabilities.session_capabilities.close.is_some(),
+        supports_images,
         models,
         current_model,
     })
@@ -3101,10 +3150,10 @@ mod tests {
 
     use agent_client_protocol::schema::v1::{
         AgentCapabilities, AuthMethod, AuthMethodAgent, InitializeResponse, PermissionOption,
-        PermissionOptionKind, RequestPermissionRequest, SessionConfigBoolean, SessionConfigSelect,
-        SessionConfigSelectGroup, SessionConfigSelectOption, SessionListCapabilities, SessionMode,
-        SessionResumeCapabilities, SetSessionConfigOptionResponse, ToolCallUpdate,
-        ToolCallUpdateFields,
+        PermissionOptionKind, PromptCapabilities, PromptResponse, RequestPermissionRequest,
+        SessionConfigBoolean, SessionConfigSelect, SessionConfigSelectGroup,
+        SessionConfigSelectOption, SessionListCapabilities, SessionMode, SessionResumeCapabilities,
+        SetSessionConfigOptionResponse, ToolCallUpdate, ToolCallUpdateFields,
     };
     use agent_client_protocol::{Agent, Channel, Client};
     use tokio::sync::oneshot;
@@ -3153,6 +3202,7 @@ mod tests {
             supports_load: true,
             supports_resume: true,
             supports_close: true,
+            supports_images: false,
             models,
             current_model,
         }
@@ -3178,6 +3228,182 @@ mod tests {
                 .expect("standard ACP negotiation")
                 .supports_extensions()
         );
+    }
+
+    #[test]
+    fn grok_image_declaration_correction_is_limited_to_verified_build() {
+        for flavor in [AcpFlavor::Grok, AcpFlavor::Standard] {
+            for version in ["1.0.12", "1.0.13", "1.0.14"] {
+                for grok_shell in [false, true] {
+                    let response = InitializeResponse::new(ProtocolVersion::V1).meta(
+                        serde_json::from_value::<Meta>(serde_json::json!({
+                            "agentVersion": version,
+                            "grokShell": grok_shell,
+                        }))
+                        .unwrap(),
+                    );
+                    assert_eq!(
+                        negotiate(&response, flavor).unwrap().supports_images,
+                        flavor == AcpFlavor::Grok && grok_shell && version == "1.0.13",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_image_capability_requires_negotiated_image_support() {
+        for provider in [AcpProvider::grok(), AcpProvider::claude()] {
+            assert!(!provider.attachment_capability().supported());
+            for supports_images in [true, false] {
+                let response = InitializeResponse::new(ProtocolVersion::V1).agent_capabilities(
+                    AgentCapabilities::new().prompt_capabilities(
+                        PromptCapabilities::new()
+                            .image(supports_images)
+                            .audio(true)
+                            .embedded_context(true),
+                    ),
+                );
+                *provider.shared.negotiated.write().unwrap() =
+                    Some(negotiate(&response, provider.shared.config.flavor).unwrap());
+                let capability = provider.attachment_capability();
+                assert_eq!(capability.supported(), supports_images);
+                if supports_images {
+                    assert_eq!(capability.max_count, 4);
+                    assert_eq!(capability.max_bytes, DEFAULT_MAX_IMAGE_BYTES);
+                    assert_eq!(capability.max_total_bytes, DEFAULT_MAX_IMAGE_BYTES);
+                    assert_eq!(
+                        capability.allowed_mime_types,
+                        ["image/png", "image/jpeg", "image/webp", "image/gif"]
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn duplex_prompt_images_follow_session_capability_and_send_managed_bytes() {
+        use crate::{attachments::AttachmentStore, providers::PromptAttachment};
+
+        let temp = tempfile::tempdir().expect("image tempdir");
+        let source_path = temp.path().join("source.png");
+        image::RgbaImage::from_pixel(2, 1, image::Rgba([1, 2, 3, 255]))
+            .save(&source_path)
+            .expect("save image fixture");
+        let bytes = fs::read(&source_path).expect("read image fixture");
+        let store = AttachmentStore::new(temp.path().join("managed"), DEFAULT_MAX_IMAGE_BYTES)
+            .expect("attachment store");
+
+        for supports_images in [false, true] {
+            let provider = AcpProvider::claude();
+            let project = project(temp.path());
+            let conversation_id = ConversationId::new();
+            let session_id = "image-session";
+            let stored = store
+                .import_file(conversation_id, &source_path, &[temp.path().to_owned()])
+                .expect("import prompt image");
+            provider
+                .shared
+                .bind_session(project.id, session_id, conversation_id, None, None);
+            let (client_transport, agent_transport) = Channel::duplex();
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let client_task = tokio::spawn(async move {
+                Client
+                    .builder()
+                    .connect_with(client_transport, async move |connection| {
+                        let _ = ready_tx.send(connection.clone());
+                        let _ = shutdown_rx.await;
+                        Ok(())
+                    })
+                    .await
+            });
+            let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel();
+            let agent_task = tokio::spawn(async move {
+                Agent
+                    .builder()
+                    .on_receive_request(
+                        async move |request: PromptRequest, responder, _connection| {
+                            prompt_tx.send(request).expect("record prompt");
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        },
+                        agent_client_protocol::on_receive_request!(),
+                    )
+                    .connect_with(agent_transport, async move |_connection| {
+                        std::future::pending::<()>().await;
+                        #[allow(unreachable_code)]
+                        Ok(())
+                    })
+                    .await
+            });
+            let response = InitializeResponse::new(ProtocolVersion::V1).agent_capabilities(
+                AgentCapabilities::new()
+                    .prompt_capabilities(PromptCapabilities::new().image(supports_images)),
+            );
+            provider.shared.connections.lock().await.insert(
+                project.id,
+                Arc::new(ProjectConnection {
+                    connection: ready_rx.await.expect("client connection"),
+                    negotiated: negotiate(&response, AcpFlavor::Standard)
+                        .expect("negotiate images"),
+                    shutdown: StdMutex::new(Some(shutdown_tx)),
+                }),
+            );
+            let mut request = SendMessage {
+                conversation_id,
+                project: project.clone(),
+                native_session_id: session_id.to_owned(),
+                client_message_id: None,
+                text: "Describe this image".to_owned(),
+                attachments: vec![PromptAttachment {
+                    id: stored.metadata.id,
+                    path: stored.managed_path,
+                    mime_type: stored.metadata.mime_type,
+                }],
+                model: None,
+                effort: None,
+                permission_mode: None,
+            };
+            let result = provider.send_message(request.clone()).await;
+            if supports_images {
+                result.expect("send image prompt");
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("does not accept prompt images")
+                );
+                assert!(prompt_rx.try_recv().is_err());
+                request.attachments.clear();
+                provider
+                    .send_message(request)
+                    .await
+                    .expect("text remains supported after rejection");
+            }
+            let received = prompt_rx.recv().await.expect("agent receives prompt");
+            assert_eq!(received.session_id.to_string(), session_id);
+            assert!(
+                matches!(&received.prompt[0], ContentBlock::Text(text) if text.text == "Describe this image")
+            );
+            if supports_images {
+                assert_eq!(received.prompt.len(), 2);
+                let ContentBlock::Image(image) = &received.prompt[1] else {
+                    panic!("expected image content");
+                };
+                assert_eq!(
+                    BASE64.decode(&image.data).expect("decode prompt image"),
+                    bytes
+                );
+                assert_eq!(image.mime_type, "image/png");
+                assert!(image.uri.is_none());
+            } else {
+                assert_eq!(received.prompt.len(), 1);
+            }
+            provider.shared.connections.lock().await.remove(&project.id);
+            let _ = client_task.await;
+            agent_task.abort();
+        }
     }
 
     fn project(path: &Path) -> Project {
@@ -3572,6 +3798,7 @@ mod tests {
                     supports_load: true,
                     supports_resume: true,
                     supports_close: true,
+                    supports_images: false,
                     models: Vec::new(),
                     current_model: None,
                 },

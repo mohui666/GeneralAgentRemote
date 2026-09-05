@@ -10,8 +10,7 @@ use crate::{
 
 const DEFAULT_MODEL: &str = "grok-4.6";
 const DEFAULT_EFFORT: &str = "high";
-const MOCK_PNG_BASE64: &str =
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z/8/AwMCAO+/ab0AAAAASUVORK5CYII=";
+const MOCK_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGOQm/D/PwAFKgKti6zvbAAAAABJRU5ErkJggg==";
 
 #[derive(Debug, Clone)]
 struct SessionRecord {

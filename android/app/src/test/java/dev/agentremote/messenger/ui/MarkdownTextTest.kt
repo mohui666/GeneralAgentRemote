@@ -49,6 +49,25 @@ class MarkdownTextTest {
     }
 
     @Test
+    fun preservesIdentifierUnderscoresWhileRenderingUnderscoreEmphasis() {
+        val identifier = "ANDROID_REAL_CODEX_COMPLETED file__name__part 中文_变量_名"
+        assertEquals(
+            listOf(MarkdownInline(MarkdownInlineKind.TEXT, identifier)),
+            parseMarkdownInline(identifier),
+        )
+        assertEquals(
+            listOf(
+                MarkdownInline(MarkdownInlineKind.EMPHASIS, "some_value"),
+                MarkdownInline(MarkdownInlineKind.TEXT, " "),
+                MarkdownInline(MarkdownInlineKind.STRONG, "bold_word"),
+                MarkdownInline(MarkdownInlineKind.TEXT, " "),
+                MarkdownInline(MarkdownInlineKind.EMPHASIS, "中文"),
+            ),
+            parseMarkdownInline("_some_value_ __bold_word__ _中文_"),
+        )
+    }
+
+    @Test
     fun unterminatedFenceStillShowsItsCode() {
         val code = parseMarkdownBlocks("```\nanswer").single() as MarkdownBlock.Code
 

@@ -140,6 +140,23 @@ internal fun parseMarkdownInline(text: String): List<MarkdownInline> {
         }
     }
 
+    fun emphasisEnd(marker: String): Int {
+        if (marker[0] != '_') return text.indexOf(marker, index + marker.length)
+        val before = text.getOrNull(index - 1)
+        if (before?.isLetterOrDigit() == true || before == '_' ||
+            text.getOrNull(index + marker.length)?.isWhitespace() == true
+        ) return -1
+        var end = text.indexOf(marker, index + marker.length)
+        while (end >= 0) {
+            val after = text.getOrNull(end + marker.length)
+            if (after?.isLetterOrDigit() != true && after != '_' &&
+                !text[end - 1].isWhitespace()
+            ) return end
+            end = text.indexOf(marker, end + marker.length)
+        }
+        return -1
+    }
+
     while (index < text.length) {
         if (text[index] == '\\' && index + 1 < text.length) {
             plain.append(text[index + 1])
@@ -177,7 +194,7 @@ internal fun parseMarkdownInline(text: String): List<MarkdownInline> {
             else -> null
         }
         if (strongMarker != null) {
-            val end = text.indexOf(strongMarker, index + 2)
+            val end = emphasisEnd(strongMarker)
             if (end > index + 2) {
                 flushPlain()
                 spans += MarkdownInline(MarkdownInlineKind.STRONG, text.substring(index + 2, end))
@@ -187,7 +204,7 @@ internal fun parseMarkdownInline(text: String): List<MarkdownInline> {
         }
         if (text[index] == '*' || text[index] == '_') {
             val marker = text[index]
-            val end = text.indexOf(marker, index + 1)
+            val end = emphasisEnd(marker.toString())
             if (end > index + 1) {
                 flushPlain()
                 spans += MarkdownInline(MarkdownInlineKind.EMPHASIS, text.substring(index + 1, end))
