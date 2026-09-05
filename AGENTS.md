@@ -1,5 +1,30 @@
 # GeneralAgentRemote — Repository Instructions
 
+## Astra 协作约定
+
+- 以用户当前目标和本轮明确约束为准。任务要求实施时，完成实际修改与必要验证，不停在计划、建议或“是否继续”。普通实现选择自行决定；只有缺失信息会实质改变结果或操作超出授权时才询问，并先完成不依赖答案的工作。
+- 用户指令优先于本地 skills 的工作流建议。只读取与当前任务直接相关的文件和技能；不因关键词命中就串联整套技能、生成流程工件或增加审批。
+- 保留既有业务规则、数据所有权、用户改动和明确的工具限制。只改当前目标需要的内容，不顺手重构、升级依赖、搬目录或扩展产品范围。
+
+## 拒绝过度防御性编程
+
+- 直接使用已有输入、文件、依赖和运行环境，不重复做环境、权限、目录或文件存在性预检查。
+- 不为假想故障添加重复参数验证、大量极端输入分支、宽泛 `try/catch`、默认值兜底、静默失败或伪造成功。契约不满足时暴露具体错误。
+- 不主动新增重试、退避、熔断、降级、备用实现、兼容层、自动备份、回滚、迁移或恢复机制。
+- 不主动添加 SHA、MD5、签名、文件哈希、完整性校验、CI/CD、发布门禁、安全扫描、许可证审计、复杂日志、监控、遥测或诊断框架。
+- 不为未来需求预建插件系统、通用框架或抽象层，不为小改动铺设大量单元测试、回归测试、故障注入或性能基准。
+- 只在缺少检查会立即阻止核心功能、造成明显数据损坏或掩盖真实错误时保留最小必要检查。现有鉴权、真实业务校验和数据保护功能继续遵守其契约；本规则不授权删除这些功能。
+- 例外必须来自用户明确要求，或与本次改动直接相关的既有产品契约。旧文档中泛化的“每次全量检查”“必须先审批”“自动完善”不构成额外任务。
+
+## 验证与交付
+
+- 选择能证明本次行为的最小验证：文档或提示词改动检查内容和 diff；代码改动运行相关构建、现有定向测试或核心流程冒烟。低影响、可逆改动不新增仅复述实现的测试。
+- 必要检查通过即交付；只有新改动、失败或具体未解决疑点才扩大或重复验证。不要为了收尾重跑无关全量测试、打包、实机流程或基准。
+- 错误如实报告。区分实际运行通过、静态检查、未运行与真实环境验证；历史测试数量不能当作本次证据。
+- 仅在任务需要时使用子代理；不强制委派、切换模型或修改推理档位，遵守当前会话设置与工具权限。
+- 按当前授权和项目约定执行 Git 操作，只提交本任务文件；不要为清空工作区而夹带其他改动，不强推或丢弃用户内容。没有远端时报告，不擅自创建远端。
+- 用简明中文交代实际修改、验证结果和已知问题。只有需求、接口或已验证事实改变时同步相关文档，不追加与交付无关的报告。
+
 ## 1. Product definition
 
 GeneralAgentRemote is a **remote messaging client for coding agents**. Its primary flow is:
@@ -258,69 +283,22 @@ After the first meaningful user message:
 
 ## 10. Engineering workflow
 
-Before editing:
-
-1. inspect the repository layout, manifests, generated schemas, existing adapters, state stores, and relevant tests;
-2. trace the current end-to-end data flow before proposing a replacement;
-3. use existing naming, error, serialization, and state-management conventions;
-4. identify whether a change requires Host, Relay, client, persistence, and provider-adapter updates.
-
-During implementation:
-
-- implement a real end-to-end path, not a visual mock;
-- do not rewrite the entire project for a localized feature;
-- keep protocol changes typed, versioned, and backward-compatible where practical;
-- add migrations for persisted schema changes;
-- make network and send operations idempotent;
-- preserve drafts and cached data on recoverable failures;
-- add focused tests for state transitions, deduplication, reconnection, and provider capability differences;
-- do not add production dependencies unless they solve a concrete need and fit the current stack;
-- do not stop after producing a plan when the task asks for implementation.
-
-When the user corrects the same repository assumption more than once, update this file with the durable rule rather than relying on conversation memory.
+- Trace only the affected Host, Relay, client, persistence, or adapter path and implement the requested behavior end to end.
+- Preserve the scoped identity, provider authority, draft preservation, and capability contracts above. Reconnection and synchronization are product behavior; they do not justify unrelated defensive infrastructure.
+- Persisted data changes require the existing migration mechanism only when the schema actually changes. Avoid parallel compatibility paths.
+- Reuse the repository's types, conventions, and dependencies. Update stable project guidance when the user explicitly asks or a confirmed project contract changes.
 
 ## 11. Verification
 
-Discover and use the repository's actual commands from its manifests and scripts. Do not invent script names.
+Read actual commands from the affected manifest or `cargo xtask` command. Run the smallest relevant check/test or one core-flow smoke test. Documentation changes need content and diff review only.
 
-For affected Rust workspaces, normally run the applicable equivalents of:
+For a network, persistence, or send-path change, exercise that affected transition; do not repeat every startup, reconnect, attachment, mobile, and provider scenario. Real-provider results require a real provider run. UI/device claims require the corresponding rendered app or device evidence.
 
-- formatting check;
-- Clippy/static analysis with warnings treated as errors where the project supports it;
-- relevant unit/integration tests;
-- workspace build/check.
-
-For the client, normally run the repository-defined equivalents of:
-
-- formatting/lint;
-- type checking;
-- unit/component tests;
-- production build.
-
-Also verify the relevant manual flows:
-
-- cold-start automatic connection;
-- offline startup and later recovery;
-- switching Host/Agent without state leakage;
-- project restoration and invalid-project fallback;
-- remote conversation discovery and history resume;
-- reconnection without duplicate messages/subscriptions;
-- one-click new conversation without duplicate remote creation;
-- automatic title generation and manual-rename lock;
-- attachment success, rejection, retry, and draft preservation;
-- compact desktop sidebar and mobile drawer;
-- permission/model/effort capability handling.
+The Android procedure below is an optional recipe for Android work, not a checklist for every task.
 
 ## 12. Definition of done
 
-A task is complete only when:
-
-- the requested behavior works through the real Host/Relay/client/provider path;
-- no fake models, projects, conversations, or activity events were introduced;
-- persistence and reconnection behavior are defined;
-- relevant tests/checks pass, or exact pre-existing blockers are reported;
-- the diff is reviewed for duplicate listeners, state leakage, security regressions, and mobile layout regressions;
-- the final report lists implemented behavior, principal files changed, protocol/data-model changes, commands run, results, and remaining provider limitations.
+The requested path is implemented, directly relevant validation is complete, and failures or unavailable real-provider/device checks are reported accurately. Report behavior, principal files, validation, and remaining limitations without expanding the task.
 
 ## 13. Android 16 emulator test tutorial
 
