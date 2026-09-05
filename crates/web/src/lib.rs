@@ -2,9 +2,49 @@
 mod ui;
 
 #[cfg(any(target_arch = "wasm32", test))]
-use agent_remote_protocol::{ClientCommand, Conversation, ProjectId, ProviderId};
+use agent_remote_protocol::{
+    ClientCommand, Conversation, ConversationId, ConversationState, HostId, ProjectId, ProviderId,
+    TimelineItemKind,
+};
 #[cfg(any(target_arch = "wasm32", test))]
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd};
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(target_arch = "wasm32", derive(serde::Serialize, serde::Deserialize))]
+pub(crate) struct DraftScope {
+    pub(crate) host_id: HostId,
+    pub(crate) provider: ProviderId,
+    pub(crate) project_id: ProjectId,
+    /// `None` is the draft for the project's new-conversation composer.
+    pub(crate) conversation_id: Option<ConversationId>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn draft_scope(
+    host_id: HostId,
+    provider: ProviderId,
+    project_id: Option<ProjectId>,
+    conversation_id: Option<ConversationId>,
+) -> Option<DraftScope> {
+    Some(DraftScope {
+        host_id,
+        provider,
+        project_id: project_id?,
+        conversation_id,
+    })
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(serde::Serialize, serde::Deserialize))]
+pub(crate) enum ConversationSortMode {
+    // Android's Agent mode reduces to Recent here because the Web tree is already
+    // scoped to exactly one selected Provider.
+    #[default]
+    Recent,
+    Active,
+}
 
 #[cfg(any(target_arch = "wasm32", test))]
 fn conversation_belongs_to_project(
@@ -15,9 +55,47 @@ fn conversation_belongs_to_project(
     conversation.project_id == project_id && conversation.provider == provider
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(test)]
 fn sort_conversations_newest_first(conversations: &mut [&Conversation]) {
-    conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.updated_at_ms));
+    sort_conversations(conversations, ConversationSortMode::Recent);
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn sort_conversations(conversations: &mut [&Conversation], mode: ConversationSortMode) {
+    conversations.sort_by(|left, right| {
+        let active_order = match mode {
+            ConversationSortMode::Recent => std::cmp::Ordering::Equal,
+            ConversationSortMode::Active => {
+                conversation_is_active(right).cmp(&conversation_is_active(left))
+            }
+        };
+        active_order
+            .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn conversation_is_active(conversation: &Conversation) -> bool {
+    matches!(
+        conversation.state,
+        ConversationState::Running | ConversationState::NeedsApproval
+    )
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn is_collapsible_activity(kind: &TimelineItemKind) -> bool {
+    matches!(
+        kind,
+        TimelineItemKind::Progress { .. }
+            | TimelineItemKind::ToolCall { .. }
+            | TimelineItemKind::Command { .. }
+            | TimelineItemKind::FileChange { .. }
+            | TimelineItemKind::Approval {
+                resolved_option: Some(_),
+                ..
+            }
+    )
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -100,14 +178,47 @@ mod tests {
     };
 
     use super::{
-        conversation_belongs_to_project, increment_send_attempt, markdown_to_safe_html,
-        retryable_send_rejection, sort_conversations_newest_first,
+        ConversationSortMode, conversation_belongs_to_project, draft_scope, increment_send_attempt,
+        markdown_to_safe_html, retryable_send_rejection, sort_conversations,
+        sort_conversations_newest_first,
     };
+
+    #[test]
+    fn unresolved_approvals_and_errors_remain_visible() {
+        use agent_remote_protocol::{ApprovalId, TimelineItemKind};
+        let mut approval = TimelineItemKind::Approval {
+            approval_id: ApprovalId::new(),
+            prompt: "Allow edit?".to_owned(),
+            options: Vec::new(),
+            resolved_option: None,
+        };
+        assert!(!super::is_collapsible_activity(&approval));
+        if let TimelineItemKind::Approval {
+            resolved_option, ..
+        } = &mut approval
+        {
+            *resolved_option = Some("allow".to_owned());
+        }
+        assert!(super::is_collapsible_activity(&approval));
+        assert!(!super::is_collapsible_activity(&TimelineItemKind::Error {
+            code: "failed".to_owned(),
+            message: "Could not continue".to_owned(),
+        }));
+    }
 
     fn conversation(
         project_id: ProjectId,
         provider: ProviderId,
         updated_at_ms: i64,
+    ) -> Conversation {
+        conversation_in_state(project_id, provider, updated_at_ms, ConversationState::Idle)
+    }
+
+    fn conversation_in_state(
+        project_id: ProjectId,
+        provider: ProviderId,
+        updated_at_ms: i64,
+        state: ConversationState,
     ) -> Conversation {
         Conversation {
             id: ConversationId::new(),
@@ -120,10 +231,42 @@ mod tests {
             title_updated_at_ms: updated_at_ms,
             selected_model: None,
             selected_effort: None,
-            state: ConversationState::Idle,
+            state,
             session_options: Vec::new(),
             updated_at_ms,
         }
+    }
+
+    #[test]
+    fn draft_scope_isolated_by_host_provider_project_and_conversation() {
+        let host = agent_remote_protocol::HostId::new();
+        let other_host = agent_remote_protocol::HostId::new();
+        let project = ProjectId::new();
+        let other_project = ProjectId::new();
+        let conversation = ConversationId::new();
+
+        let new_conversation = draft_scope(host, ProviderId::Codex, Some(project), None).unwrap();
+        assert_eq!(
+            new_conversation,
+            draft_scope(host, ProviderId::Codex, Some(project), None).unwrap()
+        );
+        assert_ne!(
+            new_conversation,
+            draft_scope(host, ProviderId::Codex, Some(project), Some(conversation)).unwrap()
+        );
+        assert_ne!(
+            new_conversation,
+            draft_scope(host, ProviderId::Grok, Some(project), None).unwrap()
+        );
+        assert_ne!(
+            new_conversation,
+            draft_scope(host, ProviderId::Codex, Some(other_project), None).unwrap()
+        );
+        assert_ne!(
+            new_conversation,
+            draft_scope(other_host, ProviderId::Codex, Some(project), None).unwrap()
+        );
+        assert!(draft_scope(host, ProviderId::Codex, None, None).is_none());
     }
 
     #[test]
@@ -165,6 +308,39 @@ mod tests {
                 .map(|conversation| conversation.updated_at_ms)
                 .collect::<Vec<_>>(),
             vec![30, 20, 10]
+        );
+    }
+
+    #[test]
+    fn active_sort_keeps_running_and_approval_conversations_first() {
+        let project = ProjectId::new();
+        let newest_idle =
+            conversation_in_state(project, ProviderId::Codex, 50, ConversationState::Idle);
+        let running =
+            conversation_in_state(project, ProviderId::Codex, 20, ConversationState::Running);
+        let approval = conversation_in_state(
+            project,
+            ProviderId::Codex,
+            30,
+            ConversationState::NeedsApproval,
+        );
+        let older_idle =
+            conversation_in_state(project, ProviderId::Codex, 10, ConversationState::Completed);
+        let mut items = vec![&newest_idle, &running, &approval, &older_idle];
+
+        sort_conversations(&mut items, ConversationSortMode::Active);
+
+        assert_eq!(
+            items
+                .into_iter()
+                .map(|conversation| (conversation.state, conversation.updated_at_ms))
+                .collect::<Vec<_>>(),
+            vec![
+                (ConversationState::NeedsApproval, 30),
+                (ConversationState::Running, 20),
+                (ConversationState::Idle, 50),
+                (ConversationState::Completed, 10),
+            ]
         );
     }
 

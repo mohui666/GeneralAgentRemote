@@ -60,6 +60,7 @@ data class RemoteUiState(
     val timelineByConversation: Map<UUID, List<TimelineItem>> = emptyMap(),
     val selectedConversationId: UUID? = null,
     val showingNewConversation: Boolean = false,
+    val showingConnections: Boolean = false,
     val selectedProjectId: UUID? = null,
     val selectedProvider: ProviderId? = null,
     val selectedModel: String? = null,
@@ -352,6 +353,10 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
 
     fun setPairLink(value: String) = mutableState.update { it.copy(pairLink = value) }
 
+    fun showConnections() = mutableState.update { it.copy(showingConnections = true) }
+
+    fun hideConnections() = mutableState.update { it.copy(showingConnections = false) }
+
     fun reportError(message: String) = showError(message)
 
     fun pair() {
@@ -390,6 +395,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                 sendStatus = SendStatus.IDLE,
                 sendFailure = null,
                 connecting = true,
+                showingConnections = false,
                 retryEnabled = true,
             )
         }
@@ -442,6 +448,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                     expandedProjectScopes = restored.expandedProjectScopes,
                     projectExpansionInitialized = restored.projectExpansionWasPersisted,
                     connecting = true,
+                    showingConnections = false,
                     retryEnabled = true,
                     reconnectAttempt = 0,
                     historyBefore = emptyMap(),

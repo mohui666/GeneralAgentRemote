@@ -23,7 +23,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
@@ -39,8 +38,6 @@ import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 
-private val MarkdownMuted = Color(0xFFA7A7AD)
-private val MarkdownLink = Color(0xFFA477ED)
 private val MarkdownFencePattern = Regex("^\\s*(```|~~~)(.*)$")
 private val MarkdownHeadingPattern = Regex("^\\s*(#{1,6})\\s+(.+?)\\s*#*\\s*$")
 private val MarkdownUnorderedPattern = Regex("^\\s*[-+*]\\s+(.+)$")
@@ -214,27 +211,29 @@ internal fun MarkdownText(
     val blocks = remember(markdown) { parseMarkdownBlocks(markdown) }
     val clipboard = LocalClipboardManager.current
     SelectionContainer {
-        Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
             blocks.forEachIndexed { blockIndex, block ->
                 when (block) {
                     is MarkdownBlock.Heading -> Text(
                         text = markdownAnnotatedString(block.text),
                         style = when (block.level) {
-                            1 -> MaterialTheme.typography.headlineMedium
-                            2 -> MaterialTheme.typography.titleLarge
+                            1 -> MaterialTheme.typography.titleLarge
+                            2 -> MaterialTheme.typography.titleMedium
                             else -> MaterialTheme.typography.titleMedium
                         },
+                        color = RemoteText,
                         fontWeight = FontWeight.SemiBold,
                     )
                     is MarkdownBlock.Paragraph -> Text(
                         text = markdownAnnotatedString(block.text),
                         style = MaterialTheme.typography.bodyLarge,
+                        color = RemoteText,
                     )
                     is MarkdownBlock.Code -> Column(
                         Modifier
                             .fillMaxWidth()
-                            .background(Color(0xFF101011), RoundedCornerShape(10.dp))
-                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                            .background(RemoteSurfaceRaised, RoundedCornerShape(4.dp))
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
                         verticalArrangement = Arrangement.spacedBy(5.dp),
                     ) {
                         Row(
@@ -244,7 +243,7 @@ internal fun MarkdownText(
                             Text(
                                 block.language ?: "代码",
                                 modifier = Modifier.weight(1f),
-                                color = MarkdownMuted,
+                                color = RemoteMuted,
                                 style = MaterialTheme.typography.labelSmall,
                             )
                             IconButton(
@@ -261,15 +260,16 @@ internal fun MarkdownText(
                                     Icons.Rounded.ContentCopy,
                                     contentDescription = "复制代码",
                                     modifier = Modifier.size(18.dp),
-                                    tint = MarkdownMuted,
+                                    tint = RemoteMuted,
                                 )
                             }
                         }
                         Text(
                             block.text,
-                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            modifier = Modifier.horizontalScroll(rememberScrollState()).padding(bottom = 6.dp),
                             fontFamily = FontFamily.Monospace,
                             style = MaterialTheme.typography.bodyMedium,
+                            color = RemoteText,
                         )
                     }
                     is MarkdownBlock.ListItems -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -278,13 +278,14 @@ internal fun MarkdownText(
                                 Text(
                                     if (block.ordered) "${itemIndex + 1}." else "•",
                                     modifier = Modifier.width(24.dp),
-                                    color = MarkdownMuted,
+                                    color = RemoteMuted,
                                     style = MaterialTheme.typography.bodyLarge,
                                 )
                                 Text(
                                     text = markdownAnnotatedString(item),
                                     modifier = Modifier.weight(1f),
                                     style = MaterialTheme.typography.bodyLarge,
+                                    color = RemoteText,
                                 )
                             }
                         }
@@ -298,12 +299,14 @@ internal fun MarkdownText(
 @Composable
 private fun markdownAnnotatedString(text: String): AnnotatedString {
     val inline = remember(text) { parseMarkdownInline(text) }
-    val linkStyle = remember {
+    val accent = RemoteAccent
+    val inlineCodeBackground = RemoteSurfaceRaised
+    val linkStyle = remember(accent) {
         TextLinkStyles(
-            style = SpanStyle(color = MarkdownLink, textDecoration = TextDecoration.Underline),
+            style = SpanStyle(color = accent, textDecoration = TextDecoration.Underline),
         )
     }
-    return remember(inline, linkStyle) {
+    return remember(inline, linkStyle, inlineCodeBackground) {
         buildAnnotatedString {
             inline.forEach { span ->
                 when (span.kind) {
@@ -311,7 +314,7 @@ private fun markdownAnnotatedString(text: String): AnnotatedString {
                     MarkdownInlineKind.STRONG -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(span.text) }
                     MarkdownInlineKind.EMPHASIS -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { append(span.text) }
                     MarkdownInlineKind.CODE -> withStyle(
-                        SpanStyle(fontFamily = FontFamily.Monospace, background = Color(0xFF28282A)),
+                        SpanStyle(fontFamily = FontFamily.Monospace, background = inlineCodeBackground),
                     ) { append(span.text) }
                     MarkdownInlineKind.LINK -> {
                         val destination = span.destination.orEmpty()

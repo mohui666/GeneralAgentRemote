@@ -1,5 +1,6 @@
 package dev.agentremote.messenger.ui
 
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -53,6 +54,7 @@ import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.TouchApp
 import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.AttachFile
 import androidx.compose.material.icons.rounded.ChatBubbleOutline
@@ -78,6 +80,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalDrawerSheet
@@ -90,8 +93,6 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.Typography
-import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -105,12 +106,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -118,11 +122,9 @@ import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -144,57 +146,12 @@ import dev.agentremote.messenger.model.TimelineItem
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.distinctUntilChanged
-
-private val RemoteBlack = Color(0xFF000000)
-private val RemoteSurface = Color(0xFF141414)
-private val RemoteSurfaceRaised = Color(0xFF1E1E1F)
-private val RemoteBorder = Color(0xFF343436)
-private val RemoteText = Color(0xFFF5F5F6)
-private val RemoteMuted = Color(0xFFA7A7AD)
-private val RemotePurple = Color(0xFFA477ED)
-private val RemoteGreen = Color(0xFF58D59A)
-private val RemoteOrange = Color(0xFFFF6B2C)
-
-private val AgentRemoteColors = darkColorScheme(
-    primary = RemotePurple,
-    onPrimary = Color.White,
-    primaryContainer = Color(0xFF302342),
-    onPrimaryContainer = Color(0xFFF4E9FF),
-    secondary = Color(0xFFD0B7F4),
-    secondaryContainer = Color(0xFF362B43),
-    onSecondaryContainer = Color(0xFFF2E7FF),
-    background = RemoteBlack,
-    onBackground = RemoteText,
-    surface = RemoteSurface,
-    onSurface = RemoteText,
-    surfaceVariant = RemoteSurfaceRaised,
-    onSurfaceVariant = RemoteMuted,
-    outline = RemoteBorder,
-    error = Color(0xFFFF7483),
-    errorContainer = Color(0xFF35161C),
-    onErrorContainer = Color(0xFFFFDADF),
-)
-
-private val AgentRemoteTypography = Typography(
-    displaySmall = TextStyle(fontFamily = FontFamily.SansSerif, fontSize = 34.sp, lineHeight = 40.sp, fontWeight = FontWeight.SemiBold),
-    headlineMedium = TextStyle(fontFamily = FontFamily.SansSerif, fontSize = 26.sp, lineHeight = 32.sp, fontWeight = FontWeight.SemiBold),
-    titleLarge = TextStyle(fontFamily = FontFamily.SansSerif, fontSize = 21.sp, lineHeight = 28.sp, fontWeight = FontWeight.SemiBold),
-    titleMedium = TextStyle(fontFamily = FontFamily.SansSerif, fontSize = 18.sp, lineHeight = 24.sp, fontWeight = FontWeight.Medium),
-    bodyLarge = TextStyle(fontFamily = FontFamily.SansSerif, fontSize = 17.sp, lineHeight = 27.sp, fontWeight = FontWeight.Normal),
-    bodyMedium = TextStyle(fontFamily = FontFamily.SansSerif, fontSize = 15.sp, lineHeight = 22.sp, fontWeight = FontWeight.Normal),
-    bodySmall = TextStyle(fontFamily = FontFamily.SansSerif, fontSize = 13.sp, lineHeight = 18.sp, fontWeight = FontWeight.Normal),
-    labelLarge = TextStyle(fontFamily = FontFamily.SansSerif, fontSize = 15.sp, lineHeight = 20.sp, fontWeight = FontWeight.Medium),
-    labelMedium = TextStyle(fontFamily = FontFamily.SansSerif, fontSize = 13.sp, lineHeight = 18.sp, fontWeight = FontWeight.Medium),
-    labelSmall = TextStyle(fontFamily = FontFamily.SansSerif, fontSize = 12.sp, lineHeight = 16.sp, fontWeight = FontWeight.Medium),
-)
-
-@Composable
-fun AgentRemoteTheme(content: @Composable () -> Unit) {
-    MaterialTheme(colorScheme = AgentRemoteColors, typography = AgentRemoteTypography, content = content)
-}
 
 @Composable
 fun RemoteApp(viewModel: RemoteViewModel) {
@@ -223,7 +180,7 @@ fun RemoteApp(viewModel: RemoteViewModel) {
             .background(MaterialTheme.colorScheme.background)
             .semantics { testTagsAsResourceId = true },
     ) {
-        if (state.snapshot == null) {
+        if (state.snapshot == null || state.showingConnections) {
             ConnectionScreen(state, viewModel)
         } else {
             ConversationShell(state, viewModel)
@@ -232,6 +189,9 @@ fun RemoteApp(viewModel: RemoteViewModel) {
             hostState = snackbar,
             modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().imePadding(),
         )
+    }
+    BackHandler(enabled = state.showingConnections && state.snapshot != null) {
+        viewModel.hideConnections()
     }
 }
 
@@ -250,7 +210,7 @@ private fun ConnectionScreen(state: RemoteUiState, viewModel: RemoteViewModel) {
         Modifier
             .fillMaxSize()
             .statusBarsPadding()
-            .navigationBarsPadding()
+            .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp, vertical = 18.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
@@ -260,6 +220,9 @@ private fun ConnectionScreen(state: RemoteUiState, viewModel: RemoteViewModel) {
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            if (state.snapshot != null) {
+                FloatingIconButton(RemoteGlyph.Back, "返回会话", viewModel::hideConnections)
+            }
             Column {
                 Text("远程", style = MaterialTheme.typography.titleLarge)
                 Text("Agent Remote", color = RemoteMuted, style = MaterialTheme.typography.bodySmall)
@@ -269,18 +232,18 @@ private fun ConnectionScreen(state: RemoteUiState, viewModel: RemoteViewModel) {
         Spacer(Modifier.height(18.dp))
         Text("连接你的电脑", style = MaterialTheme.typography.displaySmall)
         Text(
-            "在手机上继续电脑里的 Codex 与 Grok 会话。项目文件和 Agent 都留在 Host。",
+            "继续电脑上的会话，随时查看任务进展。",
             style = MaterialTheme.typography.bodyLarge,
             color = RemoteMuted,
         )
         Surface(
             modifier = Modifier.fillMaxWidth(),
             color = RemoteSurface,
-            shape = RoundedCornerShape(28.dp),
+            shape = RoundedCornerShape(12.dp),
             border = BorderStroke(1.dp, RemoteBorder),
         ) {
             Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                Text("配对新 Host", style = MaterialTheme.typography.titleLarge)
+                Text("添加电脑", style = MaterialTheme.typography.titleLarge)
                 Text(
                     "在电脑运行 agent-remote-host pair，然后粘贴完整链接。也可以从浏览器把链接分享给本应用。",
                     style = MaterialTheme.typography.bodyMedium,
@@ -293,7 +256,7 @@ private fun ConnectionScreen(state: RemoteUiState, viewModel: RemoteViewModel) {
                     label = { Text("配对链接") },
                     placeholder = { Text("http://host/#host=…&pair=…") },
                     minLines = 3,
-                    shape = RoundedCornerShape(18.dp),
+                    shape = RoundedCornerShape(12.dp),
                 )
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     OutlinedButton(
@@ -309,7 +272,7 @@ private fun ConnectionScreen(state: RemoteUiState, viewModel: RemoteViewModel) {
                                 }
                         },
                         modifier = Modifier.weight(1f).height(48.dp),
-                        shape = RoundedCornerShape(16.dp),
+                        shape = RoundedCornerShape(12.dp),
                         border = BorderStroke(1.dp, RemoteBorder),
                     ) {
                         RemoteIcon(RemoteGlyph.Scan, "扫码", Modifier.size(20.dp))
@@ -319,7 +282,7 @@ private fun ConnectionScreen(state: RemoteUiState, viewModel: RemoteViewModel) {
                     OutlinedButton(
                         onClick = { clipboard.getText()?.text?.let(viewModel::setPairLink) },
                         modifier = Modifier.weight(1f).height(48.dp),
-                        shape = RoundedCornerShape(16.dp),
+                        shape = RoundedCornerShape(12.dp),
                         border = BorderStroke(1.dp, RemoteBorder),
                     ) {
                         RemoteIcon(RemoteGlyph.Paste, "粘贴", Modifier.size(20.dp))
@@ -331,12 +294,12 @@ private fun ConnectionScreen(state: RemoteUiState, viewModel: RemoteViewModel) {
                     onClick = viewModel::pair,
                     enabled = state.pairLink.isNotBlank() && !state.connecting,
                     modifier = Modifier.fillMaxWidth().height(52.dp),
-                    shape = RoundedCornerShape(18.dp),
+                    shape = RoundedCornerShape(12.dp),
                 ) { Text(if (state.connecting) "正在连接…" else "连接并配对") }
             }
         }
         if (state.credentials.isNotEmpty()) {
-            Text("已保存 Host", style = MaterialTheme.typography.titleLarge)
+            Text("保存的电脑", style = MaterialTheme.typography.titleLarge)
             state.credentials.forEach { credential ->
                 SavedHostCard(
                     credential = credential,
@@ -354,7 +317,7 @@ private fun StatusCard(text: String, online: Boolean) {
     Surface(
         modifier = Modifier.testTag("gar.connection.status"),
         color = RemoteSurfaceRaised,
-        shape = RoundedCornerShape(999.dp),
+        shape = RoundedCornerShape(10.dp),
         border = BorderStroke(1.dp, RemoteBorder),
     ) {
         Row(
@@ -378,7 +341,7 @@ private fun SavedHostCard(
     Surface(
         modifier = Modifier.fillMaxWidth(),
         color = RemoteSurface,
-        shape = RoundedCornerShape(24.dp),
+        shape = RoundedCornerShape(12.dp),
         border = BorderStroke(1.dp, RemoteBorder),
     ) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -403,7 +366,7 @@ private fun SavedHostCard(
                 Button(
                     onClick = onConnect,
                     enabled = !connecting,
-                    shape = RoundedCornerShape(16.dp),
+                    shape = RoundedCornerShape(12.dp),
                 ) { Text(if (connecting) "连接中" else "连接") }
             }
         }
@@ -413,6 +376,7 @@ private fun SavedHostCard(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) {
+    val compactInput = useCompactInputLayout()
     val snapshot = requireNotNull(state.snapshot)
     val drawerState = androidx.compose.material3.rememberDrawerState(androidx.compose.material3.DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -460,11 +424,17 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
         },
     ) {
         Scaffold(
-            containerColor = RemoteBlack,
+            containerColor = RemoteBackground,
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
             topBar = {
-                RemoteTopBar(
+                if (compactInput) {
+                    Spacer(Modifier.fillMaxWidth().statusBarsPadding())
+                } else RemoteTopBar(
                     hostName = snapshot.hostName,
+                    conversation = selectedConversation.takeUnless { state.showingNewConversation },
+                    title = if (state.showingNewConversation) "新对话" else "会话",
+                    subtitle = listOfNotNull(state.selectedProvider?.label, snapshot.projects.find { it.id == state.selectedProjectId }?.displayName).joinToString(" · "),
+                    onRename = viewModel::renameConversation,
                     online = state.online,
                     menuExpanded = menuExpanded,
                     sortMode = sortMode,
@@ -479,6 +449,10 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
                     onShowProjects = {
                         menuExpanded = false
                         scope.launch { drawerState.open() }
+                    },
+                    onManageConnections = {
+                        menuExpanded = false
+                        viewModel.showConnections()
                     },
                     onDisconnect = {
                         menuExpanded = false
@@ -496,8 +470,12 @@ private fun ConversationShell(state: RemoteUiState, viewModel: RemoteViewModel) 
             }
         }
     }
-    BackHandler(enabled = state.showingNewConversation || selectedConversation != null) {
-        viewModel.showConversationList()
+    BackHandler(enabled = drawerState.isOpen || state.showingNewConversation || selectedConversation != null) {
+        if (drawerState.isOpen) {
+            scope.launch { drawerState.close() }
+        } else {
+            viewModel.showConversationList()
+        }
     }
 }
 
@@ -658,7 +636,7 @@ private fun RemoteDrawer(
                             .fillMaxWidth()
                             .height(46.dp)
                             .testTag("gar.conversation.new"),
-                        shape = RoundedCornerShape(14.dp),
+                        shape = RoundedCornerShape(12.dp),
                     ) {
                         RemoteIcon(RemoteGlyph.Compose, null, Modifier.size(19.dp))
                         Spacer(Modifier.width(7.dp))
@@ -678,7 +656,7 @@ private fun RemoteDrawer(
                 singleLine = true,
                 placeholder = { Text("搜索项目或对话", maxLines = 1) },
                 leadingIcon = { RemoteIcon(RemoteGlyph.Search, null, Modifier.size(18.dp), RemoteMuted) },
-                shape = RoundedCornerShape(13.dp),
+                shape = RoundedCornerShape(12.dp),
             )
             LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 6.dp)) {
                 listOf(
@@ -833,7 +811,7 @@ private fun AgentSelector(
                 .then(if (canSwitch) Modifier.clickable { expanded = true } else Modifier),
             color = Color.Transparent,
             shape = RoundedCornerShape(12.dp),
-            border = BorderStroke(1.dp, if (selected != null) RemotePurple else RemoteBorder),
+            border = BorderStroke(1.dp, RemoteBorder),
         ) {
             Row(
                 Modifier.fillMaxSize().padding(horizontal = 10.dp),
@@ -868,7 +846,7 @@ private fun AgentSelector(
                     modifier = Modifier.testTag("gar.agent.${provider.wire}"),
                     leadingIcon = {
                         if (provider == selected) {
-                            RemoteIcon(RemoteGlyph.Check, null, Modifier.size(18.dp), RemotePurple)
+                            RemoteIcon(RemoteGlyph.Check, null, Modifier.size(18.dp), RemoteText)
                         }
                     },
                     contentPadding = PaddingValues(horizontal = 12.dp),
@@ -928,7 +906,7 @@ private fun DrawerProjectRow(
                 )
             }
             IconButton(onClick = onPin, modifier = Modifier.size(44.dp)) {
-                Text(if (pinned) "★" else "☆", color = if (pinned) RemotePurple else RemoteMuted)
+                Text(if (pinned) "★" else "☆", color = if (pinned) RemoteText else RemoteMuted)
             }
         }
     }
@@ -946,7 +924,7 @@ private fun DrawerConversationRow(
             .padding(start = 38.dp, end = 4.dp, top = 1.dp, bottom = 1.dp)
             .heightIn(min = 44.dp)
             .clip(RoundedCornerShape(10.dp))
-            .background(if (selected) Color(0xFF28232F) else Color.Transparent)
+            .background(if (selected) RemoteSurfaceRaised else Color.Transparent)
             .clickable(onClick = onClick)
             .padding(horizontal = 10.dp, vertical = 6.dp)
             .testTag("gar.conversation.${conversation.id}"),
@@ -986,6 +964,10 @@ private fun activityLabel(updatedAtMs: Long?): String {
 @Composable
 private fun RemoteTopBar(
     hostName: String,
+    conversation: Conversation?,
+    title: String,
+    subtitle: String,
+    onRename: (String) -> Unit,
     online: Boolean,
     menuExpanded: Boolean,
     sortMode: HomeSort,
@@ -994,59 +976,38 @@ private fun RemoteTopBar(
     onDismissMenu: () -> Unit,
     onSort: (HomeSort) -> Unit,
     onShowProjects: () -> Unit,
+    onManageConnections: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
-    Box(
-        Modifier
-            .fillMaxWidth()
-            .background(RemoteBlack)
-            .statusBarsPadding()
-            .padding(horizontal = 18.dp, vertical = 10.dp),
-    ) {
-        FloatingIconButton(
-            glyph = RemoteGlyph.Menu,
-            description = "打开项目导航",
-            onClick = onNavigation,
-            modifier = Modifier.align(Alignment.CenterStart).testTag("gar.drawer.open"),
-        )
-        Column(
-            modifier = Modifier
-                .align(Alignment.Center)
-                .widthIn(max = 120.dp)
-                .testTag("gar.connection.status"),
-            horizontalAlignment = Alignment.CenterHorizontally,
+    Column(Modifier.fillMaxWidth().background(RemoteBackground).statusBarsPadding()) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("远程", style = MaterialTheme.typography.titleLarge)
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                OnlineDot(online)
-                Spacer(Modifier.width(6.dp))
-                RemoteIcon(RemoteGlyph.Computer, null, Modifier.size(15.dp), RemoteMuted)
-                Spacer(Modifier.width(5.dp))
-                Text(
-                    hostName,
-                    color = RemoteMuted,
-                    style = MaterialTheme.typography.bodySmall,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+            FloatingIconButton(
+                glyph = RemoteGlyph.Menu,
+                description = "打开项目导航",
+                onClick = onNavigation,
+                modifier = Modifier.testTag("gar.drawer.open"),
+            )
+            Column(Modifier.weight(1f).padding(horizontal = 8.dp)) {
+                if (conversation != null) {
+                    ConversationHeader(conversation, onRename)
+                } else {
+                    Text(title, style = MaterialTheme.typography.titleMedium)
+                    Text(subtitle.ifBlank { hostName }, color = RemoteMuted, style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            Box(Modifier.padding(8.dp).testTag("gar.connection.status").semantics {
+                contentDescription = "$hostName · ${if (online) "在线" else "离线"}"
+            }) { OnlineDot(online) }
+            Box {
+                FloatingIconButton(RemoteGlyph.More, "更多选项", onToggleMenu)
+                RemoteOverflowMenu(menuExpanded, sortMode, online, onDismissMenu, onSort, onShowProjects, onManageConnections, onDisconnect)
             }
         }
-        Box(Modifier.align(Alignment.CenterEnd)) {
-            FloatingIconButton(
-                glyph = RemoteGlyph.More,
-                description = "更多选项",
-                onClick = onToggleMenu,
-            )
-            RemoteOverflowMenu(
-                expanded = menuExpanded,
-                sortMode = sortMode,
-                online = online,
-                onDismiss = onDismissMenu,
-                onSort = onSort,
-                onShowProjects = onShowProjects,
-                onDisconnect = onDisconnect,
-            )
-        }
+        HorizontalDivider(color = RemoteBorder.copy(alpha = 0.65f))
     }
 }
 
@@ -1058,13 +1019,14 @@ private fun RemoteOverflowMenu(
     onDismiss: () -> Unit,
     onSort: (HomeSort) -> Unit,
     onShowProjects: () -> Unit,
+    onManageConnections: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
     DropdownMenu(
         expanded = expanded,
         onDismissRequest = onDismiss,
         modifier = Modifier.widthIn(min = 168.dp, max = 220.dp),
-        shape = RoundedCornerShape(18.dp),
+        shape = RoundedCornerShape(12.dp),
         containerColor = RemoteSurfaceRaised,
         border = BorderStroke(1.dp, RemoteBorder),
     ) {
@@ -1075,6 +1037,7 @@ private fun RemoteOverflowMenu(
         HorizontalDivider(Modifier.padding(vertical = 8.dp), color = RemoteBorder)
         MenuSectionLabel("管理")
         RemoteMenuRow(RemoteGlyph.Folder, "项目列表") { onShowProjects() }
+        RemoteMenuRow(RemoteGlyph.Computer, "管理连接") { onManageConnections() }
         RemoteMenuRow(RemoteGlyph.Disconnect, "断开 Host", tint = MaterialTheme.colorScheme.error) { onDisconnect() }
         HorizontalDivider(Modifier.padding(vertical = 8.dp), color = RemoteBorder)
         Row(
@@ -1165,11 +1128,16 @@ private fun RemoteHomeScreen(
     }
 
     Column(Modifier.fillMaxSize()) {
-        Text(
-            "项目",
-            modifier = Modifier.padding(horizontal = 20.dp, vertical = 18.dp),
-            style = MaterialTheme.typography.titleLarge,
-        )
+        Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 12.dp, top = 8.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            Text("当前项目", color = RemoteMuted, style = MaterialTheme.typography.labelMedium, modifier = Modifier.weight(1f))
+            TextButton(onClick = viewModel::showNewConversation, enabled = selectedProject != null,
+                modifier = Modifier.testTag("gar.home.new")) {
+                RemoteIcon(RemoteGlyph.Compose, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(5.dp))
+                Text("新对话")
+            }
+        }
         if (selectedProject == null) {
             Row(
                 Modifier.fillMaxWidth().heightIn(min = 44.dp).padding(horizontal = 20.dp),
@@ -1278,7 +1246,7 @@ private fun ConversationListItem(conversation: Conversation, onClick: () -> Unit
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                "${conversation.provider.label} · ${stateLabel(conversation.state)}",
+                "${conversation.provider.label} · ${stateLabel(conversation.state)} · ${activityLabel(conversation.updatedAtMs)}",
                 modifier = Modifier.padding(top = 3.dp),
                 color = RemoteMuted,
                 style = MaterialTheme.typography.bodySmall,
@@ -1286,16 +1254,10 @@ private fun ConversationListItem(conversation: Conversation, onClick: () -> Unit
         }
         if (conversation.running) {
             Spacer(Modifier.width(10.dp))
-            Surface(color = Color(0xFF153526), shape = RoundedCornerShape(999.dp)) {
-                Text(
-                    "进行中",
-                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
-                    color = RemoteGreen,
-                    style = MaterialTheme.typography.labelSmall,
-                )
-            }
+            Box(Modifier.size(6.dp).background(RemoteSuccess, CircleShape))
         }
     }
+    HorizontalDivider(color = RemoteBorder.copy(alpha = 0.5f))
 }
 
 @Composable
@@ -1304,13 +1266,13 @@ private fun HomeBottomBar(search: String, onSearch: (String) -> Unit) {
         Modifier
             .fillMaxWidth()
             .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
-            .padding(start = 18.dp, top = 12.dp, end = 18.dp),
+            .padding(start = 16.dp, top = 8.dp, end = 16.dp, bottom = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Surface(
             modifier = Modifier.weight(1f).height(52.dp),
             color = RemoteSurfaceRaised,
-            shape = RoundedCornerShape(999.dp),
+            shape = RoundedCornerShape(10.dp),
             border = BorderStroke(1.dp, RemoteBorder),
         ) {
             BasicTextField(
@@ -1345,7 +1307,6 @@ private fun HomeBottomBar(search: String, onSearch: (String) -> Unit) {
 @Composable
 private fun NewConversationScreen(state: RemoteUiState, viewModel: RemoteViewModel) {
     val snapshot = requireNotNull(state.snapshot)
-    val project = snapshot.projects.find { it.id == state.selectedProjectId }
     val capability = snapshot.providerCapabilities.find {
         it.projectId == state.selectedProjectId && it.provider == state.selectedProvider
     }
@@ -1354,15 +1315,6 @@ private fun NewConversationScreen(state: RemoteUiState, viewModel: RemoteViewMod
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
     ) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 13.dp)) {
-            Text("新对话", style = MaterialTheme.typography.titleLarge)
-            Text(
-                "${state.selectedProvider?.label ?: "Agent"} · ${project?.displayName ?: "请选择项目"}",
-                color = RemoteMuted,
-                style = MaterialTheme.typography.bodySmall,
-            )
-            Text("首次发送时才创建远程会话", color = RemoteMuted, style = MaterialTheme.typography.labelSmall)
-        }
         Box(
             Modifier.weight(1f).fillMaxWidth(),
             contentAlignment = Alignment.Center,
@@ -1370,7 +1322,9 @@ private fun NewConversationScreen(state: RemoteUiState, viewModel: RemoteViewMod
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 RemoteIcon(RemoteGlyph.Chat, null, Modifier.size(34.dp), RemoteMuted)
                 Spacer(Modifier.height(10.dp))
-                Text("写下第一条消息", color = RemoteMuted)
+                Text("开始一段对话", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(6.dp))
+                Text("描述任务，或附上相关文件", color = RemoteMuted, style = MaterialTheme.typography.bodyMedium)
                 capability?.limitation?.let {
                     Text(it, color = RemoteMuted, style = MaterialTheme.typography.labelSmall)
                 }
@@ -1423,7 +1377,8 @@ private fun ConversationScreen(
     val timeline = state.timelineByConversation[conversation.id].orEmpty()
     val timelineGrouper = remember(conversation.id) { TimelineBlockGrouper() }
     val timelineBlocks = remember(timeline) { timelineGrouper.update(timeline) }
-    val listState = rememberLazyListState()
+    val listState = rememberSaveable(conversation.id, saver = LazyListState.Saver) { LazyListState() }
+    val scrollScope = rememberCoroutineScope()
     var followingTail by remember(conversation.id) { mutableStateOf(true) }
     LaunchedEffect(listState) {
         snapshotFlow { listState.isScrollInProgress to !listState.canScrollForward }
@@ -1434,7 +1389,7 @@ private fun ConversationScreen(
     }
     LaunchedEffect(timelineBlocks.lastOrNull()?.key, timeline.lastOrNull()?.revision) {
         if (followingTail && timelineBlocks.isNotEmpty()) {
-            listState.scrollToItem(timelineBlocks.lastIndex + 1)
+            listState.scrollToItem(timelineBlocks.size + 1)
         }
     }
     Column(
@@ -1442,7 +1397,6 @@ private fun ConversationScreen(
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
     ) {
-        ConversationHeader(conversation, viewModel::renameConversation)
         if (timeline.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -1456,8 +1410,8 @@ private fun ConversationScreen(
                 LazyColumn(
                     state = listState,
                     modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(start = 20.dp, top = 14.dp, end = 25.dp, bottom = 14.dp),
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                    contentPadding = PaddingValues(start = 18.dp, top = 4.dp, end = 22.dp, bottom = 20.dp),
+                    verticalArrangement = Arrangement.spacedBy(20.dp),
                 ) {
                     item("load-older") {
                         if (conversation.id !in state.historyExhausted) {
@@ -1479,6 +1433,7 @@ private fun ConversationScreen(
                         when (block) {
                             is TimelineBlock.Single -> TimelineCard(
                                 item = block.item,
+                                providerLabel = conversation.provider.label,
                                 attachment = (block.item.content as? TimelineContent.Image)?.let {
                                     state.attachments[it.attachmentId]
                                 },
@@ -1493,6 +1448,20 @@ private fun ConversationScreen(
                             )
                         }
                     }
+                    item("timeline-end") { Spacer(Modifier.height(1.dp)) }
+                }
+                if (!followingTail && listState.canScrollForward) {
+                    OutlinedButton(
+                        onClick = { followingTail = true; scrollScope.launch { listState.animateScrollToItem(timelineBlocks.size + 1) } },
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(12.dp).testTag("gar.timeline.latest"),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(containerColor = RemoteSurface),
+                        contentPadding = PaddingValues(horizontal = 12.dp),
+                    ) {
+                        RemoteIcon(RemoteGlyph.Latest, null, Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("最新消息", style = MaterialTheme.typography.labelMedium)
+                    }
                 }
                 CodexScrollbar(
                     state = listState,
@@ -1506,6 +1475,7 @@ private fun ConversationScreen(
             online = state.online,
             supportsSteer = capability?.supportsSteer == true,
             sessionOptions = conversation.sessionOptions,
+            existingConversation = true,
             capability = capability,
             selectedModel = conversation.selectedModel,
             selectedEffort = conversation.selectedEffort,
@@ -1532,7 +1502,7 @@ private fun ConversationHeader(conversation: Conversation, onRename: (String) ->
     var editing by rememberSaveable(conversation.id) { mutableStateOf(false) }
     var title by remember(conversation.id, conversation.title) { mutableStateOf(conversation.title) }
     Row(
-        Modifier.fillMaxWidth().background(RemoteBlack).padding(horizontal = 20.dp, vertical = 12.dp),
+        Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f).clickable { editing = true }) {
@@ -1543,18 +1513,17 @@ private fun ConversationHeader(conversation: Conversation, onRename: (String) ->
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                conversation.provider.label,
+                "${conversation.provider.label} · ${stateLabel(conversation.state)}",
                 color = RemoteMuted,
                 style = MaterialTheme.typography.bodySmall,
             )
         }
-        StatePill(conversation.state)
     }
     if (editing) {
         Dialog(onDismissRequest = { editing = false }) {
             Surface(
                 color = RemoteSurfaceRaised,
-                shape = RoundedCornerShape(22.dp),
+                shape = RoundedCornerShape(12.dp),
                 border = BorderStroke(1.dp, RemoteBorder),
             ) {
                 Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -1581,25 +1550,6 @@ private fun ConversationHeader(conversation: Conversation, onRename: (String) ->
     }
 }
 
-@Composable
-private fun StatePill(state: String) {
-    val colors = when (state) {
-        "running" -> Triple(Color(0xFF153526), RemoteGreen, Color(0xFF285A40))
-        "needs_approval" -> Triple(Color(0xFF362816), Color(0xFFFFC869), Color(0xFF6D5329))
-        "failed" -> Triple(MaterialTheme.colorScheme.errorContainer, MaterialTheme.colorScheme.error, Color(0xFF71313B))
-        "offline" -> Triple(RemoteSurfaceRaised, RemoteMuted, RemoteBorder)
-        else -> Triple(RemoteSurfaceRaised, RemoteText, RemoteBorder)
-    }
-    Surface(color = colors.first, shape = RoundedCornerShape(999.dp), border = BorderStroke(1.dp, colors.third)) {
-        Text(
-            stateLabel(state),
-            Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-            color = colors.second,
-            style = MaterialTheme.typography.labelMedium,
-        )
-    }
-}
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun Composer(
@@ -1608,6 +1558,7 @@ private fun Composer(
     online: Boolean,
     supportsSteer: Boolean,
     sessionOptions: List<SessionOption>,
+    existingConversation: Boolean = false,
     capability: ProviderCapability?,
     selectedModel: String?,
     selectedEffort: String?,
@@ -1624,21 +1575,29 @@ private fun Composer(
     onAttachments: (List<Uri>) -> Unit,
     onRemoveAttachment: (UUID) -> Unit,
 ) {
-    val inputEnabled = online && (!running || supportsSteer)
+    val compactInput = useCompactInputLayout()
+    val inputEnabled = !running || supportsSteer
     var settingsOpen by rememberSaveable { mutableStateOf(false) }
     val effectiveOptions = remember(
         sessionOptions,
+        existingConversation,
         capability,
         selectedModel,
         selectedEffort,
         selectedPermission,
     ) {
-        if (sessionOptions.isNotEmpty()) {
+        if (existingConversation || sessionOptions.isNotEmpty()) {
             sessionOptions
         } else {
             newConversationOptions(capability, selectedModel, selectedEffort, selectedPermission)
         }
     }
+    val permission = effectiveOptions.find { it.id == "permission_mode" }
+    val model = effectiveOptions.find { it.id == "model" || it.category == "model" }
+    val effort = effectiveOptions.find { it.id == "reasoning_effort" || it.id == "thought_level" || it.category == "thought_level" }
+    val modelLabel = listOfNotNull(model?.let(::sessionOptionValueLabel), effort?.let(::sessionOptionValueLabel))
+        .joinToString(" · ").ifEmpty { "会话设置" }
+    val canSend = online && draft.isNotBlank() && sendStatus == SendStatus.IDLE
     val attachmentTypes = capability?.attachments?.allowedMimeTypes.orEmpty().toTypedArray()
     val attachmentLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments(),
@@ -1647,8 +1606,8 @@ private fun Composer(
     Column(
         Modifier
             .fillMaxWidth()
-            .background(RemoteBlack)
-            .padding(start = 14.dp, top = 12.dp, end = 14.dp),
+            .background(RemoteBackground)
+            .padding(start = 12.dp, top = if (compactInput) 4.dp else 8.dp, end = 12.dp, bottom = if (compactInput) 4.dp else 6.dp),
     ) {
         if (promptAttachments.isNotEmpty()) {
             Row(
@@ -1683,84 +1642,82 @@ private fun Composer(
                 }
             }
         }
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalAlignment = Alignment.Bottom,
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = RemoteSurface,
+            shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(1.dp, RemoteBorder),
         ) {
-            Surface(
-                modifier = Modifier.weight(1f).heightIn(min = 56.dp, max = 144.dp),
-                color = RemoteSurfaceRaised,
-                shape = RoundedCornerShape(28.dp),
-                border = BorderStroke(1.dp, RemoteBorder),
-            ) {
-                Row(
-                    Modifier.fillMaxWidth().padding(start = 18.dp, end = 5.dp, top = 5.dp, bottom = 5.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
+            Column(Modifier.padding(if (compactInput) 3.dp else 5.dp)) {
+                BasicTextField(
+                    value = draft,
+                    onValueChange = onDraft,
+                    enabled = inputEnabled,
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(color = RemoteText),
+                    cursorBrush = SolidColor(RemoteText),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = if (compactInput) 36.dp else 52.dp, max = if (compactInput) 44.dp else 116.dp)
+                        .padding(horizontal = 11.dp, vertical = if (compactInput) 5.dp else 12.dp)
+                        .testTag("gar.composer.input")
+                        .semantics { contentDescription = if (running) "输入追加指令" else "输入消息" },
+                    maxLines = if (compactInput) 1 else 4,
+                    decorationBox = { input ->
+                        Box {
+                            if (draft.isEmpty()) Text(
+                                when {
+                                    running && !supportsSteer -> "等待当前任务完成…"
+                                    running -> "补充一条指令…"
+                                    !online -> "离线，仍可编辑草稿"
+                                    else -> "输入消息…"
+                                }, color = RemoteMuted, style = MaterialTheme.typography.bodyLarge)
+                            input()
+                        }
+                    },
+                )
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     IconButton(
                         onClick = { attachmentLauncher.launch(attachmentTypes) },
-                        enabled = inputEnabled && capability?.attachments?.supported == true &&
+                        enabled = inputEnabled && sendStatus == SendStatus.IDLE && capability?.attachments?.supported == true &&
                             promptAttachments.size < capability.attachments.maxCount &&
-                            promptAttachments.sumOf { it.bytes.size.toLong() } <
-                            capability.attachments.maxTotalBytes,
-                        modifier = Modifier.size(44.dp),
+                            promptAttachments.sumOf { it.bytes.size.toLong() } < capability.attachments.maxTotalBytes,
+                        modifier = Modifier.size(44.dp).testTag("gar.composer.attach"),
                     ) {
-                        RemoteIcon(RemoteGlyph.Attach, "添加附件", Modifier.size(19.dp), RemoteMuted)
+                        RemoteIcon(RemoteGlyph.Attach, "添加附件", Modifier.size(20.dp), RemoteMuted)
                     }
-                    BasicTextField(
-                        value = draft,
-                        onValueChange = onDraft,
-                        enabled = inputEnabled,
-                        textStyle = MaterialTheme.typography.bodyLarge.copy(color = if (inputEnabled) RemoteText else RemoteMuted),
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(vertical = 9.dp)
-                            .testTag("gar.composer.input")
-                            .semantics {
-                                contentDescription = when {
-                                    running && !supportsSteer -> "当前 Agent 不支持追加指令"
-                                    running -> "输入追加指令"
-                                    else -> "回复 Agent"
-                                }
-                            },
-                        maxLines = 5,
-                        decorationBox = { input ->
-                            Box {
-                                if (draft.isEmpty()) {
-                                    Text(
-                                        when {
-                                            running && !supportsSteer -> "当前 Agent 不支持追加指令"
-                                            running -> "输入追加指令…"
-                                            else -> "回复 Agent"
-                                        },
-                                        color = RemoteMuted,
-                                    )
-                                }
-                                input()
-                            }
-                        },
-                    )
+                    permission?.let {
+                        SessionSettingsChip(
+                            label = sessionOptionValueLabel(it), enabled = online && !running,
+                            onClick = { settingsOpen = true },
+                            modifier = Modifier.weight(0.8f).testTag("gar.session.permission"),
+                        )
+                    }
+                    if (effectiveOptions.isNotEmpty()) {
+                        SessionSettingsChip(
+                            label = modelLabel, enabled = online && !running,
+                            onClick = { settingsOpen = true },
+                            modifier = Modifier.weight(1.4f).testTag("gar.session.settings"),
+                        )
+                    } else {
+                        Spacer(Modifier.weight(1f))
+                    }
                     if (!running || supportsSteer) {
                         IconButton(
                             onClick = if (running) onSteer else onSend,
-                            enabled = online && draft.isNotBlank() && sendStatus == SendStatus.IDLE,
-                            modifier = Modifier
-                                .size(46.dp)
-                                .background(Color.White, CircleShape)
-                                .testTag("gar.composer.send"),
+                            enabled = canSend,
+                            modifier = Modifier.size(44.dp).testTag("gar.composer.send"),
                         ) {
-                            RemoteIcon(RemoteGlyph.Send, if (running) "追加指令" else "发送", Modifier.size(22.dp), Color.Black)
+                            Box(Modifier.size(34.dp).background(if (canSend) RemoteText else RemoteSurfaceRaised, RoundedCornerShape(9.dp)),
+                                contentAlignment = Alignment.Center) {
+                                RemoteIcon(RemoteGlyph.Send, if (running) "追加指令" else "发送", Modifier.size(20.dp),
+                                    if (canSend) RemoteBackground else RemoteMuted)
+                            }
                         }
                     }
-                }
-            }
-            if (running) {
-                IconButton(
-                    onClick = onInterrupt,
-                    enabled = online,
-                    modifier = Modifier.size(56.dp).border(1.dp, Color(0xFF70343D), CircleShape).background(Color(0xFF2B171B), CircleShape),
-                ) {
-                    RemoteIcon(RemoteGlyph.Stop, "停止", Modifier.size(22.dp), MaterialTheme.colorScheme.error)
+                    if (running) {
+                        IconButton(onClick = onInterrupt, enabled = online,
+                            modifier = Modifier.size(44.dp).testTag("gar.composer.stop")) {
+                            RemoteIcon(RemoteGlyph.Stop, "停止", Modifier.size(22.dp), MaterialTheme.colorScheme.error)
+                        }
+                    }
                 }
             }
         }
@@ -1794,13 +1751,7 @@ private fun Composer(
                 }
             }
         }
-        if (effectiveOptions.isNotEmpty()) {
-            SessionSettingsBar(
-                options = effectiveOptions,
-                enabled = online && !running,
-                onClick = { settingsOpen = true },
-            )
-        }
+
     }
     if (settingsOpen) {
         SessionSettingsSheet(
@@ -1812,6 +1763,11 @@ private fun Composer(
         )
     }
 }
+
+@Composable
+private fun useCompactInputLayout(): Boolean =
+    LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE &&
+        WindowInsets.ime.getBottom(LocalDensity.current) > 0
 
 private fun newConversationOptions(
     capability: ProviderCapability?,
@@ -1867,37 +1823,6 @@ private fun newConversationOptions(
 }
 
 @Composable
-private fun SessionSettingsBar(options: List<SessionOption>, enabled: Boolean, onClick: () -> Unit) {
-    val model = options.find { it.id == "model" }
-    val effort = options.find { it.id == "reasoning_effort" || it.id == "thought_level" }
-    val permission = options.find { it.id == "permission_mode" }
-    val primary = listOfNotNull(
-        model?.let(::sessionOptionValueLabel),
-        effort?.let(::sessionOptionValueLabel),
-    ).joinToString(" · ").ifEmpty { "会话设置" }
-    Row(
-        Modifier.fillMaxWidth().padding(top = 8.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        permission?.let {
-            SessionSettingsChip(
-                label = sessionOptionValueLabel(it),
-                enabled = enabled,
-                onClick = onClick,
-                modifier = Modifier.widthIn(min = 100.dp, max = 132.dp),
-            )
-        }
-        SessionSettingsChip(
-            label = primary,
-            enabled = enabled,
-            onClick = onClick,
-            modifier = Modifier.weight(1f),
-        )
-    }
-}
-
-@Composable
 private fun SessionSettingsChip(
     label: String,
     enabled: Boolean,
@@ -1905,13 +1830,12 @@ private fun SessionSettingsChip(
     modifier: Modifier = Modifier,
 ) {
     Surface(
-        modifier = modifier.height(44.dp).clip(RoundedCornerShape(14.dp)).clickable(enabled = enabled, onClick = onClick),
-        color = RemoteSurfaceRaised,
-        shape = RoundedCornerShape(14.dp),
-        border = BorderStroke(1.dp, RemoteBorder),
+        modifier = modifier.height(44.dp).clip(RoundedCornerShape(8.dp)).clickable(enabled = enabled, onClick = onClick).semantics { contentDescription = label },
+        color = Color.Transparent,
+        shape = RoundedCornerShape(8.dp),
     ) {
         Row(
-            Modifier.fillMaxSize().padding(horizontal = 12.dp),
+            Modifier.fillMaxSize().padding(horizontal = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center,
         ) {
@@ -1919,12 +1843,12 @@ private fun SessionSettingsChip(
                 label,
                 modifier = Modifier.weight(1f),
                 color = if (enabled) RemoteText else RemoteMuted,
-                style = MaterialTheme.typography.labelMedium,
+                style = MaterialTheme.typography.labelSmall,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-            Spacer(Modifier.width(7.dp))
-            RemoteIcon(RemoteGlyph.ChevronDown, null, Modifier.size(14.dp), RemoteMuted)
+            Spacer(Modifier.width(3.dp))
+            RemoteIcon(RemoteGlyph.ChevronDown, null, Modifier.size(12.dp), RemoteMuted)
         }
     }
 }
@@ -1943,12 +1867,13 @@ private fun SessionSettingsSheet(
     val activeOption = options.find { it.id == activeOptionId }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
+        sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true),
         containerColor = RemoteSurfaceRaised,
         contentColor = RemoteText,
     ) {
         if (activeOption == null) {
             Column(
-                Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 24.dp),
+                Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, bottom = 24.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 Text("会话设置", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(bottom = 10.dp))
@@ -1971,18 +1896,18 @@ private fun SessionSettingsSheet(
                     style = MaterialTheme.typography.titleLarge,
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp),
                 )
-                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 430.dp)) {
+                LazyColumn(Modifier.fillMaxWidth().weight(1f, fill = false)) {
                     items(activeOption.values, key = { it.value }) { value ->
                         val selected = value.value == activeOption.currentValue
                         val permission = activeOption.id == "permission_mode"
                         val permissionMode = permissionModes.find { it.id == value.value }
                         val elevated = permissionMode?.risk == PermissionRisk.ELEVATED
-                        val selectedColor = if (elevated && selected) RemoteOrange else RemoteText
+                        val selectedColor = if (elevated && selected) RemoteWarning else RemoteText
                         Row(
                             Modifier
                                 .fillMaxWidth()
                                 .heightIn(min = if (permission) 68.dp else 58.dp)
-                                .clip(RoundedCornerShape(18.dp))
+                                .clip(RoundedCornerShape(12.dp))
                                 .clickable(enabled = enabled) {
                                     if (elevated) {
                                         pendingElevatedPermission = value.value
@@ -1993,15 +1918,15 @@ private fun SessionSettingsSheet(
                                 }
                                 .background(
                                     when {
-                                        elevated && selected -> RemoteOrange.copy(alpha = 0.08f)
-                                        selected -> Color(0xFF303033)
+                                        elevated && selected -> RemoteWarning.copy(alpha = 0.08f)
+                                        selected -> RemoteSurfaceRaised
                                         else -> Color.Transparent
                                     },
                                 )
                                 .border(
                                     1.dp,
-                                    if (elevated && selected) RemoteOrange.copy(alpha = 0.55f) else Color.Transparent,
-                                    RoundedCornerShape(18.dp),
+                                    if (elevated && selected) RemoteWarning.copy(alpha = 0.55f) else Color.Transparent,
+                                    RoundedCornerShape(12.dp),
                                 )
                                 .padding(horizontal = 16.dp, vertical = 10.dp),
                             verticalAlignment = Alignment.CenterVertically,
@@ -2037,8 +1962,8 @@ private fun SessionSettingsSheet(
         Dialog(onDismissRequest = { pendingElevatedPermission = null }) {
             Surface(
                 color = RemoteSurfaceRaised,
-                shape = RoundedCornerShape(22.dp),
-                border = BorderStroke(1.dp, Color(0xFF78452E)),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, RemoteWarning.copy(alpha = 0.4f)),
             ) {
                 Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("确认高风险权限", style = MaterialTheme.typography.titleLarge)
@@ -2067,13 +1992,13 @@ private fun SessionSettingRow(option: SessionOption, enabled: Boolean, onClick: 
         Modifier
             .fillMaxWidth()
             .height(58.dp)
-            .clip(RoundedCornerShape(17.dp))
+            .clip(RoundedCornerShape(12.dp))
             .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(sessionOptionLabel(option), modifier = Modifier.weight(1f), fontWeight = FontWeight.Medium)
-        Text(sessionOptionValueLabel(option), color = RemoteMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(sessionOptionLabel(option), modifier = Modifier.weight(0.7f), fontWeight = FontWeight.Medium)
+        Text(sessionOptionValueLabel(option), modifier = Modifier.weight(1f), color = RemoteMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Spacer(Modifier.width(10.dp))
         RemoteIcon(RemoteGlyph.ChevronRight, null, Modifier.size(20.dp), RemoteMuted)
     }
@@ -2105,7 +2030,8 @@ private fun CodexScrollbar(state: LazyListState, modifier: Modifier = Modifier) 
     val totalCount = layout.totalItemsCount
     if (visibleCount == 0 || totalCount <= visibleCount || (!state.canScrollBackward && !state.canScrollForward)) return
     BoxWithConstraints(modifier.fillMaxHeight().width(7.dp)) {
-        val thumbHeight = (maxHeight * (visibleCount.toFloat() / totalCount)).coerceIn(38.dp, maxHeight)
+        val thumbHeight = (maxHeight * (visibleCount.toFloat() / totalCount))
+            .coerceIn(minOf(38.dp, maxHeight), maxHeight)
         val lastStartIndex = (totalCount - visibleCount).coerceAtLeast(1)
         val firstItemSize = layout.visibleItemsInfo.firstOrNull()?.size?.coerceAtLeast(1) ?: 1
         val fractionalIndex = state.firstVisibleItemIndex + state.firstVisibleItemScrollOffset.toFloat() / firstItemSize
@@ -2118,7 +2044,7 @@ private fun CodexScrollbar(state: LazyListState, modifier: Modifier = Modifier) 
                 .width(3.dp)
                 .height(thumbHeight)
                 .background(
-                    if (state.isScrollInProgress) Color(0xFF9B9B9F) else Color(0xFF66666A),
+                    RemoteMuted.copy(alpha = if (state.isScrollInProgress) 0.7f else 0.3f),
                     CircleShape,
                 ),
         )
@@ -2174,12 +2100,10 @@ internal fun updateTimelineGrouping(
     val affectedBlock = previous.blocks.firstOrNull { commonPrefix < it.endExclusive }
     if (affectedBlock != null) {
         rebuildStart = affectedBlock.startIndex
-    } else if (
-        commonPrefix == previous.items.size &&
-        previous.blocks.lastOrNull() is TimelineBlock.Activity &&
-        items.getOrNull(commonPrefix)?.content?.isActivity() == true
-    ) {
-        rebuildStart = previous.blocks.last().startIndex
+    }
+    if (items.getOrNull(rebuildStart)?.content?.isActivity() == true) {
+        val precedingActivity = previous.blocks.lastOrNull { it.endExclusive == rebuildStart } as? TimelineBlock.Activity
+        if (precedingActivity != null) rebuildStart = precedingActivity.startIndex
     }
     rebuildStart = rebuildStart.coerceAtMost(items.size)
     val preserved = previous.blocks.takeWhile { it.endExclusive <= rebuildStart }
@@ -2218,9 +2142,8 @@ private fun TimelineContent.isActivity(): Boolean = when (this) {
     is TimelineContent.ToolCall,
     is TimelineContent.Command,
     is TimelineContent.FileChange,
-    is TimelineContent.Approval,
-    is TimelineContent.Error,
     -> true
+    is TimelineContent.Approval -> resolvedOption != null
     else -> false
 }
 
@@ -2247,15 +2170,15 @@ private fun ActivityTimelineCard(
     Surface(
         modifier = Modifier.fillMaxWidth(),
         color = RemoteSurface,
-        shape = RoundedCornerShape(18.dp),
+        shape = RoundedCornerShape(12.dp),
         border = BorderStroke(1.dp, RemoteBorder),
     ) {
         Column {
             Row(
-                Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(14.dp),
+                Modifier.fillMaxWidth().heightIn(min = 44.dp).testTag("gar.activity.${items.first().id}").clickable { expanded = !expanded }.padding(horizontal = 10.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                RemoteIcon(RemoteGlyph.ChevronRight, null, Modifier.size(18.dp), RemoteMuted)
+                RemoteIcon(if (expanded) RemoteGlyph.ChevronDown else RemoteGlyph.ChevronRight, null, Modifier.size(18.dp), RemoteMuted)
                 Spacer(Modifier.width(8.dp))
                 Text("活动 · $labels", modifier = Modifier.weight(1f), style = MaterialTheme.typography.labelMedium)
                 Text("${items.size} 项", color = RemoteMuted, style = MaterialTheme.typography.labelSmall)
@@ -2282,20 +2205,22 @@ private fun ActivityTimelineCard(
 @Composable
 private fun TimelineCard(
     item: TimelineItem,
+    providerLabel: String = "Agent",
     attachment: ByteArray?,
     approvalPending: Boolean,
     onApproval: (UUID, String) -> Unit,
 ) {
     when (val content = item.content) {
-        is TimelineContent.UserMessage -> MessageBubble(content.text, user = true, messageId = item.id)
+        is TimelineContent.UserMessage -> MessageBubble(content.text, user = true, messageId = item.id, createdAtMs = item.createdAtMs)
         is TimelineContent.AgentMessage -> MessageBubble(
             text = content.text,
             user = false,
             messageId = item.id,
+            createdAtMs = item.createdAtMs,
             label = when (content.phase) {
-                "final" -> "Agent 最终回复"
+                "final" -> providerLabel
                 "reasoning_summary" -> "推理摘要"
-                else -> "Agent"
+                else -> providerLabel
             },
         )
         is TimelineContent.Progress -> GenericTimelineCard(
@@ -2337,11 +2262,10 @@ private fun ToolTimelineCard(content: TimelineContent.ToolCall) {
     }
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        color = RemoteSurface,
-        shape = RoundedCornerShape(22.dp),
-        border = BorderStroke(1.dp, RemoteBorder),
+        color = Color.Transparent,
+        shape = RoundedCornerShape(12.dp),
     ) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("工具 · $displayName", fontWeight = FontWeight.SemiBold)
@@ -2385,46 +2309,32 @@ private fun meaningfulToolSummary(value: String?): String? {
 }
 
 @Composable
-private fun MessageBubble(text: String, user: Boolean, messageId: UUID, label: String = "你") {
+private fun MessageBubble(text: String, user: Boolean, messageId: UUID, createdAtMs: Long, label: String = "你") {
     val clipboard = LocalClipboardManager.current
-    val copyButton: @Composable () -> Unit = {
-        IconButton(
-            onClick = { clipboard.setText(AnnotatedString(text)) },
-            modifier = Modifier.size(44.dp).testTag("gar.message.$messageId.copy"),
-        ) {
-            RemoteIcon(RemoteGlyph.Copy, "复制消息", Modifier.size(18.dp), RemoteMuted)
+    val time = remember(createdAtMs) { SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(createdAtMs)) }
+    var copied by remember(text) { mutableStateOf(false) }
+    val content: @Composable () -> Unit = {
+        Column(Modifier.fillMaxWidth().padding(horizontal = if (user) 14.dp else 0.dp, vertical = if (user) 6.dp else 0.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(label, color = RemoteText, style = MaterialTheme.typography.labelMedium)
+                Text(time, color = RemoteMuted, style = MaterialTheme.typography.labelSmall, modifier = Modifier.weight(1f).padding(start = 8.dp))
+                IconButton(
+                    onClick = { clipboard.setText(AnnotatedString(text)); copied = true },
+                    modifier = Modifier.size(44.dp).testTag("gar.message.$messageId.copy"),
+                ) {
+                    RemoteIcon(if (copied) RemoteGlyph.Check else RemoteGlyph.Copy,
+                        if (copied) "已复制" else "复制消息", Modifier.size(16.dp), RemoteMuted)
+                }
+            }
+            MarkdownText(text, modifier = Modifier.padding(bottom = if (user) 10.dp else 0.dp), contentKey = messageId.toString())
         }
     }
     if (user) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-            Column(Modifier.fillMaxWidth(0.86f)) {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Spacer(Modifier.weight(1f))
-                    Text(label, color = RemoteMuted, style = MaterialTheme.typography.labelMedium)
-                    copyButton()
-                }
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    color = RemoteSurfaceRaised,
-                    shape = RoundedCornerShape(24.dp),
-                    border = BorderStroke(1.dp, RemoteBorder),
-                ) {
-                    MarkdownText(
-                        markdown = text,
-                        modifier = Modifier.padding(horizontal = 17.dp, vertical = 14.dp),
-                        contentKey = messageId.toString(),
-                    )
-                }
-            }
+            Surface(Modifier.fillMaxWidth(0.92f), color = RemoteSurfaceRaised, shape = RoundedCornerShape(10.dp)) { content() }
         }
     } else {
-        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(7.dp)) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text(label, modifier = Modifier.weight(1f), color = RemoteMuted, style = MaterialTheme.typography.labelMedium)
-                copyButton()
-            }
-            MarkdownText(text, contentKey = messageId.toString())
-        }
+        content()
     }
 }
 
@@ -2437,9 +2347,9 @@ private fun GenericTimelineCard(
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        color = if (error) MaterialTheme.colorScheme.errorContainer else RemoteSurface,
-        shape = RoundedCornerShape(22.dp),
-        border = BorderStroke(1.dp, if (error) Color(0xFF71313B) else RemoteBorder),
+        color = if (error) MaterialTheme.colorScheme.errorContainer else Color.Transparent,
+        shape = RoundedCornerShape(12.dp),
+        border = if (error) BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.25f)) else null,
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row {
@@ -2456,11 +2366,10 @@ private fun CodeTimelineCard(content: TimelineContent.Command) {
     val clipboard = LocalClipboardManager.current
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        color = RemoteSurface,
-        shape = RoundedCornerShape(22.dp),
-        border = BorderStroke(1.dp, RemoteBorder),
+        color = Color.Transparent,
+        shape = RoundedCornerShape(12.dp),
     ) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("命令 · ${stateLabel(content.status)}", fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
                 IconButton(
@@ -2473,7 +2382,7 @@ private fun CodeTimelineCard(content: TimelineContent.Command) {
                 }
             }
             val scroll = rememberScrollState()
-            Surface(color = Color(0xFF0B0B0B), shape = RoundedCornerShape(14.dp)) {
+            Surface(color = RemoteSurfaceRaised, shape = RoundedCornerShape(12.dp)) {
                 Text(
                     content.command,
                     fontFamily = FontFamily.Monospace,
@@ -2497,24 +2406,24 @@ private fun ApprovalCard(
     onApproval: (UUID, String) -> Unit,
 ) {
     Surface(
-        color = Color(0xFF2D2315),
-        shape = RoundedCornerShape(22.dp),
-        border = BorderStroke(1.dp, Color(0xFF6D5329)),
+        color = RemoteWarning.copy(alpha = 0.07f),
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, RemoteWarning.copy(alpha = 0.3f)),
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(17.dp), verticalArrangement = Arrangement.spacedBy(11.dp)) {
-            Text("需要你的许可", color = Color(0xFFFFC869), fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.titleMedium)
+            Text(if (content.resolvedOption == null) "等待你的确认" else "已处理", color = RemoteWarning, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.titleMedium)
             Text(content.prompt)
             if (content.resolvedOption != null) {
-                Text("已选择：${content.resolvedOption}", color = RemoteMuted, fontWeight = FontWeight.Medium)
+                Text("已选择：${content.options.find { it.id == content.resolvedOption }?.label ?: content.resolvedOption}", color = RemoteMuted, fontWeight = FontWeight.Medium)
             } else {
                 content.options.forEach { option ->
                     OutlinedButton(
                         onClick = { onApproval(content.approvalId, option.id) },
                         enabled = !pending,
                         modifier = Modifier.fillMaxWidth().height(48.dp),
-                        shape = RoundedCornerShape(16.dp),
-                        border = BorderStroke(1.dp, Color(0xFF765D35)),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, RemoteWarning.copy(alpha = 0.4f)),
                     ) { Text(if (pending) "正在提交…" else option.label) }
                 }
             }
@@ -2529,7 +2438,7 @@ private fun ImageCard(alt: String, bytes: ByteArray?) {
     Surface(
         modifier = Modifier.fillMaxWidth().clickable(enabled = bitmap != null) { fullscreen = true },
         color = RemoteSurface,
-        shape = RoundedCornerShape(22.dp),
+        shape = RoundedCornerShape(12.dp),
         border = BorderStroke(1.dp, RemoteBorder),
     ) {
         Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -2542,7 +2451,7 @@ private fun ImageCard(alt: String, bytes: ByteArray?) {
                     bitmap = bitmap.asImageBitmap(),
                     contentDescription = alt,
                     contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxWidth().height(240.dp).clip(RoundedCornerShape(15.dp)).background(Color(0xFF090909)),
+                    modifier = Modifier.fillMaxWidth().height(240.dp).clip(RoundedCornerShape(12.dp)).background(RemoteSurfaceRaised),
                 )
             }
             Text(alt, modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp), color = RemoteMuted, style = MaterialTheme.typography.bodySmall)
@@ -2601,6 +2510,7 @@ private enum class RemoteGlyph(val imageVector: ImageVector) {
     Search(Icons.Rounded.Search),
     Close(Icons.Rounded.Close),
     Send(Icons.Rounded.ArrowUpward),
+    Latest(Icons.Rounded.ArrowDownward),
     Stop(Icons.Rounded.Stop),
     Attach(Icons.Rounded.AttachFile),
     Copy(Icons.Rounded.ContentCopy),
@@ -2613,7 +2523,8 @@ private fun OnlineDot(online: Boolean) {
     Box(
         Modifier
             .size(7.dp)
-            .background(if (online) RemoteGreen else RemoteMuted, CircleShape)
+            .background(if (online) RemoteSuccess else Color.Transparent, CircleShape)
+            .border(1.dp, if (online) RemoteSuccess else RemoteMuted, CircleShape)
             .semantics { contentDescription = if (online) "在线" else "离线" },
     )
 }
@@ -2624,16 +2535,15 @@ private fun FloatingIconButton(
     description: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
-    containerColor: Color = RemoteSurfaceRaised,
+    containerColor: Color = Color.Transparent,
     contentColor: Color = RemoteText,
-    size: Dp = 52.dp,
+    size: Dp = 44.dp,
 ) {
     IconButton(
         onClick = onClick,
         modifier = modifier
             .size(size)
-            .background(containerColor, CircleShape)
-            .border(1.dp, if (containerColor == RemotePurple) Color.Transparent else RemoteBorder, CircleShape),
+            .background(containerColor, RoundedCornerShape(8.dp)),
     ) {
         RemoteIcon(glyph, description, Modifier.size(24.dp), contentColor)
     }
@@ -2644,7 +2554,7 @@ private fun RemoteIcon(
     glyph: RemoteGlyph,
     description: String?,
     modifier: Modifier = Modifier,
-    tint: Color = RemoteText,
+    tint: Color = LocalContentColor.current,
 ) {
     Icon(
         imageVector = glyph.imageVector,

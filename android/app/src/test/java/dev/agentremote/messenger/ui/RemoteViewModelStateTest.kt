@@ -165,6 +165,38 @@ class RemoteViewModelStateTest {
     }
 
     @Test
+    fun approvalResolutionMovesOnlyHandledApprovalIntoCollapsedActivity() {
+        val progress = timelineItem(
+            id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            revision = 1,
+            content = TimelineContent.Progress("tool", "read", "completed", null),
+        )
+        val approval = timelineItem(
+            id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            revision = 1,
+            content = TimelineContent.Approval(UUID.randomUUID(), "Allow changes?", emptyList(), null),
+        )
+        val error = timelineItem(
+            id = "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            revision = 1,
+            content = TimelineContent.Error("provider_error", "Connection interrupted"),
+        )
+        val grouper = TimelineBlockGrouper()
+        val pending = grouper.update(listOf(progress, approval, error))
+
+        assertEquals(listOf(approval, error), pending.filterIsInstance<TimelineBlock.Single>().map { it.item })
+
+        val resolved = approval.copy(
+            revision = 2,
+            content = (approval.content as TimelineContent.Approval).copy(resolvedOption = "allow"),
+        )
+        val handled = grouper.update(listOf(progress, resolved, error))
+
+        assertEquals(listOf(progress, resolved), (handled.first() as TimelineBlock.Activity).items)
+        assertEquals(error, (handled.last() as TimelineBlock.Single).item)
+    }
+
+    @Test
     fun explicitProviderSelectsAuthorizedProject() {
         val codexProject = project(
             "22222222-2222-2222-2222-222222222222",

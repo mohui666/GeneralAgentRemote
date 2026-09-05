@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use agent_remote_protocol::{
     ApprovalId, AttachmentId, ClientAttachment, ClientCommand, CommandId, Conversation,
     ConversationId, ConversationState, DeviceId, HostId, PermissionRisk, ProjectId,
-    ProviderCapability, ProviderId, ProviderState, SendTraceStage, ServerMessage, Snapshot,
-    TimelineItem, TimelineItemId, TimelineItemKind, TimelinePageCursor, decode, encode,
+    ProviderCapability, ProviderId, ProviderState, SendTraceStage, ServerMessage, SessionOption,
+    Snapshot, TimelineItem, TimelineItemId, TimelineItemKind, TimelinePageCursor, decode, encode,
 };
 use js_sys::{Array, ArrayBuffer, Math, Uint8Array};
 use serde::{Deserialize, Serialize};
@@ -12,14 +12,15 @@ use uuid::Uuid;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{
     BinaryType, Blob, ClipboardEvent, CloseEvent, DataTransfer, DragEvent, Event, File, FileReader,
-    HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement, MessageEvent, Url, UrlSearchParams,
-    WebSocket, window,
+    HtmlElement, HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement, MessageEvent, Url,
+    UrlSearchParams, WebSocket, window,
 };
-use yew::{Component, Context, Html, InputEvent, MouseEvent, TargetCast, classes, html};
+use yew::{Component, Context, Html, InputEvent, MouseEvent, NodeRef, TargetCast, classes, html};
 
 use crate::{
-    conversation_belongs_to_project, increment_send_attempt, markdown_to_safe_html,
-    retryable_send_rejection, sort_conversations_newest_first,
+    ConversationSortMode, DraftScope, conversation_belongs_to_project, draft_scope,
+    increment_send_attempt, is_collapsible_activity, markdown_to_safe_html,
+    retryable_send_rejection, sort_conversations,
 };
 
 const CREDENTIALS_KEY: &str = "agent_remote_credentials_v1";
@@ -27,7 +28,7 @@ const LAST_HOST_KEY: &str = "agent_remote_last_host_v2";
 const CACHE_PREFIX: &str = "agent_remote_cache_v2_";
 const WS_SUBPROTOCOL: &str = "agent-remote.cbor.v5";
 const MAX_RECONNECT_ATTEMPTS: u8 = 6;
-const CACHE_VERSION: u16 = 3;
+const CACHE_VERSION: u16 = 4;
 const CACHE_WRITE_DELAY_MS: i32 = 250;
 
 type TimelineIndex = HashMap<ConversationId, Vec<TimelineItem>>;
@@ -73,6 +74,14 @@ struct StoredCredential {
     device_token: String,
     origin: String,
     relay: bool,
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredDraft {
+    scope: DraftScope,
+    value: String,
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +108,12 @@ struct AppCache {
     draft_conversation: Option<ConversationId>,
     #[serde(default)]
     pending_command: Option<ClientCommand>,
+    #[serde(default)]
     composer: String,
+    #[serde(default)]
+    drafts: Vec<StoredDraft>,
+    #[serde(default)]
+    conversation_sort: ConversationSortMode,
     sidebar_collapsed: bool,
     pinned_projects: Vec<ProjectId>,
     recent_projects: Vec<ProjectId>,
@@ -119,6 +133,12 @@ struct BrowserAttachment {
     byte_len: u64,
     bytes: Option<Vec<u8>>,
     error: Option<String>,
+}
+
+struct TimelineAnchor {
+    conversation_id: ConversationId,
+    item_id: String,
+    offset: f64,
 }
 
 struct SocketCallbacks {
@@ -156,6 +176,7 @@ pub struct App {
     draft_conversation: Option<ConversationId>,
     pending_send: Option<PendingSend>,
     composer: String,
+    scoped_drafts: HashMap<DraftScope, String>,
     pending_attachments: Vec<BrowserAttachment>,
     attachments: HashMap<AttachmentId, String>,
     fullscreen_image: Option<AttachmentId>,
@@ -165,13 +186,22 @@ pub struct App {
     pinned_projects: Vec<ProjectId>,
     recent_projects: Vec<ProjectId>,
     expanded_projects: HashSet<ProjectTreeScope>,
+    conversation_sort: ConversationSortMode,
     sidebar_collapsed: bool,
     sidebar_open: bool,
     history_before: HashMap<ConversationId, TimelinePageCursor>,
     history_exhausted: HashSet<ConversationId>,
     history_requested: HashSet<ConversationId>,
+    history_loading: HashSet<ConversationId>,
     editing_title: bool,
     title_draft: String,
+    session_settings_open: bool,
+    pending_approvals: HashSet<ApprovalId>,
+    approval_commands: HashMap<CommandId, ApprovalId>,
+    timeline_ref: NodeRef,
+    follow_timeline_tail: bool,
+    timeline_anchor: Option<TimelineAnchor>,
+    copy_feedback: Option<String>,
     sync_in_flight: HashMap<CommandId, ProjectTreeScope>,
     refresh_in_flight: HashSet<ProviderId>,
     cache_persist_timer: Option<i32>,
@@ -193,7 +223,7 @@ pub enum Msg {
     PairLinkChanged(String),
     OpenPairLink,
     ConnectStored(usize),
-    ForgetCredentials,
+    ForgetCredential(usize),
     SelectConversation(ConversationId),
     SelectProject(ProjectId),
     ToggleProject(ProjectId),
@@ -206,9 +236,17 @@ pub enum Msg {
     ProjectSearchChanged(String),
     ToggleProjectPin(ProjectId),
     ConversationSearchChanged(String),
+    SelectConversationSort(ConversationSortMode),
     ToggleSidebar,
     OpenSidebar,
     CloseSidebar,
+    ToggleSessionSettings,
+    CloseSessionSettings,
+    TimelineScrolled,
+    JumpToLatest,
+    CopyFinished(bool),
+    DismissFeedback,
+    CloseOverlays,
     ComposerChanged(String),
     FilesSelected(Vec<File>),
     AttachmentLoaded(AttachmentId, String, String, Vec<u8>),
@@ -272,12 +310,41 @@ impl Component for App {
         let pending_attachments = pending_send
             .as_ref()
             .map_or_else(Vec::new, pending_browser_attachments);
-        let cache_needs_tree_default = cache
-            .as_ref()
-            .is_none_or(|cache| cache.version < CACHE_VERSION);
+        let cache_needs_tree_default = cache.as_ref().is_none_or(|cache| cache.version < 3);
         let (timeline_by_conversation, markdown_render_cache) = cache
             .as_ref()
             .map(|cache| index_timeline(&cache.snapshot.timeline))
+            .unwrap_or_default();
+        let selected_conversation = cache.as_ref().and_then(|cache| cache.selected_conversation);
+        let selected_project = cache.as_ref().and_then(|cache| cache.selected_project);
+        let selected_provider = cache
+            .as_ref()
+            .map_or(ProviderId::Codex, |cache| cache.selected_provider);
+        let draft_conversation = cache.as_ref().and_then(|cache| cache.draft_conversation);
+        let current_draft_scope = connection.as_ref().and_then(|connection| {
+            draft_scope(
+                connection.host_id,
+                selected_provider,
+                selected_project,
+                selected_conversation.filter(|_| draft_conversation.is_none()),
+            )
+        });
+        let mut scoped_drafts = cache.as_ref().map_or_else(HashMap::new, |cache| {
+            cache
+                .drafts
+                .iter()
+                .map(|draft| (draft.scope, draft.value.clone()))
+                .collect()
+        });
+        if let (Some(scope), Some(cache)) = (current_draft_scope, cache.as_ref())
+            && scoped_drafts.is_empty()
+            && !cache.composer.is_empty()
+        {
+            scoped_drafts.insert(scope, cache.composer.clone());
+        }
+        let composer = current_draft_scope
+            .and_then(|scope| scoped_drafts.get(&scope).cloned())
+            .or_else(|| cache.as_ref().map(|cache| cache.composer.clone()))
             .unwrap_or_default();
         let mut app = Self {
             socket: None,
@@ -302,11 +369,9 @@ impl Component for App {
                 "等待连接".to_owned()
             },
             pair_link: String::new(),
-            selected_conversation: cache.as_ref().and_then(|cache| cache.selected_conversation),
-            selected_project: cache.as_ref().and_then(|cache| cache.selected_project),
-            selected_provider: cache
-                .as_ref()
-                .map_or(ProviderId::Codex, |cache| cache.selected_provider),
+            selected_conversation,
+            selected_project,
+            selected_provider,
             selected_model: cache
                 .as_ref()
                 .and_then(|cache| cache.selected_model.clone()),
@@ -316,11 +381,10 @@ impl Component for App {
             selected_permission: cache
                 .as_ref()
                 .and_then(|cache| cache.selected_permission.clone()),
-            draft_conversation: cache.as_ref().and_then(|cache| cache.draft_conversation),
+            draft_conversation,
             pending_send,
-            composer: cache
-                .as_ref()
-                .map_or_else(String::new, |cache| cache.composer.clone()),
+            composer,
+            scoped_drafts,
             pending_attachments,
             attachments: HashMap::new(),
             fullscreen_image: None,
@@ -336,13 +400,26 @@ impl Component for App {
             expanded_projects: cache.as_ref().map_or_else(HashSet::new, |cache| {
                 cache.expanded_projects.iter().copied().collect()
             }),
+            conversation_sort: cache
+                .as_ref()
+                .map_or(ConversationSortMode::Recent, |cache| {
+                    cache.conversation_sort
+                }),
             sidebar_collapsed: cache.as_ref().is_some_and(|cache| cache.sidebar_collapsed),
             sidebar_open: false,
             history_before: HashMap::new(),
             history_exhausted: HashSet::new(),
             history_requested: HashSet::new(),
+            history_loading: HashSet::new(),
             editing_title: false,
             title_draft: String::new(),
+            session_settings_open: false,
+            pending_approvals: HashSet::new(),
+            approval_commands: HashMap::new(),
+            timeline_ref: NodeRef::default(),
+            follow_timeline_tail: true,
+            timeline_anchor: None,
+            copy_feedback: None,
             sync_in_flight: HashMap::new(),
             refresh_in_flight: HashSet::new(),
             cache_persist_timer: None,
@@ -398,10 +475,17 @@ impl Component for App {
             return false;
         }
         if let Msg::CopyText(text) = &message {
-            if let Some(browser) = window() {
-                let _ = browser.navigator().clipboard().write_text(text);
-            }
-            return false;
+            let Some(browser) = window().filter(|browser| browser.is_secure_context()) else {
+                self.copy_feedback =
+                    Some("当前连接不支持剪贴板，请选中文字复制，或使用 HTTPS 连接".to_owned());
+                return true;
+            };
+            let promise = browser.navigator().clipboard().write_text(text);
+            self.copy_feedback = Some("正在复制…".to_owned());
+            context.link().send_future(async move {
+                Msg::CopyFinished(js_sys::futures::JsFuture::from(promise).await.is_ok())
+            });
+            return true;
         }
         match message {
             Msg::Opened(generation) => {
@@ -506,11 +590,30 @@ impl Component for App {
             Msg::PairLinkChanged(value) => self.pair_link = value,
             Msg::OpenPairLink => {
                 if let Some(location) = window().map(|window| window.location()) {
-                    let _ = location.set_href(self.pair_link.trim());
+                    let Ok(url) = Url::new(self.pair_link.trim()) else {
+                        self.status = "请输入完整的配对链接".to_owned();
+                        return true;
+                    };
+                    if url.protocol() != "http:" && url.protocol() != "https:" {
+                        self.status = "配对链接需要以 http:// 或 https:// 开头".to_owned();
+                        return true;
+                    }
+                    let same_page = location.href().ok().is_some_and(|current| {
+                        current.split('#').next() == url.href().split('#').next()
+                    });
+                    self.cancel_cache_persist_timer();
+                    self.persist_cache();
+                    if location.set_href(&url.href()).is_err()
+                        || (same_page && location.reload().is_err())
+                    {
+                        self.status = "无法打开配对链接，请检查浏览器设置".to_owned();
+                    }
                 }
             }
             Msg::ConnectStored(index) => {
                 if let Some(credential) = self.credentials.get(index).cloned() {
+                    self.cancel_cache_persist_timer();
+                    self.persist_cache();
                     self.connection = Some(ConnectionConfig {
                         host_id: credential.host_id,
                         pair_token: None,
@@ -524,22 +627,7 @@ impl Component for App {
                     self.connect(context);
                 }
             }
-            Msg::ForgetCredentials => {
-                if let Some(connection) = &self.connection {
-                    remove_cache(connection.host_id);
-                }
-                self.credentials.clear();
-                save_credentials(&self.credentials);
-                self.manually_disconnected = true;
-                self.retry_enabled = false;
-                self.cancel_reconnect_timer();
-                self.close_socket("credentials removed");
-                self.connection = None;
-                self.snapshot = None;
-                self.timeline_by_conversation.clear();
-                self.markdown_render_cache.clear();
-                self.status = "本地设备凭证已删除".to_owned();
-            }
+            Msg::ForgetCredential(index) => self.forget_credential(index),
             Msg::SelectConversation(id) => {
                 self.select_conversation(id);
             }
@@ -565,14 +653,17 @@ impl Component for App {
                     self.status = "请先等待发送确认，或取消重试后再切换 Provider".to_owned();
                     return true;
                 }
+                self.remember_current_draft();
                 self.selected_provider = provider;
                 self.selected_project = None;
                 self.selected_conversation = None;
                 self.draft_conversation = None;
                 self.pending_attachments.clear();
+                self.session_settings_open = false;
                 self.reset_dynamic_selection();
                 self.ensure_project_for_provider();
                 self.expand_selected_project();
+                self.restore_current_draft();
                 self.request_project_refresh(provider);
                 self.sync_selected_project();
             }
@@ -585,7 +676,11 @@ impl Component for App {
                                 Some(model.id.as_str()) == self.selected_model.as_deref()
                             })
                         })
-                        .and_then(|model| model.default_effort.clone());
+                        .and_then(|model| {
+                            model.default_effort.clone().or_else(|| {
+                                model.effort_options.first().map(|effort| effort.id.clone())
+                            })
+                        });
             }
             Msg::SelectEffort(effort) => self.selected_effort = effort,
             Msg::SelectPermission(permission) => {
@@ -600,12 +695,16 @@ impl Component for App {
                 if self.pending_send.is_some() {
                     self.status = "请先等待发送确认，或取消重试后再新建对话".to_owned();
                 } else if self.selected_project.is_some() {
+                    self.remember_current_draft();
                     self.selected_conversation = None;
                     self.draft_conversation = Some(ConversationId::new());
                     self.pending_attachments.clear();
                     self.sidebar_open = false;
                     self.editing_title = false;
+                    self.session_settings_open = false;
+                    self.follow_timeline_tail = true;
                     self.expand_selected_project();
+                    self.restore_current_draft();
                 }
             }
             Msg::ToggleProjectPicker => self.project_picker_open = !self.project_picker_open,
@@ -618,12 +717,57 @@ impl Component for App {
                 }
             }
             Msg::ConversationSearchChanged(value) => self.conversation_search = value,
+            Msg::SelectConversationSort(mode) => self.conversation_sort = mode,
             Msg::ToggleSidebar => self.sidebar_collapsed = !self.sidebar_collapsed,
             Msg::OpenSidebar => self.sidebar_open = true,
             Msg::CloseSidebar => self.sidebar_open = false,
+            Msg::ToggleSessionSettings => self.session_settings_open = !self.session_settings_open,
+            Msg::CloseSessionSettings => self.session_settings_open = false,
+            Msg::TimelineScrolled => {
+                let was_following = self.follow_timeline_tail;
+                self.update_timeline_follow_state();
+                let near_top = self
+                    .timeline_ref
+                    .cast::<HtmlElement>()
+                    .is_some_and(|element| element.scroll_top() <= 48);
+                if near_top && !self.follow_timeline_tail {
+                    self.load_older();
+                } else if was_following == self.follow_timeline_tail {
+                    return false;
+                }
+            }
+            Msg::JumpToLatest => {
+                self.follow_timeline_tail = true;
+                self.timeline_anchor = None;
+            }
+            Msg::DismissFeedback => self.copy_feedback = None,
+            Msg::CloseOverlays => {
+                self.session_settings_open = false;
+                self.project_picker_open = false;
+                self.sidebar_open = false;
+                self.fullscreen_image = None;
+                self.editing_title = false;
+                if let Some(document) = window().and_then(|browser| browser.document())
+                    && let Ok(Some(menu)) = document.query_selector(".host-switcher[open]")
+                {
+                    let _ = menu.remove_attribute("open");
+                }
+            }
+            Msg::CopyFinished(success) => {
+                self.copy_feedback = Some(
+                    if success {
+                        "已复制"
+                    } else {
+                        "复制失败，请允许剪贴板访问或选中文字复制"
+                    }
+                    .to_owned(),
+                );
+            }
             Msg::ComposerChanged(value) => {
+                self.copy_feedback = None;
                 if self.pending_send.is_none() {
                     self.composer = value;
+                    self.remember_current_draft();
                 }
             }
             Msg::FilesSelected(files) => {
@@ -659,8 +803,14 @@ impl Component for App {
                 }
             }
             Msg::Send => {
+                let provider_ready = self.selected_conversation.is_some()
+                    || self
+                        .selected_capability()
+                        .is_some_and(|capability| capability.health.state == ProviderState::Ready);
                 if !self.authenticated {
                     self.status = "连接尚未完成认证，消息已保留".to_owned();
+                } else if !provider_ready {
+                    self.status = "当前 Provider 尚未就绪，消息已保留".to_owned();
                 } else if self.pending_send.is_none()
                     && !self.composer.trim().is_empty()
                     && self
@@ -786,11 +936,17 @@ impl Component for App {
                 }
             }
             Msg::ResolveApproval(approval_id, option_id) => {
-                self.send_authenticated(ClientCommand::ResolveApproval {
-                    command_id: CommandId::new(),
-                    approval_id,
-                    option_id,
-                });
+                if !self.pending_approvals.contains(&approval_id) {
+                    let command_id = CommandId::new();
+                    if self.send_authenticated(ClientCommand::ResolveApproval {
+                        command_id,
+                        approval_id,
+                        option_id,
+                    }) {
+                        self.pending_approvals.insert(approval_id);
+                        self.approval_commands.insert(command_id, approval_id);
+                    }
+                }
             }
             Msg::SetSessionOption(option_id, value) => {
                 if option_id == "permission_mode" && !self.confirm_permission_change(&value) {
@@ -824,34 +980,7 @@ impl Component for App {
                     self.editing_title = false;
                 }
             }
-            Msg::LoadOlder => {
-                if let Some(conversation_id) = self.selected_conversation
-                    && !self.history_exhausted.contains(&conversation_id)
-                {
-                    let before = self
-                        .history_before
-                        .get(&conversation_id)
-                        .copied()
-                        .or_else(|| {
-                            self.snapshot.as_ref().and_then(|snapshot| {
-                                snapshot
-                                    .timeline
-                                    .iter()
-                                    .filter(|item| item.conversation_id == conversation_id)
-                                    .min_by_key(|item| (item.created_at_ms, item.id))
-                                    .map(|item| TimelinePageCursor {
-                                        created_at_ms: item.created_at_ms,
-                                        item_id: item.id,
-                                    })
-                            })
-                        });
-                    self.send_authenticated(ClientCommand::GetConversationPage {
-                        conversation_id,
-                        before,
-                        limit: 100,
-                    });
-                }
-            }
+            Msg::LoadOlder => self.load_older(),
             Msg::OpenImage(id) => {
                 self.fullscreen_image = Some(id);
                 if !self.attachments.contains_key(&id) {
@@ -882,13 +1011,25 @@ impl Component for App {
             .and_then(|id| snapshot.projects.iter().find(|project| project.id == id));
         let providers = available_providers(snapshot);
         html! {
-            <main class={classes!("app-shell", self.sidebar_collapsed.then_some("sidebar-collapsed"))}>
+            <main class={classes!("app-shell", self.sidebar_collapsed.then_some("sidebar-collapsed"))} onkeydown={link.batch_callback(|event: web_sys::KeyboardEvent| {
+                (event.key() == "Escape").then_some(Msg::CloseOverlays)
+            })}>
                 {if self.sidebar_open { html! {<button class="drawer-scrim" aria-label="关闭侧边栏" onclick={link.callback(|_| Msg::CloseSidebar)}></button>} } else {html! {}}}
                 <aside class={classes!("sidebar", self.sidebar_open.then_some("open"))}>
-                    <div class="brand">
-                        <span class="brand-mark">{"AR"}</span>
-                        <div class="collapsible-copy"><strong>{"Agent Remote"}</strong><small>{&snapshot.host_name}</small></div>
-                    </div>
+                    <details key={snapshot.host_id.to_string()} class="host-switcher">
+                        <summary class="brand" title="连接与主机"><span class="brand-mark">{icon("connection")}</span><span class="collapsible-copy"><strong>{"Agent Remote"}</strong><small>{&snapshot.host_name}</small></span><span class="collapsible-copy">{icon("chevron-down")}</span></summary>
+                        <div class="host-menu">
+                            <h3>{"主机"}</h3>
+                            {for self.credentials.iter().enumerate().map(|(index, credential)| html! {
+                                <button class={classes!("host-row", (credential.host_id == snapshot.host_id).then_some("active"))} onclick={link.callback(move |_| Msg::ConnectStored(index))}>
+                                    <span>{credential.display_name.as_deref().unwrap_or("已保存的主机")}</span>
+                                    {if credential.host_id == snapshot.host_id {icon("check")} else {icon("chevron-right")}}
+                                </button>
+                            })}
+                            <label class="field"><span>{"连接其他主机"}</span><input aria-label="新主机配对链接" placeholder="粘贴配对链接" value={self.pair_link.clone()} oninput={link.callback(|event: InputEvent| Msg::PairLinkChanged(event.target_unchecked_into::<HtmlInputElement>().value()))}/></label>
+                            <button class="primary wide" disabled={self.pair_link.trim().is_empty()} onclick={link.callback(|_| Msg::OpenPairLink)}>{"连接"}</button>
+                        </div>
+                    </details>
                     <div class="connection-strip">
                         <span class={if self.connected {"status-dot online"} else {"status-dot"}}></span>
                         <span class="collapsible-copy">{&self.status}</span>
@@ -897,20 +1038,24 @@ impl Component for App {
                     {self.view_agent_selector(link, &providers)}
                     <div class="project-control">
                         <button class="project-trigger" onclick={link.callback(|_| Msg::ToggleProjectPicker)} title="选择项目">
-                            <span class="project-icon">{"▣"}</span>
+                            <span class="project-icon">{icon("folder")}</span>
                             <span class="collapsible-copy"><strong>{project.map_or("选择项目", |project| project.display_name.as_str())}</strong><small>{project.map_or("", |project| project.short_path.as_str())}</small></span>
-                            <span class="collapsible-copy">{"⌄"}</span>
+                            <span class="collapsible-copy">{icon("chevron-down")}</span>
                         </button>
                         {if self.project_picker_open { self.view_project_picker(link, snapshot) } else {html! {}}}
                     </div>
-                    <button class="new-button" onclick={link.callback(|_| Msg::NewConversation)} disabled={self.selected_project.is_none()}><span>{"＋"}</span><b class="collapsible-copy">{"新建对话"}</b></button>
-                    <label class="conversation-search collapsible-copy"><span>{"⌕"}</span><input placeholder="搜索项目或对话" value={self.conversation_search.clone()} oninput={link.callback(|event: InputEvent| Msg::ConversationSearchChanged(event.target_unchecked_into::<HtmlInputElement>().value()))}/></label>
+                    <button class="new-button" title="新建对话" onclick={link.callback(|_| Msg::NewConversation)} disabled={self.selected_project.is_none()}>{icon("plus")}<span class="collapsible-copy">{"新建对话"}</span></button>
+                    <label class="conversation-search collapsible-copy">{icon("search")}<input aria-label="搜索项目或对话" placeholder="搜索项目或对话" value={self.conversation_search.clone()} oninput={link.callback(|event: InputEvent| Msg::ConversationSearchChanged(event.target_unchecked_into::<HtmlInputElement>().value()))}/></label>
+                    <div class="sidebar-sort collapsible-copy" aria-label="会话排序">
+                        <button class={classes!((self.conversation_sort == ConversationSortMode::Recent).then_some("active"))} aria-pressed={(self.conversation_sort == ConversationSortMode::Recent).to_string()} onclick={link.callback(|_| Msg::SelectConversationSort(ConversationSortMode::Recent))}>{"最新"}</button>
+                        <button class={classes!((self.conversation_sort == ConversationSortMode::Active).then_some("active"))} aria-pressed={(self.conversation_sort == ConversationSortMode::Active).to_string()} onclick={link.callback(|_| Msg::SelectConversationSort(ConversationSortMode::Active))}>{"进行中"}</button>
+                    </div>
                     <nav class="conversation-list" aria-label="项目与会话">
                         {self.view_project_tree(link, snapshot)}
                     </nav>
                     <div class="sidebar-footer">
-                        <button onclick={link.callback(|_| Msg::Disconnect)} title="断开连接">{"⏻"}<span class="collapsible-copy">{"断开"}</span></button>
-                        <button onclick={link.callback(|_| Msg::ToggleSidebar)} title="收起侧边栏">{if self.sidebar_collapsed {"›"} else {"‹"}}</button>
+                        <button onclick={link.callback(|_| Msg::Disconnect)} title="断开连接">{icon("disconnect")}<span class="collapsible-copy">{"断开连接"}</span></button>
+                        <button onclick={link.callback(|_| Msg::ToggleSidebar)} title={if self.sidebar_collapsed {"展开侧边栏"} else {"收起侧边栏"}}>{icon("panel")}</button>
                     </div>
                 </aside>
                 <section class="chat-pane">
@@ -918,13 +1063,22 @@ impl Component for App {
                         self.view_chat(link, conversation, snapshot)
                     } else if self.draft_conversation.is_some() && self.selected_project.is_some() {
                         self.view_draft_chat(link, snapshot)
+                    } else if let Some(project) = project {
+                        self.view_project_home(link, project, snapshot)
                     } else {
-                        html! { <div class="empty-state"><button class="mobile-menu" onclick={link.callback(|_| Msg::OpenSidebar)}>{"☰"}</button><h2>{"选择或新建对话"}</h2><p>{"这里只显示当前 Agent 与项目的远程对话。"}</p></div> }
+                        html! { <div class="empty-state"><button class="mobile-menu" aria-label="打开侧边栏" onclick={link.callback(|_| Msg::OpenSidebar)}>{icon("panel")}</button><h2>{"选择或新建对话"}</h2><p>{"这里只显示当前 Agent 与项目的远程对话。"}</p></div> }
                     }}
                 </section>
                 {self.view_fullscreen_image(link)}
+                {self.view_session_settings(link)}
+                {self.copy_feedback.as_ref().map(|feedback| html! {<div class="copy-feedback" role="status" onclick={link.callback(|_| Msg::DismissFeedback)}>{feedback}<button aria-label="关闭提示">{icon("close")}</button></div>}).unwrap_or_default()}
             </main>
         }
+    }
+
+    fn rendered(&mut self, _context: &Context<Self>, _first_render: bool) {
+        self.restore_timeline_anchor();
+        self.scroll_timeline_to_tail();
     }
 
     fn destroy(&mut self, _context: &Context<Self>) {
@@ -993,6 +1147,8 @@ impl App {
     }
 
     fn handle_disconnect(&mut self, context: &Context<Self>, reason: String) {
+        self.history_loading.clear();
+        self.history_requested.clear();
         self.connected = false;
         self.authenticated = false;
         self.socket = None;
@@ -1020,6 +1176,7 @@ impl App {
             return;
         }
         if self.reconnect_attempt >= MAX_RECONNECT_ATTEMPTS {
+            self.retry_enabled = false;
             self.status = format!("连接失败 · 已达到重试上限：{reason}");
             return;
         }
@@ -1234,6 +1391,7 @@ impl App {
                         device_token,
                         origin: connection.origin.clone(),
                         relay: connection.relay,
+                        display_name: None,
                     };
                     self.credentials.retain(|item| item.host_id != host_id);
                     self.credentials.push(credential.clone());
@@ -1275,6 +1433,15 @@ impl App {
                     self.status = "忽略了其他 Host 的状态快照".to_owned();
                     return;
                 }
+                if let Some(credential) = self
+                    .credentials
+                    .iter_mut()
+                    .find(|credential| credential.host_id == snapshot.host_id)
+                {
+                    credential.display_name = Some(snapshot.host_name.clone());
+                    save_credentials(&self.credentials);
+                }
+                self.remember_current_draft();
                 self.snapshot = Some(snapshot);
                 self.reindex_timeline();
                 self.sync_in_flight.clear();
@@ -1282,6 +1449,9 @@ impl App {
                 self.history_before.clear();
                 self.history_exhausted.clear();
                 self.history_requested.clear();
+                self.history_loading.clear();
+                self.pending_approvals.clear();
+                self.approval_commands.clear();
                 let previous_project = self.selected_project;
                 self.ensure_provider_available();
                 self.ensure_project_for_provider();
@@ -1298,6 +1468,7 @@ impl App {
                 if previous_project != self.selected_project {
                     self.expand_selected_project();
                 }
+                self.restore_current_draft();
                 self.status = "同步中…".to_owned();
                 self.request_project_refresh(self.selected_provider);
                 if self
@@ -1315,6 +1486,9 @@ impl App {
                 projects,
                 capabilities,
             } => {
+                if provider == self.selected_provider {
+                    self.remember_current_draft();
+                }
                 self.refresh_in_flight.remove(&provider);
                 if let Some(snapshot) = &mut self.snapshot {
                     let incoming_ids = projects
@@ -1341,11 +1515,31 @@ impl App {
                     }
                 }
                 if provider == self.selected_provider {
+                    let previous_provider = self.selected_provider;
                     let previous_project = self.selected_project;
+                    let previous_conversation = self.selected_conversation;
                     self.ensure_provider_available();
                     self.ensure_project_for_provider();
+                    self.selected_conversation = self.selected_conversation.filter(|selected| {
+                        self.snapshot.as_ref().is_some_and(|snapshot| {
+                            snapshot.conversations.iter().any(|conversation| {
+                                conversation.id == *selected
+                                    && Some(conversation.project_id) == self.selected_project
+                                    && conversation.provider == self.selected_provider
+                            })
+                        })
+                    });
                     if previous_project != self.selected_project {
                         self.expand_selected_project();
+                    }
+                    if previous_provider != self.selected_provider
+                        || previous_project != self.selected_project
+                        || previous_conversation != self.selected_conversation
+                    {
+                        self.draft_conversation = None;
+                        self.pending_attachments.clear();
+                        self.session_settings_open = false;
+                        self.restore_current_draft();
                     }
                     self.reset_dynamic_selection();
                 }
@@ -1371,6 +1565,11 @@ impl App {
                 items,
                 next_before,
             } => {
+                self.history_loading.remove(&conversation_id);
+                if self.selected_conversation == Some(conversation_id) && !self.follow_timeline_tail
+                {
+                    self.timeline_anchor = self.capture_timeline_anchor(conversation_id);
+                }
                 for item in items {
                     let changed = self.snapshot.as_mut().is_some_and(|snapshot| {
                         upsert_timeline_item(&mut snapshot.timeline, item.clone())
@@ -1393,6 +1592,7 @@ impl App {
                         self.history_exhausted.insert(conversation_id);
                     }
                 }
+                self.request_images_for_selected();
             }
             ServerMessage::ProviderChanged { capability } => {
                 if let Some(snapshot) = &mut self.snapshot {
@@ -1415,15 +1615,36 @@ impl App {
                     }
                     refresh_project_metrics(snapshot, project_id);
                     if self.draft_conversation == Some(conversation.id) {
+                        if let Some(host_id) = self
+                            .connection
+                            .as_ref()
+                            .map(|connection| connection.host_id)
+                            && let Some(scope) =
+                                draft_scope(host_id, provider, Some(project_id), None)
+                        {
+                            self.scoped_drafts.remove(&scope);
+                        }
                         self.selected_provider = provider;
                         self.selected_project = Some(project_id);
                         self.selected_conversation = Some(conversation.id);
                         self.draft_conversation = None;
+                        self.follow_timeline_tail = true;
+                        self.remember_current_draft();
                         self.expand_selected_project();
                     }
                 }
             }
             ServerMessage::TimelineItemUpserted { item } => {
+                if let TimelineItemKind::Approval {
+                    approval_id,
+                    resolved_option: Some(_),
+                    ..
+                } = &item.kind
+                {
+                    self.pending_approvals.remove(approval_id);
+                    self.approval_commands
+                        .retain(|_, pending| pending != approval_id);
+                }
                 let image_id = match &item.kind {
                     TimelineItemKind::Image { attachment_id, .. } => Some(*attachment_id),
                     _ => None,
@@ -1445,6 +1666,10 @@ impl App {
                 }
             }
             ServerMessage::ConversationRemoved { conversation_id } => {
+                let removed_selected = self.selected_conversation == Some(conversation_id);
+                if removed_selected {
+                    self.remember_current_draft();
+                }
                 if let Some(snapshot) = &mut self.snapshot {
                     let project_id = snapshot
                         .conversations
@@ -1461,8 +1686,12 @@ impl App {
                         refresh_project_metrics(snapshot, project_id);
                     }
                 }
-                if self.selected_conversation == Some(conversation_id) {
+                if removed_selected {
                     self.selected_conversation = None;
+                    self.pending_attachments.clear();
+                    self.session_settings_open = false;
+                    self.follow_timeline_tail = true;
+                    self.restore_current_draft();
                 }
                 if let Some(items) = self.timeline_by_conversation.remove(&conversation_id) {
                     for item in items {
@@ -1518,8 +1747,16 @@ impl App {
                 code,
                 message,
             } => {
+                if command_id.is_none() {
+                    self.history_requested
+                        .retain(|id| !self.history_loading.contains(id));
+                    self.history_loading.clear();
+                }
                 if let Some(command_id) = command_id {
                     self.sync_in_flight.remove(&command_id);
+                    if let Some(approval_id) = self.approval_commands.remove(&command_id) {
+                        self.pending_approvals.remove(&approval_id);
+                    }
                 }
                 let rejected_pending_id = match command_id {
                     Some(command_id)
@@ -1544,6 +1781,17 @@ impl App {
                 if code == "authentication_failed" {
                     self.authenticated = false;
                     self.retry_enabled = false;
+                    if let Some(host_id) = self
+                        .connection
+                        .as_ref()
+                        .map(|connection| connection.host_id)
+                        && let Some(index) = self
+                            .credentials
+                            .iter()
+                            .position(|credential| credential.host_id == host_id)
+                    {
+                        self.forget_credential(index);
+                    }
                     self.status = format!("认证失效，请重新配对：{message}");
                 } else {
                     self.status = format!("{code}: {message}");
@@ -1559,20 +1807,23 @@ impl App {
                     .as_ref()
                     .is_some_and(|pending| pending.command_id == command_id)
                 {
-                    if let Some(pending) = &self.pending_send
-                        && command_is_send(&pending.command)
-                    {
-                        trace_send_stage(
-                            "command_accepted",
-                            command_id,
-                            &pending.client_message_id,
-                            Some(self.connection_generation),
-                            self.send_elapsed_ms(command_id),
-                        );
+                    if let Some(pending) = self.pending_send.take() {
+                        let clear_visible_draft = self.command_owns_current_draft(&pending.command);
+                        if command_is_send(&pending.command) {
+                            trace_send_stage(
+                                "command_accepted",
+                                command_id,
+                                &pending.client_message_id,
+                                Some(self.connection_generation),
+                                self.send_elapsed_ms(command_id),
+                            );
+                        }
+                        self.clear_draft_for_command(&pending.command);
+                        if clear_visible_draft {
+                            self.composer.clear();
+                            self.pending_attachments.clear();
+                        }
                     }
-                    self.pending_send = None;
-                    self.composer.clear();
-                    self.pending_attachments.clear();
                     self.status = "已发送".to_owned();
                 }
             }
@@ -1601,26 +1852,24 @@ impl App {
                 .iter()
                 .find(|model| Some(model.id.as_str()) == self.selected_model.as_deref())
         });
-        self.selected_effort = self
-            .selected_effort
-            .take()
-            .filter(|selected| {
-                valid_efforts.is_some_and(|model| {
-                    model
-                        .effort_options
-                        .iter()
-                        .any(|effort| &effort.id == selected)
+        self.selected_effort =
+            self.selected_effort
+                .take()
+                .filter(|selected| {
+                    valid_efforts.is_some_and(|model| {
+                        model
+                            .effort_options
+                            .iter()
+                            .any(|effort| &effort.id == selected)
+                    })
                 })
-            })
-            .or_else(|| {
-                capability.as_ref().and_then(|capability| {
-                    capability.models.first().and_then(|model| {
+                .or_else(|| {
+                    valid_efforts.and_then(|model| {
                         model.default_effort.clone().or_else(|| {
                             model.effort_options.first().map(|effort| effort.id.clone())
                         })
                     })
-                })
-            });
+                });
         self.selected_permission = self
             .selected_permission
             .take()
@@ -1719,6 +1968,260 @@ impl App {
             .insert(item.id, (item.revision, markdown_html(markdown)));
     }
 
+    fn current_draft_scope(&self) -> Option<DraftScope> {
+        draft_scope(
+            self.connection.as_ref()?.host_id,
+            self.selected_provider,
+            self.selected_project,
+            self.selected_conversation
+                .filter(|_| self.draft_conversation.is_none()),
+        )
+    }
+
+    fn remember_current_draft(&mut self) {
+        let Some(scope) = self.current_draft_scope() else {
+            return;
+        };
+        if self.composer.is_empty() {
+            self.scoped_drafts.remove(&scope);
+        } else {
+            self.scoped_drafts.insert(scope, self.composer.clone());
+        }
+    }
+
+    fn restore_current_draft(&mut self) {
+        self.composer = self
+            .current_draft_scope()
+            .and_then(|scope| self.scoped_drafts.get(&scope).cloned())
+            .unwrap_or_default();
+    }
+
+    fn clear_draft_for_command(&mut self, command: &ClientCommand) {
+        let Some(host_id) = self
+            .connection
+            .as_ref()
+            .map(|connection| connection.host_id)
+        else {
+            return;
+        };
+        match command {
+            ClientCommand::StartConversation {
+                conversation_id,
+                project_id,
+                provider,
+                ..
+            } => {
+                if let Some(scope) = draft_scope(host_id, *provider, Some(*project_id), None) {
+                    self.scoped_drafts.remove(&scope);
+                }
+                if let Some(scope) = draft_scope(
+                    host_id,
+                    *provider,
+                    Some(*project_id),
+                    Some(*conversation_id),
+                ) {
+                    self.scoped_drafts.remove(&scope);
+                }
+            }
+            ClientCommand::SendMessage {
+                conversation_id, ..
+            }
+            | ClientCommand::Steer {
+                conversation_id, ..
+            } => {
+                if let Some(conversation) = self.snapshot.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .conversations
+                        .iter()
+                        .find(|conversation| conversation.id == *conversation_id)
+                }) && let Some(scope) = draft_scope(
+                    host_id,
+                    conversation.provider,
+                    Some(conversation.project_id),
+                    Some(*conversation_id),
+                ) {
+                    self.scoped_drafts.remove(&scope);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn command_owns_current_draft(&self, command: &ClientCommand) -> bool {
+        let Some(host_id) = self
+            .connection
+            .as_ref()
+            .map(|connection| connection.host_id)
+        else {
+            return false;
+        };
+        let current = self.current_draft_scope();
+        match command {
+            ClientCommand::StartConversation {
+                conversation_id,
+                project_id,
+                provider,
+                ..
+            } => {
+                current == draft_scope(host_id, *provider, Some(*project_id), None)
+                    || current
+                        == draft_scope(
+                            host_id,
+                            *provider,
+                            Some(*project_id),
+                            Some(*conversation_id),
+                        )
+            }
+            ClientCommand::SendMessage {
+                conversation_id, ..
+            }
+            | ClientCommand::Steer {
+                conversation_id, ..
+            } => self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot
+                        .conversations
+                        .iter()
+                        .find(|conversation| conversation.id == *conversation_id)
+                })
+                .is_some_and(|conversation| {
+                    current
+                        == draft_scope(
+                            host_id,
+                            conversation.provider,
+                            Some(conversation.project_id),
+                            Some(*conversation_id),
+                        )
+                }),
+            _ => false,
+        }
+    }
+
+    fn update_timeline_follow_state(&mut self) {
+        let Some(element) = self.timeline_ref.cast::<HtmlElement>() else {
+            return;
+        };
+        let remaining = element.scroll_height() - element.scroll_top() - element.client_height();
+        self.follow_timeline_tail = remaining <= 72;
+    }
+
+    fn load_older(&mut self) {
+        let Some(conversation_id) = self.selected_conversation else {
+            return;
+        };
+        if !self.authenticated
+            || !self.connected
+            || self.history_exhausted.contains(&conversation_id)
+            || self.history_loading.contains(&conversation_id)
+        {
+            return;
+        }
+        let before = self
+            .history_before
+            .get(&conversation_id)
+            .copied()
+            .or_else(|| {
+                self.timeline_by_conversation
+                    .get(&conversation_id)?
+                    .first()
+                    .map(|item| TimelinePageCursor {
+                        created_at_ms: item.created_at_ms,
+                        item_id: item.id,
+                    })
+            });
+        if self.send_authenticated(ClientCommand::GetConversationPage {
+            conversation_id,
+            before,
+            limit: 100,
+        }) {
+            self.follow_timeline_tail = false;
+            self.history_loading.insert(conversation_id);
+        }
+    }
+
+    fn capture_timeline_anchor(&self, conversation_id: ConversationId) -> Option<TimelineAnchor> {
+        let element = self.timeline_ref.cast::<HtmlElement>()?;
+        let top = element.get_bounding_client_rect().top();
+        let mut child = element.first_element_child();
+        while let Some(node) = child {
+            let rect = node.get_bounding_client_rect();
+            if rect.bottom() > top
+                && let Some(item_id) = node.get_attribute("data-timeline-id")
+            {
+                return Some(TimelineAnchor {
+                    conversation_id,
+                    item_id,
+                    offset: rect.top() - top,
+                });
+            }
+            child = node.next_element_sibling();
+        }
+        None
+    }
+
+    fn restore_timeline_anchor(&mut self) {
+        let Some(anchor) = self.timeline_anchor.take() else {
+            return;
+        };
+        if self.selected_conversation != Some(anchor.conversation_id) || self.follow_timeline_tail {
+            return;
+        }
+        if let Some(element) = self.timeline_ref.cast::<HtmlElement>()
+            && let Ok(Some(node)) =
+                element.query_selector(&format!("[data-timeline-id='{}']", anchor.item_id))
+        {
+            let node = node
+                .closest(".activity-group:not([open])")
+                .ok()
+                .flatten()
+                .unwrap_or(node);
+            let delta = node.get_bounding_client_rect().top()
+                - element.get_bounding_client_rect().top()
+                - anchor.offset;
+            element.set_scroll_top(element.scroll_top() + delta.round() as i32);
+        }
+    }
+
+    fn scroll_timeline_to_tail(&self) {
+        if !self.follow_timeline_tail {
+            return;
+        }
+        if let Some(element) = self.timeline_ref.cast::<HtmlElement>() {
+            element.set_scroll_top(element.scroll_height());
+        }
+    }
+
+    fn forget_credential(&mut self, index: usize) {
+        let Some(credential) = self.credentials.get(index).cloned() else {
+            return;
+        };
+        self.credentials.remove(index);
+        save_credentials(&self.credentials);
+        remove_cache(credential.host_id);
+        if self
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.host_id == credential.host_id)
+        {
+            self.manually_disconnected = true;
+            self.retry_enabled = false;
+            self.cancel_reconnect_timer();
+            self.close_socket("credentials removed");
+            self.connection = None;
+            self.snapshot = None;
+            self.timeline_by_conversation.clear();
+            self.markdown_render_cache.clear();
+            self.scoped_drafts.clear();
+            self.pending_send = None;
+            self.pending_attachments.clear();
+            self.pending_approvals.clear();
+            self.approval_commands.clear();
+        }
+        self.status = "本地设备凭证已删除".to_owned();
+    }
+
     fn project_scope(
         &self,
         provider: ProviderId,
@@ -1760,6 +2263,7 @@ impl App {
             self.status = "项目不属于当前 Host/Provider，已忽略选择".to_owned();
             return;
         }
+        self.remember_current_draft();
         let changed = self.selected_project != Some(project_id);
         self.selected_project = Some(project_id);
         self.selected_conversation = None;
@@ -1767,6 +2271,7 @@ impl App {
         self.pending_attachments.clear();
         self.project_picker_open = false;
         self.sidebar_open = false;
+        self.session_settings_open = false;
         self.recent_projects
             .retain(|project| *project != project_id);
         self.recent_projects.insert(0, project_id);
@@ -1776,6 +2281,7 @@ impl App {
             self.reset_dynamic_selection();
             self.sync_selected_project();
         }
+        self.restore_current_draft();
     }
 
     fn select_conversation(&mut self, conversation_id: ConversationId) {
@@ -1802,6 +2308,7 @@ impl App {
             self.status = "对话不属于已授权的 Host/Provider/Project，已忽略选择".to_owned();
             return;
         };
+        self.remember_current_draft();
         let scope_changed =
             self.selected_provider != provider || self.selected_project != Some(project_id);
         self.selected_provider = provider;
@@ -1811,6 +2318,8 @@ impl App {
         self.pending_attachments.clear();
         self.sidebar_open = false;
         self.editing_title = false;
+        self.session_settings_open = false;
+        self.follow_timeline_tail = true;
         self.recent_projects
             .retain(|project| *project != project_id);
         self.recent_projects.insert(0, project_id);
@@ -1819,6 +2328,7 @@ impl App {
         if scope_changed {
             self.reset_dynamic_selection();
         }
+        self.restore_current_draft();
         self.request_images_for_selected();
         self.request_selected_conversation_page();
     }
@@ -2038,6 +2548,26 @@ impl App {
                 scope.project_id.to_string(),
             )
         });
+        let mut drafts = self.scoped_drafts.clone();
+        if let Some(scope) = self.current_draft_scope() {
+            if self.composer.is_empty() {
+                drafts.remove(&scope);
+            } else {
+                drafts.insert(scope, self.composer.clone());
+            }
+        }
+        let mut drafts = drafts
+            .into_iter()
+            .map(|(scope, value)| StoredDraft { scope, value })
+            .collect::<Vec<_>>();
+        drafts.sort_by_key(|draft| {
+            (
+                draft.scope.host_id.to_string(),
+                draft.scope.provider.to_string(),
+                draft.scope.project_id.to_string(),
+                draft.scope.conversation_id.map(|id| id.to_string()),
+            )
+        });
         save_cache(&AppCache {
             version: CACHE_VERSION,
             host_id: connection.host_id,
@@ -2054,6 +2584,8 @@ impl App {
                 .as_ref()
                 .map(|pending| pending.command.clone()),
             composer: self.composer.clone(),
+            drafts,
+            conversation_sort: self.conversation_sort,
             sidebar_collapsed: self.sidebar_collapsed,
             pinned_projects: self.pinned_projects.clone(),
             recent_projects: self.recent_projects.clone(),
@@ -2112,12 +2644,19 @@ impl App {
         self.history_before.clear();
         self.history_exhausted.clear();
         self.history_requested.clear();
+        self.history_loading.clear();
+        self.timeline_anchor = None;
+        self.copy_feedback = None;
         self.conversation_search.clear();
         self.project_picker_open = false;
         self.project_search.clear();
         self.sidebar_open = false;
         self.editing_title = false;
         self.title_draft.clear();
+        self.session_settings_open = false;
+        self.pending_approvals.clear();
+        self.approval_commands.clear();
+        self.follow_timeline_tail = true;
         let Some(cache) = load_cache(host_id) else {
             self.snapshot = None;
             self.selected_conversation = None;
@@ -2129,13 +2668,15 @@ impl App {
             self.draft_conversation = None;
             self.pending_send = None;
             self.composer.clear();
+            self.scoped_drafts.clear();
             self.sidebar_collapsed = false;
             self.pinned_projects.clear();
             self.recent_projects.clear();
             self.expanded_projects.clear();
+            self.conversation_sort = ConversationSortMode::Recent;
             return;
         };
-        let cache_needs_tree_default = cache.version < CACHE_VERSION;
+        let cache_needs_tree_default = cache.version < 3;
         self.snapshot = Some(cache.snapshot);
         self.reindex_timeline();
         self.selected_conversation = cache.selected_conversation;
@@ -2156,7 +2697,22 @@ impl App {
             .pending_send
             .as_ref()
             .map_or_else(Vec::new, pending_browser_attachments);
-        self.composer = cache.composer;
+        self.scoped_drafts = cache
+            .drafts
+            .into_iter()
+            .map(|draft| (draft.scope, draft.value))
+            .collect();
+        if self.scoped_drafts.is_empty()
+            && !cache.composer.is_empty()
+            && let Some(scope) = self.current_draft_scope()
+        {
+            self.scoped_drafts.insert(scope, cache.composer.clone());
+        }
+        self.composer = self
+            .current_draft_scope()
+            .and_then(|scope| self.scoped_drafts.get(&scope).cloned())
+            .unwrap_or(cache.composer);
+        self.conversation_sort = cache.conversation_sort;
         self.sidebar_collapsed = cache.sidebar_collapsed;
         self.pinned_projects = cache.pinned_projects;
         self.recent_projects = cache.recent_projects;
@@ -2211,6 +2767,8 @@ impl App {
             limit: 100,
         }) {
             self.history_requested.remove(&conversation_id);
+        } else {
+            self.history_loading.insert(conversation_id);
         }
     }
 
@@ -2218,32 +2776,36 @@ impl App {
         html! {
             <main class="connection-page">
                 <section class="connection-card">
-                    <div class="connection-logo">{"AR"}</div>
-                    <p class="eyebrow">{"AGENT REMOTE MESSENGER"}</p>
-                    <h1>{"连接你的编程 Agent"}</h1>
-                    <p class="lead">{"在电脑上运行 Host，然后用 Host 输出的配对链接打开本页。项目和 Agent 始终留在电脑上。"}</p>
+                    <div class="connection-logo">{icon("connection")}</div>
+                    <p class="eyebrow">{"Agent Remote"}</p>
+                    <h1>{"连接工作电脑"}</h1>
+                    <p class="lead">{"粘贴电脑上的配对链接，在这里继续对话。"}</p>
                     <div class="connection-status"><span class="status-dot"></span><span>{&self.status}</span></div>
                     {if self.credentials.is_empty() { html! {} } else { html! {
                         <div class="saved-hosts">
-                            <h2>{"已配对 Host"}</h2>
+                            <h2>{"已保存的主机"}</h2>
                             {for self.credentials.iter().enumerate().map(|(index, credential)| {
-                                let onclick = link.callback(move |_| Msg::ConnectStored(index));
-                                html! { <button class="host-row" {onclick}><span>{credential.host_id.to_string()}</span><b>{"连接"}</b></button> }
+                                let connect = link.callback(move |_| Msg::ConnectStored(index));
+                                let forget = link.callback(move |_| Msg::ForgetCredential(index));
+                                html! {
+                                    <article class="saved-host-card">
+                                        <div><strong>{credential.display_name.as_deref().unwrap_or("已保存的主机")}</strong><small>{&credential.origin}</small><small>{if credential.relay {"公网 Relay"} else {"直接连接"}}</small></div>
+                                        <div class="host-actions"><button onclick={connect}>{"连接"}</button><button class="danger" onclick={forget}>{"删除"}</button></div>
+                                    </article>
+                                }
                             })}
                         </div>
                     }}}
                     <label class="field">
                         <span>{"配对链接"}</span>
                         <input
-                            placeholder="https://host/#host=…&pair=…"
+                            aria-label="配对链接"
+                            placeholder="https://…"
                             value={self.pair_link.clone()}
                             oninput={link.callback(|event: InputEvent| Msg::PairLinkChanged(event.target_unchecked_into::<HtmlInputElement>().value()))}
                         />
                     </label>
-                    <button class="primary wide" onclick={link.callback(|_| Msg::OpenPairLink)} disabled={self.pair_link.trim().is_empty()}>{"打开并配对"}</button>
-                    {if self.credentials.is_empty() { html! {} } else { html! {
-                        <button class="text-button" onclick={link.callback(|_| Msg::ForgetCredentials)}>{"删除此浏览器保存的设备凭证"}</button>
-                    }}}
+                    <button class="primary wide" onclick={link.callback(|_| Msg::OpenPairLink)} disabled={self.pair_link.trim().is_empty()}>{"连接"}{icon("arrow-right")}</button><p class="connection-footer">{icon("lock")}{"项目、文件与 Agent 均在你的电脑上运行。"}</p>
                 </section>
             </main>
         }
@@ -2295,7 +2857,7 @@ impl App {
                         || project_matches
                         || conversation.title.to_lowercase().contains(&query)
                 });
-                sort_conversations_newest_first(&mut conversations);
+                sort_conversations(&mut conversations, self.conversation_sort);
                 if !query.is_empty() && !project_matches && conversations.is_empty() {
                     return None;
                 }
@@ -2346,7 +2908,7 @@ impl App {
                         aria-label={if expanded {"折叠项目"} else {"展开项目"}}
                         aria-expanded={expanded.to_string()}
                         onclick={link.callback(move |_| Msg::ToggleProject(project_id))}
-                    >{if expanded {"⌄"} else {"›"}}</button>
+                    >{icon(if expanded {"chevron-down"} else {"chevron-right"})}</button>
                     <button class="project-tree-main" disabled={!project.valid} onclick={link.callback(move |_| Msg::SelectProject(project_id))}>
                         <strong>{&project.display_name}</strong>
                         <small class="project-tree-meta">
@@ -2401,7 +2963,7 @@ impl App {
             .collect::<Vec<_>>();
         html! {
             <div class="project-popover">
-                <label><span>{"⌕"}</span><input autofocus=true placeholder="搜索项目" value={self.project_search.clone()} oninput={link.callback(|event: InputEvent| Msg::ProjectSearchChanged(event.target_unchecked_into::<HtmlInputElement>().value()))}/></label>
+                <label>{icon("search")}<input aria-label="搜索项目" autofocus=true placeholder="搜索项目" value={self.project_search.clone()} oninput={link.callback(|event: InputEvent| Msg::ProjectSearchChanged(event.target_unchecked_into::<HtmlInputElement>().value()))}/></label>
                 {if pinned.is_empty() {html! {}} else {html! {<section><h3>{"固定"}</h3>{for pinned.into_iter().map(|project| self.view_project_row(link, project))}</section>}}}
                 {if recent.is_empty() {html! {}} else {html! {<section><h3>{"最近"}</h3>{for recent.into_iter().map(|project| self.view_project_row(link, project))}</section>}}}
                 <section><h3>{"全部项目"}</h3>{for projects.into_iter().map(|project| self.view_project_row(link, project))}</section>
@@ -2424,18 +2986,64 @@ impl App {
         }
     }
 
+    fn view_project_home(
+        &self,
+        link: &yew::html::Scope<Self>,
+        project: &agent_remote_protocol::ProjectSummary,
+        snapshot: &Snapshot,
+    ) -> Html {
+        let query = self.conversation_search.trim().to_lowercase();
+        let mut conversations = snapshot
+            .conversations
+            .iter()
+            .filter(|conversation| {
+                conversation_belongs_to_project(conversation, project.id, self.selected_provider)
+                    && (query.is_empty() || conversation.title.to_lowercase().contains(&query))
+            })
+            .collect::<Vec<_>>();
+        sort_conversations(&mut conversations, self.conversation_sort);
+        html! {
+            <>
+                <header class="chat-header">
+                    <div class="chat-header-inner">
+                        <button class="mobile-menu" aria-label="打开侧边栏" onclick={link.callback(|_| Msg::OpenSidebar)}>{icon("panel")}</button>
+                        <div class="chat-title"><p class="eyebrow">{provider_label(self.selected_provider)}</p><h1>{&project.display_name}</h1><small>{&project.short_path}</small></div>
+                        <button class="primary" onclick={link.callback(|_| Msg::NewConversation)}>{"新建对话"}</button>
+                    </div>
+                </header>
+                <div class="timeline project-home">
+                    <div class="project-home-heading">
+                        <div><h2>{"对话"}</h2><p>{format!("{} 个对话", conversations.len())}</p></div>
+                        <div class="sidebar-sort" aria-label="会话排序">
+                            <button class={classes!((self.conversation_sort == ConversationSortMode::Recent).then_some("active"))} aria-pressed={(self.conversation_sort == ConversationSortMode::Recent).to_string()} onclick={link.callback(|_| Msg::SelectConversationSort(ConversationSortMode::Recent))}>{"按时间"}</button>
+                            <button class={classes!((self.conversation_sort == ConversationSortMode::Active).then_some("active"))} aria-pressed={(self.conversation_sort == ConversationSortMode::Active).to_string()} onclick={link.callback(|_| Msg::SelectConversationSort(ConversationSortMode::Active))}>{"进行中优先"}</button>
+                        </div>
+                    </div>
+                    {if conversations.is_empty() {
+                        html! {<div class="empty-state"><h2>{if query.is_empty() {"这个项目还没有会话"} else {"没有匹配的聊天记录"}}</h2><p>{if query.is_empty() {"从一条消息开始。"} else {"试试其他项目名或对话标题。"}}</p></div>}
+                    } else {
+                        html! {<div class="project-home-list"><div class="project-home-list-header"><span>{"对话"}</span><span>{"状态"}</span><span>{"更新时间"}</span></div>{for conversations.into_iter().map(|conversation| self.view_conversation_row(link, conversation))}</div>}
+                    }}
+                </div>
+            </>
+        }
+    }
+
     fn view_draft_chat(&self, link: &yew::html::Scope<Self>, snapshot: &Snapshot) -> Html {
         let project_name = self
             .selected_project
             .and_then(|id| snapshot.projects.iter().find(|project| project.id == id))
             .map_or("未知项目", |project| project.display_name.as_str());
+        let capability = self.selected_capability();
         html! {
             <>
                 <header class="chat-header">
-                    <button class="mobile-menu" onclick={link.callback(|_| Msg::OpenSidebar)}>{"☰"}</button>
-                    <div><p class="eyebrow">{format!("{} · {}", self.selected_provider, project_name)}</p><h1>{"新对话"}</h1><small>{"首次发送时才会创建远程会话"}</small></div>
+                    <div class="chat-header-inner">
+                        <button class="mobile-menu" aria-label="打开侧边栏" onclick={link.callback(|_| Msg::OpenSidebar)}>{icon("panel")}</button>
+                        <div class="chat-title"><p class="eyebrow">{format!("{} · {}", self.selected_provider, project_name)}</p><h1>{"新对话"}</h1><small>{"首次发送时才会创建远程会话"}</small></div>
+                    </div>
                 </header>
-                <div class="timeline empty-draft"><p>{"写下第一条消息。当前项目的 Provider 默认设置会自动继承。"}</p></div>
+                <div class="timeline empty-draft"><div class="draft-intro">{icon("message")}<h2>{"开始一段对话"}</h2><p>{"描述任务，或添加需要参考的文件。"}</p>{capability.and_then(|capability| capability.limitation.as_ref()).map(|limitation| html! {<p class="provider-limitation">{limitation}</p>}).unwrap_or_default()}</div></div>
                 {self.view_composer(link, false, None)}
             </>
         }
@@ -2450,8 +3058,9 @@ impl App {
         let onclick = link.callback(move |_| Msg::SelectConversation(id));
         html! {
             <button key={id.to_string()} class={classes!("conversation-row", (Some(id) == self.selected_conversation).then_some("active"))} {onclick}>
-                <span class={classes!("provider-badge", provider_class(conversation.provider))}>{provider_short(conversation.provider)}</span>
+                <span class={classes!("provider-badge", provider_class(conversation.provider))}>{icon("message")}</span>
                 <span class="conversation-copy"><strong>{&conversation.title}</strong><small>{state_label(conversation.state)}</small></span>
+                <span class="conversation-trailing"><span class={classes!("state-pill", state_class(conversation.state))}>{state_label(conversation.state)}</span><time class="conversation-updated">{format_relative_activity(Some(conversation.updated_at_ms))}</time>{icon("chevron-right")}</span>
             </button>
         }
     }
@@ -2476,17 +3085,22 @@ impl App {
         html! {
             <>
                 <header class="chat-header">
-                    <button class="mobile-menu" onclick={link.callback(|_| Msg::OpenSidebar)}>{"☰"}</button>
-                    <div class="chat-title"><p class="eyebrow">{format!("{} · {}", conversation.provider, project_name)}</p>
-                        {if self.editing_title {html! {<div class="title-editor"><input value={self.title_draft.clone()} maxlength="80" oninput={link.callback(|event: InputEvent| Msg::TitleChanged(event.target_unchecked_into::<HtmlInputElement>().value()))}/><button onclick={link.callback(|_| Msg::SaveTitle)}>{"保存"}</button></div>}} else {html! {<button class="title-button" onclick={link.callback(|_| Msg::EditTitle)}><h1>{&conversation.title}</h1><span>{"✎"}</span></button>}}}
-                    </div>
-                    <div class="header-controls">
-                        <span class={classes!("state-pill", state_class(conversation.state))}>{state_label(conversation.state)}</span>
+                    <div class="chat-header-inner">
+                        <button class="mobile-menu" aria-label="打开侧边栏" onclick={link.callback(|_| Msg::OpenSidebar)}>{icon("panel")}</button>
+                        <div class="chat-title"><p class="eyebrow">{format!("{} · {}", conversation.provider, project_name)}</p>
+                            {if self.editing_title {html! {<div class="title-editor"><input value={self.title_draft.clone()} maxlength="80" oninput={link.callback(|event: InputEvent| Msg::TitleChanged(event.target_unchecked_into::<HtmlInputElement>().value()))}/><button onclick={link.callback(|_| Msg::SaveTitle)}>{"保存"}</button></div>}} else {html! {<button class="title-button" onclick={link.callback(|_| Msg::EditTitle)}><h1>{&conversation.title}</h1><span>{icon("edit")}</span></button>}}}
+                        </div>
+                        <div class="header-controls">
+                            <span class={classes!("state-pill", state_class(conversation.state))}>{state_label(conversation.state)}</span>
+                        </div>
                     </div>
                 </header>
-                <div class="timeline">
-                    {if self.history_exhausted.contains(&conversation.id) {html! {}} else {html! {<button class="load-older" onclick={link.callback(|_| Msg::LoadOlder)}>{"加载更早消息"}</button>}}}
+                <div class="timeline-area">
+                <div class="timeline" ref={self.timeline_ref.clone()} onscroll={link.callback(|_| Msg::TimelineScrolled)}>
+                    {if self.history_exhausted.contains(&conversation.id) {html! {}} else {html! {<button class="load-older" disabled={!self.authenticated || self.history_loading.contains(&conversation.id)} onclick={link.callback(|_| Msg::LoadOlder)}>{if self.history_loading.contains(&conversation.id) {"正在加载…"} else {"查看更早的消息"}}</button>}}}
                     {self.view_timeline(link, self.timeline_by_conversation.get(&conversation.id).map_or(&[][..], Vec::as_slice))}
+                </div>
+                {if !self.follow_timeline_tail {html! {<button class="jump-latest" onclick={link.callback(|_| Msg::JumpToLatest)}>{icon("arrow-down")}{"回到最新"}</button>}} else {html! {}}}
                 </div>
                 {self.view_composer(link, running, capability)}
             </>
@@ -2508,10 +3122,31 @@ impl App {
             .and_then(|conversation| conversation.selected_effort.as_deref())
             .or(self.selected_effort.as_deref());
         let models = capability.map_or(&[][..], |capability| capability.models.as_slice());
-        let efforts = models
-            .iter()
-            .find(|model| Some(model.id.as_str()) == selected_model)
-            .map_or(&[][..], |model| model.effort_options.as_slice());
+        let model_label = conversation
+            .and_then(|conversation| session_value_label(&conversation.session_options, "model"))
+            .or_else(|| {
+                models
+                    .iter()
+                    .find(|model| Some(model.id.as_str()) == selected_model)
+                    .map(|model| model.display_name.as_str())
+            })
+            .unwrap_or("会话设置");
+        let effort_label = conversation
+            .and_then(|conversation| {
+                session_value_label(&conversation.session_options, "thought_level")
+            })
+            .or_else(|| {
+                models
+                    .iter()
+                    .find(|model| Some(model.id.as_str()) == selected_model)
+                    .and_then(|model| {
+                        model
+                            .effort_options
+                            .iter()
+                            .find(|effort| Some(effort.id.as_str()) == selected_effort)
+                    })
+                    .map(|effort| effort.display_name.as_str())
+            });
         let permission_option = conversation.and_then(|conversation| {
             conversation
                 .session_options
@@ -2522,6 +3157,26 @@ impl App {
             .map(|option| option.current_value.as_str())
             .or(self.selected_permission.as_deref());
         let attachment_capability = capability.map(|capability| &capability.attachments);
+        let provider_ready = conversation.is_some()
+            || capability.is_some_and(|capability| capability.health.state == ProviderState::Ready);
+        let has_session_settings = conversation.map_or_else(
+            || {
+                capability.is_some_and(|capability| {
+                    !capability.models.is_empty() || !capability.permission_modes.is_empty()
+                })
+            },
+            |conversation| !conversation.session_options.is_empty(),
+        );
+        let can_send = self.connected
+            && self.authenticated
+            && provider_ready
+            && !running
+            && self.pending_send.is_none()
+            && !self.composer.trim().is_empty()
+            && self
+                .pending_attachments
+                .iter()
+                .all(|attachment| attachment.bytes.is_some() && attachment.error.is_none());
         let accepts = attachment_capability
             .map(|capability| capability.allowed_mime_types.join(","))
             .unwrap_or_default();
@@ -2552,6 +3207,7 @@ impl App {
         });
         html! {
             <footer class="composer" {ondrop} ondragover={yew::Callback::from(|event: DragEvent| event.prevent_default())} {onpaste}>
+                <div class="composer-inner">
                 {if let Some(pending) = &self.pending_send {
                     let retryable = pending_can_retry(pending);
                     let failed = matches!(pending.state, PendingSendState::WriteFailed | PendingSendState::Rejected);
@@ -2578,26 +3234,33 @@ impl App {
                     let attachment_status = if attachment.bytes.is_some() {"已就绪"} else if self.pending_send.is_some() {"已保留"} else {"读取中…"};
                     html! {<span key={id.to_string()} class={classes!(attachment.error.is_some().then_some("failed"))}><b>{&attachment.file_name}</b><small>{attachment.error.as_deref().unwrap_or(attachment_status)}</small><button disabled={self.pending_send.is_some()} onclick={link.callback(move |_| Msg::RemoveAttachment(id))}>{"×"}</button></span>}
                 })}</div>}}}
-                <textarea
-                    placeholder={if running {"输入追加指令（Provider 支持时可用）"} else {"发送消息…"}}
-                    value={self.composer.clone()}
-                    disabled={self.pending_send.is_some()}
-                    oninput={link.callback(|event: InputEvent| Msg::ComposerChanged(event.target_unchecked_into::<HtmlTextAreaElement>().value()))}
-                />
-                <div class="composer-bar">
-                    <div class="composer-left">
-                        <label class={classes!("attachment-action", (!attachment_enabled).then_some("disabled"))} title={attachment_capability.map_or("当前 Provider 不支持附件".to_owned(), |capability| format!("最多 {} 个，每个 {} MiB，总计 {} MiB", capability.max_count, capability.max_bytes / 1024 / 1024, capability.max_total_bytes / 1024 / 1024))}><span>{"＋"}</span><span class="action-label">{"附件"}</span><input type="file" multiple=true accept={accepts} disabled={!attachment_enabled} onchange={files_on_change}/></label>
-                        {if let Some(option) = permission_option {html! {<select class="permission-select" disabled={running} title="权限" onchange={{let id=option.id.clone(); link.callback(move |event: Event| Msg::SetSessionOption(id.clone(), event.target_unchecked_into::<HtmlSelectElement>().value()))}}>{for option.values.iter().map(|value| html! {<option value={value.value.clone()} selected={value.value == option.current_value}>{&value.display_name}</option>})}</select>}} else if let Some(capability) = capability {html! {<select class="permission-select" title="权限" disabled={capability.permission_modes.is_empty()} onchange={link.callback(|event: Event| Msg::SelectPermission(nonempty(event.target_unchecked_into::<HtmlSelectElement>().value())))}><option value="" selected={selected_permission.is_none()}>{"Provider 按次审批"}</option>{for capability.permission_modes.iter().map(|mode| html! {<option value={mode.id.clone()} selected={Some(mode.id.as_str()) == selected_permission}>{&mode.display_name}</option>})}</select>}} else {html! {}}}
-                    </div>
-                    <div class="composer-right">
-                        <div class="model-effort" title="模型 · effort">
-                            <select disabled={running || models.is_empty()} onchange={if conversation.is_some() {{link.callback(|event: Event| Msg::SetSessionOption("model".to_owned(), event.target_unchecked_into::<HtmlSelectElement>().value()))}} else {{link.callback(|event: Event| Msg::SelectModel(nonempty(event.target_unchecked_into::<HtmlSelectElement>().value())))}}}>{for models.iter().map(|model| html! {<option value={model.id.clone()} selected={Some(model.id.as_str()) == selected_model}>{&model.display_name}</option>})}</select>
-                            {if efforts.is_empty() {html! {}} else {html! {<><span>{"·"}</span><select disabled={running} onchange={if conversation.is_some() {{link.callback(|event: Event| Msg::SetSessionOption("reasoning_effort".to_owned(), event.target_unchecked_into::<HtmlSelectElement>().value()))}} else {{link.callback(|event: Event| Msg::SelectEffort(nonempty(event.target_unchecked_into::<HtmlSelectElement>().value())))}}}>{for efforts.iter().map(|effort| html! {<option value={effort.id.clone()} selected={Some(effort.id.as_str()) == selected_effort}>{&effort.display_name}</option>})}</select></>}}}
+                <div class="composer-surface">
+                    <textarea
+                        aria-label="消息"
+                        placeholder={if running {"补充下一步指令…"} else {"写下你的消息…"}}
+                        onkeydown={link.batch_callback(move |event: web_sys::KeyboardEvent| {
+                            if can_send && event.key() == "Enter" && (event.ctrl_key() || event.meta_key()) && !event.is_composing() {
+                                event.prevent_default(); Some(Msg::Send)
+                            } else { None }
+                        })}
+                        value={self.composer.clone()}
+                        disabled={self.pending_send.is_some()}
+                        oninput={link.callback(|event: InputEvent| Msg::ComposerChanged(event.target_unchecked_into::<HtmlTextAreaElement>().value()))}
+                    />
+                    <div class="composer-bar">
+                        <div class="composer-left">
+                            <label class={classes!("attachment-action", (!attachment_enabled).then_some("disabled"))} title={attachment_capability.map_or("当前 Provider 不支持附件".to_owned(), |capability| format!("最多 {} 个，每个 {} MiB，总计 {} MiB", capability.max_count, capability.max_bytes / 1024 / 1024, capability.max_total_bytes / 1024 / 1024))}>{icon("plus")}<span class="action-label">{"附件"}</span><input type="file" multiple=true accept={accepts} disabled={!attachment_enabled} onchange={files_on_change}/></label>
+                            {if let Some(option) = permission_option {html! {<select class="permission-select" disabled={running || !self.authenticated} aria-label="权限" title="权限" onchange={{let id=option.id.clone(); link.callback(move |event: Event| Msg::SetSessionOption(id.clone(), event.target_unchecked_into::<HtmlSelectElement>().value()))}}>{for option.values.iter().map(|value| html! {<option value={value.value.clone()} selected={value.value == option.current_value}>{&value.display_name}</option>})}</select>}} else if let Some(capability) = capability {html! {<select class="permission-select" aria-label="权限" title="权限" disabled={conversation.is_some() || capability.permission_modes.is_empty()} onchange={link.callback(|event: Event| Msg::SelectPermission(nonempty(event.target_unchecked_into::<HtmlSelectElement>().value())))}><option value="" selected={selected_permission.is_none()}>{"按次审批"}</option>{for capability.permission_modes.iter().map(|mode| html! {<option value={mode.id.clone()} selected={Some(mode.id.as_str()) == selected_permission}>{&mode.display_name}</option>})}</select>}} else {html! {}}}
                         </div>
-                        {if running {html! {<button class="stop" onclick={link.callback(|_| Msg::Interrupt)}>{"停止"}</button>}} else {html! {}}}
-                        {if running && capability.is_some_and(|capability| capability.supports_steer) {html! {<button class="secondary" onclick={link.callback(|_| Msg::Steer)} disabled={self.composer.trim().is_empty()}>{"追加"}</button>}} else {html! {}}}
-                        <button class="send-button" onclick={link.callback(|_| Msg::Send)} disabled={!self.connected || !self.authenticated || running || self.pending_send.is_some() || self.composer.trim().is_empty() || self.pending_attachments.iter().any(|attachment| attachment.bytes.is_none() || attachment.error.is_some())}>{if self.pending_send.is_some() {"…"} else {"↑"}}</button>
+                        <div class="composer-right">
+                            {if has_session_settings {html! {<button class="model-trigger session-settings-trigger" onclick={link.callback(|_| Msg::ToggleSessionSettings)} aria-label="模型与会话设置" aria-expanded={self.session_settings_open.to_string()} title="模型与会话设置"><span>{model_label}{effort_label.map(|effort| format!(" · {effort}")).unwrap_or_default()}</span>{icon("chevron-down")}</button>}} else {html! {}}}
+                            {if running {html! {<button class="stop" onclick={link.callback(|_| Msg::Interrupt)}>{"停止"}</button>}} else {html! {}}}
+                            {if running && capability.is_some_and(|capability| capability.supports_steer) {html! {<button class="secondary" onclick={link.callback(|_| Msg::Steer)} disabled={self.composer.trim().is_empty()}>{"追加"}</button>}} else {html! {}}}
+                            <button class="send-button" onclick={link.callback(|_| Msg::Send)} aria-label="发送消息" title="发送消息 · Ctrl / ⌘ + Enter" disabled={!can_send}>{if self.pending_send.is_some() {html! {"…"}} else {icon("arrow-up")}}</button>
+                        </div>
                     </div>
+                </div>
+                <p class="composer-hint">{if !self.authenticated {"离线 · 草稿保存在此设备，连接后可发送"} else {"Ctrl / ⌘ + Enter 发送"}}</p>
                 </div>
             </footer>
         }
@@ -2607,9 +3270,9 @@ impl App {
         let mut rendered = Vec::new();
         let mut index = 0;
         while index < items.len() {
-            if is_activity(&items[index].kind) {
+            if is_collapsible_activity(&items[index].kind) {
                 let start = index;
-                while index < items.len() && is_activity(&items[index].kind) {
+                while index < items.len() && is_collapsible_activity(&items[index].kind) {
                     index += 1;
                 }
                 rendered.push(self.view_activity_group(link, &items[start..index]));
@@ -2628,8 +3291,8 @@ impl App {
             .map(|item| item.id.to_string())
             .unwrap_or_default();
         html! {
-            <details key={key} class="activity-group">
-                <summary><span>{"⌁"}</span><strong>{summary}</strong><small>{format!("{} 项", items.len())}</small></summary>
+            <details key={key.clone()} data-timeline-id={key} class="activity-group">
+                <summary><span>{icon("chevron-right")}</span><strong>{summary}</strong><small>{format!("{} 项", items.len())}</small></summary>
                 <div class="activity-details">{for items.iter().map(|item| self.view_timeline_item(link, item))}</div>
             </details>
         }
@@ -2639,11 +3302,11 @@ impl App {
         match &item.kind {
             TimelineItemKind::UserMessage { text } => {
                 let copy_text = text.clone();
-                html! { <article key={item.id.to_string()} class="bubble user"><button class="message-copy" aria-label="复制用户消息原文" title="复制原文" onclick={link.callback(move |_| Msg::CopyText(copy_text.clone()))}>{"复制"}</button><div class="markdown-body">{self.cached_markdown(item, text)}</div></article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="bubble user"><div class="message-heading"><span>{"你"}</span><time class="message-time">{format_message_time(item.created_at_ms)}</time></div><button class="message-copy" aria-label="复制用户消息原文" title="复制原文" onclick={link.callback(move |_| Msg::CopyText(copy_text.clone()))}>{icon("copy")}</button><div class="markdown-body">{self.cached_markdown(item, text)}</div></article> }
             }
             TimelineItemKind::AgentMessage { phase, text } => {
                 let copy_text = text.clone();
-                html! { <article key={item.id.to_string()} class={classes!("bubble", "agent", format!("phase-{phase:?}").to_lowercase())}><button class="message-copy" aria-label="复制 Agent 消息原文" title="复制原文" onclick={link.callback(move |_| Msg::CopyText(copy_text.clone()))}>{"复制"}</button><span class="item-label">{format!("{phase:?}")}</span><div class="markdown-body">{self.cached_markdown(item, text)}</div></article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class={classes!("bubble", "agent", format!("phase-{phase:?}").to_lowercase())}><button class="message-copy" aria-label="复制 Agent 消息原文" title="复制原文" onclick={link.callback(move |_| Msg::CopyText(copy_text.clone()))}>{icon("copy")}</button><div class="message-heading"><span>{provider_label(self.selected_provider)}</span><span class="message-phase">{if *phase == agent_remote_protocol::AgentMessagePhase::Commentary {"进展"} else {""}}</span><time class="message-time">{format_message_time(item.created_at_ms)}</time></div><div class="markdown-body">{self.cached_markdown(item, text)}</div></article> }
             }
             TimelineItemKind::Progress {
                 kind,
@@ -2651,10 +3314,10 @@ impl App {
                 label,
                 detail,
             } => {
-                html! { <article key={item.id.to_string()} class="process-card"><div class="process-title"><span>{format!("{kind:?}")}</span><b>{label}</b><em>{format!("{status:?}")}</em></div>{detail.as_ref().map(|value| html! {<pre>{value}</pre>}).unwrap_or_default()}</article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="process-card"><div class="process-title"><span>{format!("{kind:?}")}</span><b>{label}</b><em>{format!("{status:?}")}</em></div>{detail.as_ref().map(|value| html! {<pre>{value}</pre>}).unwrap_or_default()}</article> }
             }
             TimelineItemKind::Plan { steps } => {
-                html! { <article key={item.id.to_string()} class="process-card plan"><strong>{"计划"}</strong><ol>{for steps.iter().map(|step| html! {<li class={state_class_for_item(step.status)}>{&step.text}</li>})}</ol></article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="process-card plan"><strong>{"计划"}</strong><ol>{for steps.iter().map(|step| html! {<li class={state_class_for_item(step.status)}>{&step.text}</li>})}</ol></article> }
             }
             TimelineItemKind::ToolCall {
                 name,
@@ -2662,7 +3325,7 @@ impl App {
                 input_summary,
                 output_summary,
             } => {
-                html! { <article key={item.id.to_string()} class="process-card"><div class="process-title"><span>{"工具"}</span><b>{name}</b><em>{format!("{status:?}")}</em></div>{summary_pair(input_summary, output_summary)}</article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="process-card"><div class="process-title"><span>{"工具"}</span><b>{name}</b><em>{format!("{status:?}")}</em></div>{summary_pair(input_summary, output_summary)}</article> }
             }
             TimelineItemKind::Command {
                 command,
@@ -2671,14 +3334,18 @@ impl App {
                 exit_code,
                 output,
             } => {
-                html! { <article key={item.id.to_string()} class="process-card command"><div class="process-title"><span>{"命令"}</span><b>{relative_cwd.as_deref().unwrap_or("项目根目录")}</b><em>{format!("{status:?}{}", exit_code.map(|code| format!(" · {code}")).unwrap_or_default())}</em></div><code>{command}</code>{output.as_ref().map(|value| html! {<pre>{value}</pre>}).unwrap_or_default()}</article> }
+                let copy_text = output.as_ref().map_or_else(
+                    || command.clone(),
+                    |output| format!("{command}\n\n{output}"),
+                );
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="process-card command"><div class="process-title"><span>{"命令"}</span><b>{relative_cwd.as_deref().unwrap_or("项目根目录")}</b><em>{format!("{status:?}{}", exit_code.map(|code| format!(" · {code}")).unwrap_or_default())}</em><button class="command-copy" aria-label="复制命令和输出" onclick={link.callback(move |_| Msg::CopyText(copy_text.clone()))}>{"复制"}</button></div><code>{command}</code>{output.as_ref().map(|value| html! {<pre>{value}</pre>}).unwrap_or_default()}</article> }
             }
             TimelineItemKind::FileChange {
                 relative_path,
                 change_kind,
                 status,
             } => {
-                html! { <article key={item.id.to_string()} class="process-card"><div class="process-title"><span>{"文件"}</span><b>{relative_path}</b><em>{format!("{} · {status:?}", change_kind)}</em></div></article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="process-card"><div class="process-title"><span>{"文件"}</span><b>{relative_path}</b><em>{format!("{} · {status:?}", change_kind)}</em></div></article> }
             }
             TimelineItemKind::Approval {
                 approval_id,
@@ -2687,16 +3354,98 @@ impl App {
                 resolved_option,
             } => {
                 let id = *approval_id;
-                html! { <article key={item.id.to_string()} class="approval-card"><span class="item-label">{"需要权限"}</span><p>{prompt}</p><div class="approval-actions">{if let Some(resolved) = resolved_option { html! {<b>{format!("已选择：{resolved}")}</b>} } else { html! {{for options.iter().map(|option| { let value=option.id.clone(); html! {<button onclick={link.callback(move |_| Msg::ResolveApproval(id, value.clone()))}>{&option.label}</button>} })}} }}</div></article> }
+                let pending = self.pending_approvals.contains(&id);
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class={classes!("approval-card", pending.then_some("pending"))} aria-busy={pending.to_string()}><span class="item-label">{"需要权限"}</span><p>{prompt}</p><div class={classes!("approval-actions", pending.then_some("pending"))}>{if let Some(resolved) = resolved_option { html! {<b>{format!("已选择：{}", options.iter().find(|option| &option.id == resolved).map_or(resolved.as_str(), |option| option.label.as_str()))}</b>} } else { html! {{for options.iter().map(|option| { let value=option.id.clone(); html! {<button disabled={pending || !self.authenticated} onclick={link.callback(move |_| Msg::ResolveApproval(id, value.clone()))}>{if pending {"正在提交…"} else {option.label.as_str()}}</button>} })}} }}</div></article> }
             }
             TimelineItemKind::Image { attachment_id, alt } => {
                 let id = *attachment_id;
                 let onclick = link.callback(move |_| Msg::OpenImage(id));
-                html! { <article key={item.id.to_string()} class="image-card" {onclick}>{self.attachments.get(attachment_id).map(|url| html! {<img src={url.clone()} alt={alt.clone()} />}).unwrap_or_else(|| html! {<div class="image-loading">{"正在读取图片…"}</div>})}<span>{alt}</span></article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="image-card" {onclick}>{self.attachments.get(attachment_id).map(|url| html! {<img src={url.clone()} alt={alt.clone()} />}).unwrap_or_else(|| html! {<div class="image-loading">{"正在读取图片…"}</div>})}<span>{alt}</span></article> }
             }
             TimelineItemKind::Error { code, message } => {
-                html! { <article key={item.id.to_string()} class="error-card"><b>{code}</b><p>{message}</p></article> }
+                html! { <article key={item.id.to_string()} data-timeline-id={item.id.to_string()} class="error-card"><b>{code}</b><p>{message}</p></article> }
             }
+        }
+    }
+
+    fn view_session_settings(&self, link: &yew::html::Scope<Self>) -> Html {
+        if !self.session_settings_open {
+            return html! {};
+        }
+        let conversation = self.selected_conversation_ref();
+        let existing_conversation = conversation.is_some();
+        let selected_model = conversation
+            .and_then(|conversation| conversation.selected_model.as_deref())
+            .or(self.selected_model.as_deref());
+        let selected_effort = conversation
+            .and_then(|conversation| conversation.selected_effort.as_deref())
+            .or(self.selected_effort.as_deref());
+        let selected_permission = conversation
+            .and_then(|conversation| {
+                conversation
+                    .session_options
+                    .iter()
+                    .find(|option| option.id == "permission_mode")
+            })
+            .map(|option| option.current_value.as_str())
+            .or(self.selected_permission.as_deref());
+        let options = conversation
+            .map(|conversation| conversation.session_options.clone())
+            .unwrap_or_else(|| {
+                new_conversation_session_options(
+                    self.selected_capability(),
+                    selected_model,
+                    selected_effort,
+                    selected_permission,
+                )
+            });
+        if options.is_empty() {
+            return html! {};
+        }
+        let running = conversation.is_some_and(|conversation| {
+            matches!(
+                conversation.state,
+                ConversationState::Running | ConversationState::NeedsApproval
+            )
+        });
+        html! {
+            <div class="session-settings-modal" role="presentation" onclick={link.callback(|_| Msg::CloseSessionSettings)}>
+                <section class="session-settings-panel" role="dialog" aria-modal="true" aria-label="会话设置" onclick={yew::Callback::from(|event: MouseEvent| event.stop_propagation())}>
+                    <header><h2>{if existing_conversation {"当前对话设置"} else {"新对话设置"}}</h2><button aria-label="关闭会话设置" onclick={link.callback(|_| Msg::CloseSessionSettings)}>{icon("close")}</button></header>
+                    <div class="session-settings-list">
+                        {for options.iter().map(|option| {
+                            let option_id = option.id.clone();
+                            let onchange = if existing_conversation {
+                                link.callback(move |event: Event| Msg::SetSessionOption(option_id.clone(), event.target_unchecked_into::<HtmlSelectElement>().value()))
+                            } else {
+                                link.callback(move |event: Event| {
+                                    let value = nonempty(event.target_unchecked_into::<HtmlSelectElement>().value());
+                                    match option_id.as_str() {
+                                        "model" => Msg::SelectModel(value),
+                                        "reasoning_effort" | "thought_level" => Msg::SelectEffort(value),
+                                        "permission_mode" => Msg::SelectPermission(value),
+                                        _ => Msg::CloseSessionSettings,
+                                    }
+                                })
+                            };
+                            let description = if option.id == "permission_mode" {
+                                self.selected_capability().and_then(|capability| {
+                                    capability.permission_modes.iter().find(|mode| mode.id == option.current_value)
+                                }).map(|mode| mode.description.as_str())
+                            } else {
+                                None
+                            };
+                            html! {
+                                <label class="session-settings-row">
+                                    <span><strong>{&option.display_name}</strong>{description.map(|description| html! {<small>{description}</small>}).unwrap_or_default()}</span>
+                                    <select disabled={running || (existing_conversation && !self.authenticated)} {onchange}>{for option.values.iter().map(|value| html! {<option value={value.value.clone()} selected={value.value == option.current_value}>{&value.display_name}</option>})}</select>
+                                </label>
+                            }
+                        })}
+                        {if running {html! {<p class="provider-limitation">{"Agent 运行时不能修改这些设置。"}</p>}} else {html! {}}}
+                    </div>
+                </section>
+            </div>
         }
     }
 
@@ -2713,6 +3462,52 @@ impl App {
             .filter(|(revision, _)| *revision == item.revision)
             .map_or_else(|| markdown_html(fallback), |(_, rendered)| rendered.clone())
     }
+}
+
+fn session_value_label<'a>(options: &'a [SessionOption], category: &str) -> Option<&'a str> {
+    let option = options.iter().find(|option| {
+        option.category.as_deref() == Some(category)
+            || option.id == category
+            || (category == "thought_level" && option.id == "reasoning_effort")
+    })?;
+    option
+        .values
+        .iter()
+        .find(|value| value.value == option.current_value)
+        .map(|value| value.display_name.as_str())
+}
+
+fn format_message_time(timestamp_ms: i64) -> String {
+    let date = js_sys::Date::new(&JsValue::from_f64(timestamp_ms as f64));
+    format!("{:02}:{:02}", date.get_hours(), date.get_minutes())
+}
+
+fn icon(name: &str) -> Html {
+    let path = match name {
+        "connection" => "M8 7h8M8 17h8M5 4v6m0 4v6m14-16v6m0 4v6M2 7h6m8 0h6M2 17h6m8 0h6",
+        "panel" => "M9 3v18M4 3h16a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z",
+        "folder" => {
+            "M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7Z"
+        }
+        "plus" => "M12 5v14M5 12h14",
+        "search" => "m21 21-5-5M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0",
+        "message" => {
+            "M21 11.5a8.5 8.5 0 0 1-8.5 8.5H4l-2 2V11.5A8.5 8.5 0 0 1 10.5 3h2A8.5 8.5 0 0 1 21 11.5Z"
+        }
+        "arrow-up" => "M12 19V5m-6 6 6-6 6 6",
+        "arrow-down" => "M12 5v14m-6-6 6 6 6-6",
+        "arrow-right" => "M5 12h14m-6-6 6 6-6 6",
+        "chevron-down" => "m6 9 6 6 6-6",
+        "chevron-right" => "m9 6 6 6-6 6",
+        "copy" => "M8 8h12v12H8zM16 8V4H4v12h4",
+        "edit" => "m16 3 5 5-12 12H4v-5L16 3Zm-3 3 5 5",
+        "disconnect" => "M12 2v10M6 5a9 9 0 1 0 12 0",
+        "lock" => "M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5zM12 14v3",
+        "check" => "m5 12 4 4L19 6",
+        "close" => "m6 6 12 12M6 18 18 6",
+        _ => unreachable!("unknown UI icon"),
+    };
+    html! {<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={path}/></svg>}
 }
 
 fn open_socket(
@@ -3146,32 +3941,96 @@ fn upsert_capability(items: &mut Vec<ProviderCapability>, incoming: ProviderCapa
 fn nonempty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
-fn provider_short(provider: ProviderId) -> &'static str {
-    match provider {
-        ProviderId::Codex => "Cd",
-        ProviderId::Grok => "Gr",
-        ProviderId::ClaudeCode => "Cl",
-        ProviderId::GeminiCli => "Ge",
-        ProviderId::CopilotCli => "CP",
-        ProviderId::OpenCode => "OC",
-        ProviderId::Cursor => "Cu",
-        ProviderId::Cline => "Cn",
-        ProviderId::Goose => "Go",
-        ProviderId::Junie => "Jn",
-        ProviderId::QwenCode => "Qw",
-        ProviderId::KimiCli => "Km",
-        ProviderId::KiroCli => "Kr",
-        ProviderId::MistralVibe => "MV",
-        ProviderId::QoderCli => "Qd",
-        ProviderId::Auggie => "Au",
-        ProviderId::FactoryDroid => "FD",
-        ProviderId::Devin => "Dv",
-        ProviderId::CodeBuddy => "CB",
-        ProviderId::GlmAgent => "GL",
-        ProviderId::KiloCode => "Ki",
-        ProviderId::Amp => "Am",
+
+fn new_conversation_session_options(
+    capability: Option<&ProviderCapability>,
+    selected_model: Option<&str>,
+    selected_effort: Option<&str>,
+    selected_permission: Option<&str>,
+) -> Vec<SessionOption> {
+    let Some(capability) = capability else {
+        return Vec::new();
+    };
+    let model = capability
+        .models
+        .iter()
+        .find(|model| Some(model.id.as_str()) == selected_model)
+        .or_else(|| capability.models.first());
+    let mut options = Vec::new();
+    if !capability.models.is_empty() {
+        options.push(SessionOption {
+            id: "model".to_owned(),
+            display_name: "模型".to_owned(),
+            category: None,
+            current_value: selected_model
+                .or_else(|| model.map(|model| model.id.as_str()))
+                .unwrap_or_default()
+                .to_owned(),
+            values: capability
+                .models
+                .iter()
+                .map(|model| agent_remote_protocol::SessionOptionValue {
+                    value: model.id.clone(),
+                    display_name: model.display_name.clone(),
+                })
+                .collect(),
+        });
     }
+    if let Some(model) = model
+        && !model.effort_options.is_empty()
+    {
+        options.push(SessionOption {
+            id: "reasoning_effort".to_owned(),
+            display_name: "推理强度".to_owned(),
+            category: None,
+            current_value: selected_effort
+                .or(model.default_effort.as_deref())
+                .or_else(|| {
+                    model
+                        .effort_options
+                        .first()
+                        .map(|effort| effort.id.as_str())
+                })
+                .unwrap_or_default()
+                .to_owned(),
+            values: model
+                .effort_options
+                .iter()
+                .map(|effort| agent_remote_protocol::SessionOptionValue {
+                    value: effort.id.clone(),
+                    display_name: effort.display_name.clone(),
+                })
+                .collect(),
+        });
+    }
+    if !capability.permission_modes.is_empty() {
+        options.push(SessionOption {
+            id: "permission_mode".to_owned(),
+            display_name: "权限".to_owned(),
+            category: None,
+            current_value: selected_permission
+                .or(capability.default_permission_mode.as_deref())
+                .or_else(|| {
+                    capability
+                        .permission_modes
+                        .first()
+                        .map(|mode| mode.id.as_str())
+                })
+                .unwrap_or_default()
+                .to_owned(),
+            values: capability
+                .permission_modes
+                .iter()
+                .map(|mode| agent_remote_protocol::SessionOptionValue {
+                    value: mode.id.clone(),
+                    display_name: mode.display_name.clone(),
+                })
+                .collect(),
+        });
+    }
+    options
 }
+
 fn provider_class(provider: ProviderId) -> &'static str {
     match provider {
         ProviderId::Codex => "codex",
@@ -3227,18 +4086,6 @@ fn state_class_for_item(status: agent_remote_protocol::ItemStatus) -> &'static s
         agent_remote_protocol::ItemStatus::Failed => "failed",
         _ => "pending",
     }
-}
-
-fn is_activity(kind: &TimelineItemKind) -> bool {
-    matches!(
-        kind,
-        TimelineItemKind::Progress { .. }
-            | TimelineItemKind::ToolCall { .. }
-            | TimelineItemKind::Command { .. }
-            | TimelineItemKind::FileChange { .. }
-            | TimelineItemKind::Approval { .. }
-            | TimelineItemKind::Error { .. }
-    )
 }
 
 fn activity_summary(items: &[TimelineItem]) -> String {
