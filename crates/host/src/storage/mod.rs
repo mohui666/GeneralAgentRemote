@@ -138,6 +138,7 @@ impl Storage {
         migrate_3(&connection)?;
         migrate_4(&connection)?;
         migrate_5(&connection)?;
+        migrate_6(&connection)?;
         let storage = Self {
             connection: Mutex::new(connection),
         };
@@ -547,12 +548,65 @@ impl Storage {
     }
 
     pub fn list_conversations(&self) -> Result<Vec<Conversation>> {
+        self.query_conversations(false)
+    }
+
+    pub fn list_visible_conversations(&self) -> Result<Vec<Conversation>> {
+        self.query_conversations(true)
+    }
+
+    /// Reconcile a complete, successful provider listing without deleting history.
+    pub fn reconcile_session_visibility(
+        &self,
+        project_id: ProjectId,
+        provider: ProviderId,
+        sessions: &[agent_remote_protocol::SessionSummary],
+    ) -> Result<bool> {
+        let active: std::collections::HashSet<_> = sessions
+            .iter()
+            .map(|session| session.native_session_id.as_str())
+            .collect();
+        let mut connection = self.connection.lock().expect("storage mutex poisoned");
+        let transaction = connection.transaction()?;
+        let rows = {
+            let mut statement = transaction.prepare(
+                "SELECT id, native_session_id, listed FROM conversations WHERE project_id = ?1 AND provider = ?2",
+            )?;
+            statement
+                .query_map(
+                    params![project_id.to_string(), provider_name(provider)],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, bool>(2)?,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut changed = false;
+        for (id, native_id, listed) in rows {
+            let visible = active.contains(native_id.as_str());
+            if visible != listed {
+                transaction.execute(
+                    "UPDATE conversations SET listed = ?1 WHERE id = ?2",
+                    params![visible, id],
+                )?;
+                changed = true;
+            }
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    fn query_conversations(&self, visible_only: bool) -> Result<Vec<Conversation>> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT id, revision, provider, project_id, native_session_id, title, title_source, title_updated_at_ms, selected_model, selected_effort, state, session_options, updated_at_ms
-             FROM conversations ORDER BY updated_at_ms DESC",
+             FROM conversations WHERE (?1 = 0 OR listed = 1) ORDER BY updated_at_ms DESC",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map([visible_only], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)? as u64,
@@ -1214,6 +1268,21 @@ fn migrate_5(connection: &Connection) -> Result<()> {
     }
     connection.execute(
         "INSERT INTO host_meta(key, value) VALUES('schema_version', '5')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [],
+    )?;
+    Ok(())
+}
+
+fn migrate_6(connection: &Connection) -> Result<()> {
+    if !column_exists(connection, "conversations", "listed")? {
+        connection.execute(
+            "ALTER TABLE conversations ADD COLUMN listed INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    connection.execute(
+        "INSERT INTO host_meta(key, value) VALUES('schema_version', '6')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;

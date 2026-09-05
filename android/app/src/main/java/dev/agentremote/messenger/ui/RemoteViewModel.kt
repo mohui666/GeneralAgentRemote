@@ -76,6 +76,8 @@ data class RemoteUiState(
     val projectSearch: String = "",
     val historyBefore: Map<UUID, TimelinePageCursor> = emptyMap(),
     val historyExhausted: Set<UUID> = emptySet(),
+    val historyLoading: Set<UUID> = emptySet(),
+    val historyErrors: Map<UUID, String> = emptyMap(),
     val pendingCommands: Set<UUID> = emptySet(),
     val pendingApprovals: Set<UUID> = emptySet(),
     val creatingConversation: Boolean = false,
@@ -282,6 +284,36 @@ internal fun mergeTimelinePage(
     if (!changed) return current
     merged.sortWith(timelineComparator)
     return merged
+}
+
+internal fun mergeSnapshotTimeline(cached: Snapshot?, incoming: Snapshot): List<TimelineItem> {
+    if (cached == null || cached.hostId != incoming.hostId) return incoming.timeline.sortedWith(timelineComparator)
+    val scopes = incoming.conversations.associateBy(Conversation::id)
+    val retainedIds = cached.conversations.filter { previous ->
+        scopes[previous.id]?.let {
+            it.projectId == previous.projectId && it.provider == previous.provider
+        } == true
+    }.map(Conversation::id).toSet()
+    return mergeTimelinePage(cached.timeline.filter { it.conversationId in retainedIds }, incoming.timeline)
+}
+
+internal fun RemoteUiState.withConversationPage(event: ServerEvent.ConversationPage): RemoteUiState {
+    val snapshot = snapshot ?: return this
+    val items = event.items.filter { it.conversationId == event.conversationId }
+    return copy(
+        snapshot = snapshot.copy(timeline = mergeTimelinePage(snapshot.timeline, items)),
+        timelineByConversation = timelineByConversation + (event.conversationId to
+            mergeTimelinePage(timelineByConversation[event.conversationId].orEmpty(), items)),
+        historyLoading = historyLoading - event.conversationId,
+        historyErrors = if (event.error == null) historyErrors - event.conversationId
+            else historyErrors + (event.conversationId to event.error),
+        historyBefore = if (event.error != null) historyBefore
+            else if (event.nextBefore == null) historyBefore - event.conversationId
+            else historyBefore + (event.conversationId to event.nextBefore),
+        historyExhausted = if (event.error != null) historyExhausted - event.conversationId
+            else if (event.nextBefore == null) historyExhausted + event.conversationId
+            else historyExhausted - event.conversationId,
+    )
 }
 
 internal fun indexTimelineByConversation(
@@ -963,7 +995,8 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
     fun loadOlder() {
         val current = state.value
         val conversationId = current.selectedConversationId ?: return
-        if (conversationId in current.historyExhausted) return
+        if (!current.online || conversationId in current.historyExhausted || conversationId in current.historyLoading) return
+        mutableState.update { it.copy(historyLoading = it.historyLoading + conversationId, historyErrors = it.historyErrors - conversationId) }
         val before = current.historyBefore[conversationId]
             ?: current.snapshot?.timeline
                 ?.filter { it.conversationId == conversationId }
@@ -976,6 +1009,8 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                 100,
             ),
         )) {
+            mutableState.update { it.copy(historyLoading = it.historyLoading - conversationId,
+                historyErrors = it.historyErrors + (conversationId to "历史记录请求未能写入 WebSocket")) }
             showError("历史记录请求未能写入 WebSocket")
         }
     }
@@ -987,6 +1022,8 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
         mutableState.update {
             it.copy(
                 phase = "正在连接 ${target.origin}",
+                historyLoading = emptySet(),
+                historyErrors = emptyMap(),
                 online = false,
                 connecting = true,
                 error = null,
@@ -1019,12 +1056,9 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
             is ServerEvent.Authenticated -> mutableState.update { it.copy(phase = "认证成功，正在同步") }
             is ServerEvent.SnapshotReceived -> {
                 awaitingAuthoritativeSnapshot = false
-                snapshotPersistJob?.cancel()
-                snapshotPersistJob = viewModelScope.launch(Dispatchers.IO) {
-                    clientStateStore.saveSnapshot(event.snapshot.hostId, event.encoded)
-                }
                 if (client.isConnected(connectionGeneration)) {
                     applySnapshot(event.snapshot)
+                    scheduleSnapshotPersist()
                     reconcilePendingSend(event.snapshot.conversations.findPendingConversation())
                     state.value.selectedProvider?.let(::refreshProjects)
                     replayPendingSend()
@@ -1047,30 +1081,10 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                 }
             }
             is ServerEvent.ConversationPage -> {
-                mutableState.update { current ->
-                    val snapshot = current.snapshot ?: return@update current
-                    val pageItems = event.items.filter { it.conversationId == event.conversationId }
-                    val timeline = mergeTimelinePage(snapshot.timeline, pageItems)
-                    val conversationTimeline = mergeTimelinePage(
-                        current.timelineByConversation[event.conversationId].orEmpty(),
-                        pageItems,
-                    )
-                    if (event.nextBefore == null) {
-                        current.copy(
-                            snapshot = snapshot.copy(timeline = timeline),
-                            timelineByConversation = current.timelineByConversation +
-                                (event.conversationId to conversationTimeline),
-                            historyExhausted = current.historyExhausted + event.conversationId,
-                        )
-                    } else {
-                        current.copy(
-                            snapshot = snapshot.copy(timeline = timeline),
-                            timelineByConversation = current.timelineByConversation +
-                                (event.conversationId to conversationTimeline),
-                            historyBefore = current.historyBefore + (event.conversationId to event.nextBefore),
-                        )
-                    }
+                if (event.error != null) {
+                    requestedConversationPages.removeAll { it.conversationId == event.conversationId }
                 }
+                mutableState.update { it.withConversationPage(event) }
                 scheduleSnapshotPersist()
             }
             is ServerEvent.ProviderChanged -> {
@@ -1184,10 +1198,11 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
                     )
                 }
             }
-            is ServerEvent.HostStatus -> if (client.isConnected(connectionGeneration)) {
+            is ServerEvent.HostStatus -> if (!event.online || client.isConnected(connectionGeneration)) {
                 mutableState.update {
                     it.copy(
                         online = event.online,
+                        connecting = false,
                         phase = if (event.online) "Host 在线" else "Host 离线",
                         error = event.message?.takeIf { message -> !event.online && message.isNotBlank() },
                     )
@@ -1278,7 +1293,8 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
         val pending = pendingSend
         mutableState.update {
             it.copy(
-                phase = "连接已断开，等待重连",
+                phase = "连接已断开",
+                historyLoading = emptySet(),
                 online = false,
                 connecting = false,
                 pendingCommands = pending
@@ -1343,7 +1359,7 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
         if (active != null && active.displayName != snapshot.hostName) {
             upsertCredential(active.copy(displayName = snapshot.hostName))
         }
-        val sortedTimeline = snapshot.timeline.sortedWith(timelineComparator)
+        val sortedTimeline = mergeSnapshotTimeline(state.value.snapshot, snapshot)
         updateDraftScope { current ->
             defaults(
                 current.copy(
@@ -1638,10 +1654,21 @@ class RemoteViewModel(application: Application) : AndroidViewModel(application),
             conversationId = conversation.id,
         )
         if (!requestedConversationPages.add(scope)) return
+        mutableState.update { it.copy(historyLoading = it.historyLoading + conversation.id,
+            historyErrors = it.historyErrors - conversation.id) }
         if (!client.send(WireProtocol.getConversationPage(conversation.id, before = null, limit = 100))) {
             requestedConversationPages.remove(scope)
+            mutableState.update { it.copy(historyLoading = it.historyLoading - conversation.id,
+                historyErrors = it.historyErrors + (conversation.id to "对话历史请求未能写入 WebSocket")) }
             showError("对话历史请求未能写入 WebSocket")
         }
+    }
+
+    fun retryConversationHistory() {
+        val conversation = state.value.snapshot?.conversations?.find { it.id == state.value.selectedConversationId } ?: return
+        if (conversation.id in state.value.historyLoading) return
+        requestedConversationPages.removeAll { it.conversationId == conversation.id }
+        requestInitialConversationPage(conversation)
     }
 
     private fun attachmentName(uri: Uri): String {

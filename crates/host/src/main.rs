@@ -177,6 +177,9 @@ struct ServeArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing()?;
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow!("a rustls crypto provider was already installed"))?;
     let cli = Cli::parse();
     let data_root = cli.data_dir.map_or_else(default_data_root, Ok)?;
     match cli.command {

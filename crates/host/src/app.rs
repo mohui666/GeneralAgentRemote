@@ -284,6 +284,10 @@ impl AppService {
     }
 
     pub async fn snapshot(&self) -> Result<Snapshot> {
+        self.snapshot_with_timeline(true).await
+    }
+
+    async fn snapshot_with_timeline(&self, include_timeline: bool) -> Result<Snapshot> {
         let projects = self.storage.list_projects()?;
         let mut provider_capabilities = Vec::new();
         for project in &projects {
@@ -291,10 +295,10 @@ impl AppService {
                 provider_capabilities.push(self.cached_or_base_capability(project, *provider_id));
             }
         }
-        let conversations = self.storage.list_conversations()?;
+        let conversations = self.storage.list_visible_conversations()?;
         let cache = self.timeline_cache.lock().expect("timeline mutex poisoned");
         let mut grouped_timeline = HashMap::<ConversationId, Vec<&TimelineItem>>::new();
-        for item in cache.values() {
+        for item in cache.values().filter(|_| include_timeline) {
             grouped_timeline
                 .entry(item.conversation_id)
                 .or_default()
@@ -562,7 +566,7 @@ impl AppService {
             }
             ClientCommand::Pair { .. }
             | ClientCommand::Authenticate { .. }
-            | ClientCommand::GetSnapshot
+            | ClientCommand::GetSnapshot { .. }
             | ClientCommand::RefreshProjects { .. }
             | ClientCommand::GetConversationPage { .. }
             | ClientCommand::GetAttachment { .. } => return None,
@@ -577,8 +581,8 @@ impl AppService {
     ) -> Result<ServerMessage> {
         let command_id = command.command_id();
         match command {
-            ClientCommand::GetSnapshot => Ok(ServerMessage::Snapshot {
-                snapshot: self.snapshot().await?,
+            ClientCommand::GetSnapshot { metadata_only } => Ok(ServerMessage::Snapshot {
+                snapshot: self.snapshot_with_timeline(!metadata_only).await?,
             }),
             ClientCommand::RefreshProjects { provider } => self.projects_updated(provider).await,
             ClientCommand::SyncProject {
@@ -828,6 +832,7 @@ impl AppService {
                 }
             };
         let mut capabilities = Vec::with_capacity(projects.len());
+        let mut visibility_changed = false;
         for project in &projects {
             let sessions = scoped_sessions
                 .get(&project.id)
@@ -841,6 +846,18 @@ impl AppService {
                 let ticket = self.project_mutation_ticket(project.id);
                 let _guard = ticket.lock.lock().await;
                 self.upsert_session_metadata(project.id, provider_id, sessions)?;
+                if self
+                    .providers
+                    .get(provider_id)?
+                    .capabilities()
+                    .supports_session_list
+                {
+                    visibility_changed |= self.storage.reconcile_session_visibility(
+                        project.id,
+                        provider_id,
+                        sessions,
+                    )?;
+                }
             }
             let capability = self
                 .provider_capability(
@@ -857,7 +874,12 @@ impl AppService {
                 .insert((project.id, provider_id), capability.clone());
             capabilities.push(capability);
         }
-        let conversations = self.storage.list_conversations()?;
+        if visibility_changed {
+            self.emit(ServerMessage::Snapshot {
+                snapshot: self.snapshot().await?,
+            });
+        }
+        let conversations = self.storage.list_visible_conversations()?;
         Ok(ServerMessage::ProjectsUpdated {
             provider: provider_id,
             projects: project_summaries(&projects, &conversations),
@@ -1008,6 +1030,7 @@ impl AppService {
                 conversation_id,
                 items: cached_items,
                 next_before: cached_next_before,
+                error: Some(redact_remote_error(&format!("{error:#}"), Some(&project))),
             });
         }
         let (items, next_before) =
@@ -1017,6 +1040,7 @@ impl AppService {
             conversation_id,
             items,
             next_before,
+            error: None,
         })
     }
 
@@ -1034,6 +1058,14 @@ impl AppService {
         }
         let sessions = provider.list_sessions(&project).await?;
         self.upsert_session_metadata(project_id, provider_id, &sessions)?;
+        if self
+            .storage
+            .reconcile_session_visibility(project_id, provider_id, &sessions)?
+        {
+            self.emit(ServerMessage::Snapshot {
+                snapshot: self.snapshot().await?,
+            });
+        }
         Ok(ServerMessage::ProjectSyncCompleted {
             command_id,
             project_id,
@@ -2655,7 +2687,7 @@ fn ordered_conversation_mutation(command: &ClientCommand) -> Option<Conversation
         } => Some(*conversation_id),
         ClientCommand::Pair { .. }
         | ClientCommand::Authenticate { .. }
-        | ClientCommand::GetSnapshot
+        | ClientCommand::GetSnapshot { .. }
         | ClientCommand::RefreshProjects { .. }
         | ClientCommand::SyncProject { .. }
         | ClientCommand::CreateConversation { .. }
@@ -3107,6 +3139,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_snapshot_omits_messages_without_removing_history() {
+        let fixture = fixture();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        fixture
+            .service
+            .upsert_history_item(
+                conversation.id,
+                ProviderHistoryItem {
+                    provider_item_id: "history:user".to_owned(),
+                    created_at_ms: 1,
+                    kind: TimelineItemKind::UserMessage {
+                        text: "cached history".to_owned(),
+                    },
+                },
+            )
+            .expect("history item");
+        let index = fixture
+            .service
+            .snapshot_with_timeline(false)
+            .await
+            .expect("index");
+        assert!(index.timeline.is_empty());
+        assert_eq!(index.conversations.len(), 1);
+        assert_eq!(
+            fixture
+                .service
+                .snapshot()
+                .await
+                .expect("full snapshot")
+                .timeline
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn snapshot_returns_cached_authorized_state_without_waiting_for_provider_io() {
         let fixture = fixture();
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -3200,8 +3268,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archived_sessions_disappear_and_restore_without_losing_history() {
+        let fixture = fixture();
+        let conversation = create(&fixture.service, fixture.project_a.id).await;
+        let other = create(&fixture.service, fixture.project_b.id).await;
+        fixture
+            .service
+            .upsert_history_item(
+                conversation.id,
+                ProviderHistoryItem {
+                    provider_item_id: "archive-history".to_owned(),
+                    created_at_ms: 1,
+                    kind: TimelineItemKind::UserMessage {
+                        text: "keep history".to_owned(),
+                    },
+                },
+            )
+            .expect("history");
+        let mut events = fixture.service.subscribe();
+        fixture
+            .service
+            .sync_project(CommandId::new(), fixture.project_a.id, ProviderId::Codex)
+            .await
+            .expect("sync archived session");
+        let snapshot = fixture.service.snapshot().await.expect("snapshot");
+        assert_eq!(snapshot.conversations, vec![other]);
+        assert_eq!(
+            snapshot
+                .projects
+                .iter()
+                .find(|p| p.id == fixture.project_a.id)
+                .unwrap()
+                .conversation_count,
+            0
+        );
+        assert!(matches!(
+            events.try_recv().expect("list update"),
+            ServerMessage::Snapshot { .. }
+        ));
+        assert_eq!(
+            fixture
+                .service
+                .storage
+                .conversation(conversation.id)
+                .unwrap()
+                .id,
+            conversation.id
+        );
+        assert_eq!(fixture.service.storage.list_timeline().unwrap().len(), 1);
+        let reopened = Storage::open(fixture._temp.path().join("state.db")).expect("reopen");
+        assert_eq!(reopened.list_visible_conversations().unwrap().len(), 1);
+        fixture
+            .provider
+            .sessions
+            .lock()
+            .unwrap()
+            .push(SessionSummary {
+                native_session_id: conversation.native_session_id.clone(),
+                title: conversation.title.clone(),
+                updated_at_ms: conversation.updated_at_ms,
+            });
+        fixture
+            .service
+            .sync_project(CommandId::new(), fixture.project_a.id, ProviderId::Codex)
+            .await
+            .expect("sync unarchived session");
+        assert!(
+            fixture
+                .service
+                .snapshot()
+                .await
+                .unwrap()
+                .conversations
+                .iter()
+                .any(|c| c.id == conversation.id)
+        );
+        assert_eq!(fixture.service.storage.list_timeline().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn project_refresh_isolates_one_project_session_list_failure() {
         let fixture = fixture();
+        let cached = create(&fixture.service, fixture.project_b.id).await;
         fixture
             .provider
             .sessions
@@ -3247,8 +3395,16 @@ mod tests {
             .storage
             .list_conversations()
             .expect("conversations");
-        assert_eq!(conversations.len(), 1);
-        assert_eq!(conversations[0].project_id, fixture.project_a.id);
+        assert_eq!(conversations.len(), 2);
+        assert!(
+            fixture
+                .service
+                .storage
+                .list_visible_conversations()
+                .unwrap()
+                .iter()
+                .any(|c| c.id == cached.id)
+        );
     }
 
     #[tokio::test]

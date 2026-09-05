@@ -83,9 +83,13 @@ agent-remote-host.exe pair --relay --base-url https://relay.example.com
 
 The browser connects to `/client/<host-id>`. The Relay opens a logical connection over the existing Host tunnel and forwards the same application CBOR used by direct mode.
 
+The Host tunnel and the Relay's browser connections send a standard WebSocket Ping every 30 seconds so idle connections remain active through reverse proxies. Browsers respond with Pong automatically; no application message or conversation activity is generated.
+
 ## Offline behavior
 
 When the Host tunnel disconnects, connected browsers receive an explicit offline status and their logical connections close. The Host reconnects with a small capped delay. Browsers reconnect and request a complete Snapshot. Commands are not stored or queued while the Host is offline.
+
+The Relay also sends Ping to each Host every 30 seconds. If no Host frame or Pong arrives for 90 seconds, it removes that tunnel and notifies its clients that the Host is offline. This frees the Host ID for reconnection when a broken network path leaves the old WebSocket apparently open.
 
 ## Privacy boundary
 

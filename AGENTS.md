@@ -1,5 +1,13 @@
 # GeneralAgentRemote — Repository Instructions
 
+## 本机开发环境（2026-09-05 起）
+
+- 主工作区为 `C:\Users\mohui666\Documents\ChatGPT\GeneralAgentRemote`，使用 Windows PowerShell、Windows Rust 和 Android SDK；日常开发、构建和 Host 启动不再依赖 WSL。
+- 原 WSL 目录与 Windows 旧副本保留；不要在旧目录继续修改本项目。
+- Host 由 Windows 启动文件夹中的 `GeneralAgentRemote Host.vbs` 在用户登录时启动；脚本为 `%LOCALAPPDATA%\GeneralAgentRemote\start-host.ps1`，数据为同目录下的 `data`，凭据仅保存在该运行目录。
+- 本机监听 `127.0.0.1:7437`，连接既有公网 Relay。WSL 的 `agent-remote-host.service` 已停止并禁用。
+- Android 使用 `cargo xtask android` 或 Windows 的 `android\gradlew.bat`；下方 WSL 互操作教程仅作历史参考，不是本机默认流程。
+
 ## Astra 协作约定
 
 - 以用户当前目标和本轮明确约束为准。任务要求实施时，完成实际修改与必要验证，不停在计划、建议或“是否继续”。普通实现选择自行决定；只有缺失信息会实质改变结果或操作超出授权时才询问，并先完成不依赖答案的工作。

@@ -276,6 +276,7 @@ sealed interface ServerEvent {
         val conversationId: UUID,
         val items: List<TimelineItem>,
         val nextBefore: TimelinePageCursor?,
+        val error: String? = null,
     ) : ServerEvent
     data class ProviderChanged(val capability: ProviderCapability) : ServerEvent
     data class ConversationUpserted(val conversation: Conversation) : ServerEvent

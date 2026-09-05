@@ -49,7 +49,7 @@ object WireProtocol {
         put("device_token", credential.deviceToken)
     }
 
-    fun getSnapshot(): ByteArray = command("get_snapshot")
+    fun getSnapshot(): ByteArray = command("get_snapshot") { put("metadata_only", true) }
 
     fun encodeSnapshot(snapshot: Snapshot): ByteArray = command("snapshot") {
         set<ObjectNode>("snapshot", snapshotNode(snapshot))
@@ -248,6 +248,7 @@ object WireProtocol {
             "conversation_page" -> ServerEvent.ConversationPage(
                 conversationId = message.requiredUuid("conversation_id"),
                 items = message.requiredArray("items").map(::parseTimelineItem),
+                error = message.get("error")?.takeUnless(JsonNode::isNull)?.asText(),
                 nextBefore = message.get("next_before")?.takeUnless(JsonNode::isNull)?.let {
                     TimelinePageCursor(
                         createdAtMs = it.required("created_at_ms").asLong(),

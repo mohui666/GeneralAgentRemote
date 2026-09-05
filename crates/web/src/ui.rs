@@ -1473,7 +1473,9 @@ impl App {
                     }
                     clear_fragment();
                 }
-                if !self.send_command(ClientCommand::GetSnapshot) {
+                if !self.send_command(ClientCommand::GetSnapshot {
+                    metadata_only: false,
+                }) {
                     self.close_socket("snapshot write failed");
                     self.handle_disconnect(context, "初始状态请求未能写入 WebSocket".to_owned());
                 }
@@ -1490,7 +1492,9 @@ impl App {
                 }
                 self.authenticated = true;
                 self.status = "同步中…".to_owned();
-                if !self.send_command(ClientCommand::GetSnapshot) {
+                if !self.send_command(ClientCommand::GetSnapshot {
+                    metadata_only: false,
+                }) {
                     self.close_socket("snapshot write failed");
                     self.handle_disconnect(context, "初始状态请求未能写入 WebSocket".to_owned());
                 }
@@ -1635,6 +1639,7 @@ impl App {
                 conversation_id,
                 items,
                 next_before,
+                error,
             } => {
                 self.history_loading.remove(&conversation_id);
                 if self.selected_conversation == Some(conversation_id) && !self.follow_timeline_tail
@@ -1655,12 +1660,18 @@ impl App {
                         self.cache_markdown_item(&item);
                     }
                 }
-                match next_before {
-                    Some(before) => {
-                        self.history_before.insert(conversation_id, before);
-                    }
-                    None => {
-                        self.history_exhausted.insert(conversation_id);
+                if let Some(error) = error {
+                    self.history_requested.remove(&conversation_id);
+                    self.history_exhausted.remove(&conversation_id);
+                    self.status = format!("历史加载失败：{error}");
+                } else {
+                    match next_before {
+                        Some(before) => {
+                            self.history_before.insert(conversation_id, before);
+                        }
+                        None => {
+                            self.history_exhausted.insert(conversation_id);
+                        }
                     }
                 }
                 self.request_images_for_selected();

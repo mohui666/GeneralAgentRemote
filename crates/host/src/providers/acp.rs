@@ -1440,11 +1440,21 @@ impl AgentProvider for AcpProvider {
                 attachment.mime_type,
             )));
         }
-        if !self
+        let Some(user_item_id) = self
             .shared
             .start_turn(project_id, &request.native_session_id)
-        {
+        else {
             bail!("ACP session {} is busy", request.native_session_id);
+        };
+        if let Some(client_message_id) = request.client_message_id {
+            self.shared.emit(
+                project_id,
+                request.conversation_id,
+                ProviderEventKind::ProviderItemAlias {
+                    provider_item_id: user_item_id,
+                    alias_provider_item_id: format!("client:{client_message_id}"),
+                },
+            );
         }
         let connection_to_agent = connection.connection.clone();
         let shared = Arc::clone(&self.shared);
@@ -2066,7 +2076,7 @@ impl Shared {
         }
     }
 
-    fn start_turn(&self, project_id: ProjectId, session_id: &str) -> bool {
+    fn start_turn(&self, project_id: ProjectId, session_id: &str) -> Option<String> {
         if let Some(binding) = self
             .sessions
             .write()
@@ -2074,7 +2084,7 @@ impl Shared {
             .get_mut(&(project_id, session_id.to_owned()))
         {
             if binding.replaying || binding.prompt_in_flight {
-                return false;
+                return None;
             }
             binding.prompt_in_flight = true;
             binding.turn_index += 1;
@@ -2086,9 +2096,9 @@ impl Shared {
             binding.replay_agent_text.clear();
             binding.replay_thought_text.clear();
             binding.replay_has_response = false;
-            return true;
+            return Some(binding.user_item_id.clone());
         }
-        false
+        None
     }
 
     fn finish_turn(&self, project_id: ProjectId, session_id: &str) {
@@ -3296,8 +3306,10 @@ mod tests {
 
         for supports_images in [false, true] {
             let provider = AcpProvider::claude();
+            let mut events = provider.subscribe();
             let project = project(temp.path());
             let conversation_id = ConversationId::new();
+            let client_message_id = Uuid::new_v4();
             let session_id = "image-session";
             let stored = store
                 .import_file(conversation_id, &source_path, &[temp.path().to_owned()])
@@ -3353,7 +3365,7 @@ mod tests {
                 conversation_id,
                 project: project.clone(),
                 native_session_id: session_id.to_owned(),
-                client_message_id: None,
+                client_message_id: Some(client_message_id.to_string()),
                 text: "Describe this image".to_owned(),
                 attachments: vec![PromptAttachment {
                     id: stored.metadata.id,
@@ -3382,6 +3394,15 @@ mod tests {
                     .expect("text remains supported after rejection");
             }
             let received = prompt_rx.recv().await.expect("agent receives prompt");
+            let alias = events
+                .try_recv()
+                .expect("live prompt aliases its history item");
+            assert!(matches!(
+                alias.kind,
+                ProviderEventKind::ProviderItemAlias { provider_item_id, alias_provider_item_id }
+                    if provider_item_id == format!("history:{session_id}:1:user")
+                        && alias_provider_item_id == format!("client:{client_message_id}")
+            ));
             assert_eq!(received.session_id.to_string(), session_id);
             assert!(
                 matches!(&received.prompt[0], ContentBlock::Text(text) if text.text == "Describe this image")
@@ -4003,7 +4024,7 @@ mod tests {
             Some("grok-4.6".to_owned()),
             Some("high".to_owned()),
         );
-        assert!(provider.shared.start_turn(project.id, session_id));
+        assert!(provider.shared.start_turn(project.id, session_id).is_some());
         let live_item_id = provider
             .shared
             .session_binding(project.id, session_id)

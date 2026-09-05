@@ -22,6 +22,16 @@ use uuid::Uuid;
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 64;
 const MAX_RELAY_MESSAGE_BYTES: usize = 12 * 1024 * 1024;
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
+const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(30)
+};
+const HOST_IDLE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(90)
+};
 const APP_SUBPROTOCOL: &str = "agent-remote.cbor.v5";
 const RELAY_SUBPROTOCOL: &str = "agent-remote-relay.cbor.v1";
 
@@ -322,10 +332,24 @@ async fn host_socket(state: RelayState, mut socket: WebSocket) {
 
     info!(%host_id, "host connected");
     let (mut sink, mut stream) = socket.split();
+    let mut keepalive = tokio::time::interval(WEBSOCKET_KEEPALIVE_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    keepalive.tick().await;
+    let mut last_host_activity = tokio::time::Instant::now();
     loop {
         tokio::select! {
+            _ = keepalive.tick() => {
+                if last_host_activity.elapsed() >= HOST_IDLE_TIMEOUT {
+                    warn!(%host_id, "host did not respond to WebSocket keepalive");
+                    break;
+                }
+                if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
             inbound = stream.next() => {
                 let Some(inbound) = inbound else { break };
+                last_host_activity = tokio::time::Instant::now();
                 match inbound {
                     Ok(Message::Binary(bytes)) => {
                         let frame = match decode_relay(&bytes) {
@@ -472,8 +496,16 @@ async fn client_socket(state: RelayState, host_id: HostId, socket: WebSocket) {
         return;
     }
 
+    let mut keepalive = tokio::time::interval(WEBSOCKET_KEEPALIVE_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    keepalive.tick().await;
     loop {
         tokio::select! {
+            _ = keepalive.tick() => {
+                if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
             inbound = stream.next() => {
                 let Some(inbound) = inbound else { break };
                 match inbound {
@@ -546,7 +578,7 @@ async fn client_socket(state: RelayState, host_id: HostId, socket: WebSocket) {
     {
         debug!(%host_id, connection_id = %lease.connection_id, "host was unavailable while closing logical client");
     }
-    let _ = sink.send(Message::Close(None)).await;
+    let _ = sink.close().await;
 }
 
 async fn send_offline_and_close(mut socket: WebSocket, host_id: HostId, message: &str) {
@@ -798,7 +830,10 @@ mod tests {
             other => panic!("expected OpenClient, got {other:?}"),
         };
 
-        let application_payload = encode(&ClientCommand::GetSnapshot).expect("encode app command");
+        let application_payload = encode(&ClientCommand::GetSnapshot {
+            metadata_only: false,
+        })
+        .expect("encode app command");
         client
             .send(TungsteniteMessage::Binary(
                 application_payload.clone().into(),
@@ -828,6 +863,83 @@ mod tests {
         )
         .await;
         assert_eq!(receive_binary(&mut client).await, response_payload);
+    }
+
+    #[tokio::test]
+    async fn keeps_idle_clients_alive_and_bridges_payloads_after_pong() {
+        let relay = start_relay("secret", 8).await;
+        let host_id = HostId::new();
+        let mut host = register_host(&relay, host_id, "secret").await;
+        let mut client = connect(
+            relay.address,
+            &format!("/client/{host_id}"),
+            APP_SUBPROTOCOL,
+        )
+        .await;
+        let online: ServerMessage =
+            decode(&receive_binary(&mut client).await).expect("decode online");
+        assert!(matches!(
+            online,
+            ServerMessage::HostStatus { online: true, .. }
+        ));
+        let opened = decode_relay(&receive_binary(&mut host).await).expect("decode open");
+        let connection_id = match opened {
+            RelayFrame::OpenClient { connection_id, .. } => connection_id,
+            other => panic!("expected OpenClient, got {other:?}"),
+        };
+
+        for _ in 0..2 {
+            let ping = tokio::time::timeout(Duration::from_secs(2), client.next())
+                .await
+                .expect("idle client receives relay keepalive")
+                .expect("websocket open")
+                .expect("read keepalive");
+            let TungsteniteMessage::Ping(bytes) = ping else {
+                panic!("expected websocket Ping, got {ping:?}");
+            };
+            client
+                .send(TungsteniteMessage::Pong(bytes))
+                .await
+                .expect("send pong");
+        }
+
+        let application_payload = encode(&ClientCommand::GetSnapshot {
+            metadata_only: false,
+        })
+        .expect("encode app command");
+        client
+            .send(TungsteniteMessage::Binary(
+                application_payload.clone().into(),
+            ))
+            .await
+            .expect("send client payload after pong");
+        let forwarded = decode_relay(&receive_binary(&mut host).await).expect("decode payload");
+        assert_eq!(
+            forwarded,
+            RelayFrame::Payload {
+                connection_id,
+                payload: application_payload,
+            }
+        );
+
+        let response_payload = encode(&online).expect("encode app response");
+        send_frame(
+            &mut host,
+            RelayFrame::Payload {
+                connection_id,
+                payload: response_payload.clone(),
+            },
+        )
+        .await;
+        assert_eq!(receive_binary(&mut client).await, response_payload);
+
+        client.close(None).await.expect("initiate client close");
+        let close = tokio::time::timeout(Duration::from_secs(2), client.next())
+            .await
+            .expect("relay acknowledges client close")
+            .expect("websocket close response")
+            .expect("clean close handshake");
+        assert!(matches!(close, TungsteniteMessage::Close(_)));
     }
 
     #[tokio::test]
@@ -895,6 +1007,63 @@ mod tests {
                 host_id,
                 online: false,
                 message: Some("Host disconnected from relay".to_owned()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn removes_unresponsive_host_and_allows_it_to_reconnect() {
+        let relay = start_relay("secret", 8).await;
+        let host_id = HostId::new();
+        let mut stale_host = register_host(&relay, host_id, "secret").await;
+        let mut client = connect(
+            relay.address,
+            &format!("/client/{host_id}"),
+            APP_SUBPROTOCOL,
+        )
+        .await;
+        let _: ServerMessage = decode(&receive_binary(&mut client).await).expect("decode online");
+        let _ = decode_relay(&receive_binary(&mut stale_host).await).expect("decode open");
+
+        // Keep the old TCP connection open without reading or answering its pings.
+        let offline = tokio::time::timeout(Duration::from_secs(3), receive_binary(&mut client))
+            .await
+            .expect("unresponsive host is removed");
+        assert!(matches!(
+            decode::<ServerMessage>(&offline).expect("decode offline"),
+            ServerMessage::HostStatus { online: false, .. }
+        ));
+
+        let mut resumed_host = register_host(&relay, host_id, "secret").await;
+        let mut resumed_client = connect(
+            relay.address,
+            &format!("/client/{host_id}"),
+            APP_SUBPROTOCOL,
+        )
+        .await;
+        let online = receive_binary(&mut resumed_client).await;
+        assert!(matches!(
+            decode::<ServerMessage>(&online).expect("decode resumed online"),
+            ServerMessage::HostStatus { online: true, .. }
+        ));
+        let opened = decode_relay(&receive_binary(&mut resumed_host).await).expect("decode open");
+        let RelayFrame::OpenClient { connection_id, .. } = opened else {
+            panic!("expected OpenClient");
+        };
+        let payload = encode(&ClientCommand::GetSnapshot {
+            metadata_only: false,
+        })
+        .expect("encode command");
+        resumed_client
+            .send(TungsteniteMessage::Binary(payload.clone().into()))
+            .await
+            .expect("send to resumed host");
+        assert_eq!(
+            decode_relay(&receive_binary(&mut resumed_host).await)
+                .expect("decode forwarded command"),
+            RelayFrame::Payload {
+                connection_id,
+                payload
             }
         );
     }

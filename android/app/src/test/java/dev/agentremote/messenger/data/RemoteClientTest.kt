@@ -23,6 +23,40 @@ import org.junit.Test
 
 class RemoteClientTest {
     @Test
+    fun serverCloseIsAcknowledgedAndReleasesTheConnection() {
+        val opened = mutableListOf<OpenedSocket>()
+        val disconnected = mutableListOf<String>()
+        val client = RemoteClient(
+            listener = object : RemoteClient.Listener by NoOpListener {
+                override fun onDisconnected(message: String) { disconnected += message }
+            },
+            socketOpener = WebSocketOpener { request, listener ->
+                FakeWebSocket(request).also { opened += OpenedSocket(it, listener) }
+            },
+        )
+        try {
+            client.connect(target())
+            val active = opened.single()
+            authenticate(active, target())
+            client.stopRetrying()
+
+            active.listener.onClosing(active.socket, 1001, "Host offline")
+            assertEquals(1001 to "Host offline", active.socket.closeFrame)
+            active.listener.onClosed(active.socket, 1001, "Host offline")
+            assertEquals(listOf("Host offline"), disconnected)
+            assertFalse(client.send(byteArrayOf(1)))
+
+            client.retryNow()
+            authenticate(opened.last(), target())
+            assertTrue(client.send(byteArrayOf(1)))
+            opened.last().listener.onClosing(opened.last().socket, 1005, "")
+            assertEquals(1000 to "", opened.last().socket.closeFrame)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
     fun manualDisconnectStopsAutomaticRetryButAllowsImmediateRetry() {
         val sockets = mutableListOf<FakeWebSocket>()
         val client = RemoteClient(
@@ -212,6 +246,7 @@ class RemoteClientTest {
     private class FakeWebSocket(private val request: Request) : WebSocket {
         var binarySendCount = 0
         var sendResult = true
+        var closeFrame: Pair<Int, String?>? = null
 
         override fun request(): Request = request
 
@@ -224,7 +259,10 @@ class RemoteClientTest {
             return sendResult
         }
 
-        override fun close(code: Int, reason: String?): Boolean = true
+        override fun close(code: Int, reason: String?): Boolean {
+            closeFrame = code to reason
+            return true
+        }
 
         override fun cancel() = Unit
     }

@@ -17,6 +17,40 @@ import org.junit.Test
 
 class RemoteViewModelStateTest {
     @Test
+    fun metadataSnapshotRetainsHistoryOnlyWithinTheSameHostAndConversationScope() {
+        val host = UUID.randomUUID()
+        val chat = conversation("completed", id = UUID.fromString("11111111-1111-1111-1111-111111111111"))
+        val item = timelineItem("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 2, TimelineContent.UserMessage("cached"))
+        val cached = Snapshot(host, "Host", emptyList(), emptyList(), listOf(chat), listOf(item))
+        val index = cached.copy(timeline = emptyList())
+
+        assertEquals(listOf(item), mergeSnapshotTimeline(cached, index))
+        assertEquals(listOf(item), mergeSnapshotTimeline(cached, index.copy(timeline = listOf(item.copy(revision = 1)))))
+        assertTrue(mergeSnapshotTimeline(cached, index.copy(hostId = UUID.randomUUID())).isEmpty())
+        assertTrue(mergeSnapshotTimeline(cached, index.copy(conversations = listOf(chat.copy(provider = ProviderId.GROK)))).isEmpty())
+        assertTrue(mergeSnapshotTimeline(cached, index.copy(conversations = emptyList())).isEmpty())
+    }
+
+    @Test
+    fun failedHistoryPagePreservesCacheAndDoesNotMarkConversationEmpty() {
+        val item = timelineItem("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 1, TimelineContent.UserMessage("cached"))
+        val snapshot = Snapshot(UUID.randomUUID(), "Host", emptyList(), emptyList(), emptyList(), listOf(item))
+        val state = RemoteUiState(snapshot = snapshot, timelineByConversation = indexTimelineByConversation(snapshot.timeline),
+            historyLoading = setOf(item.conversationId))
+        val failed = state.withConversationPage(dev.agentremote.messenger.model.ServerEvent.ConversationPage(
+            item.conversationId, emptyList(), null, "provider unavailable"))
+        assertEquals(listOf(item), failed.timelineByConversation[item.conversationId])
+        assertFalse(item.conversationId in failed.historyLoading)
+        assertFalse(item.conversationId in failed.historyExhausted)
+        assertEquals("provider unavailable", failed.historyErrors[item.conversationId])
+        val loaded = failed.withConversationPage(dev.agentremote.messenger.model.ServerEvent.ConversationPage(
+            item.conversationId, listOf(item.copy(revision = 2)), null))
+        assertTrue(loaded.historyErrors.isEmpty())
+        assertTrue(item.conversationId in loaded.historyExhausted)
+        assertEquals(2L, loaded.timelineByConversation[item.conversationId]?.single()?.revision)
+    }
+
+    @Test
     fun successfulSendRemovesOnlyComposerValuesThatWereActuallySent() {
         val sentAttachment = attachment("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
         val newAttachment = attachment("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")

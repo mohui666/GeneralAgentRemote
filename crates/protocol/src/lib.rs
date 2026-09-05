@@ -473,7 +473,10 @@ pub enum ClientCommand {
         device_id: DeviceId,
         device_token: String,
     },
-    GetSnapshot,
+    GetSnapshot {
+        #[serde(default)]
+        metadata_only: bool,
+    },
     RefreshProjects {
         provider: ProviderId,
     },
@@ -566,7 +569,7 @@ impl ClientCommand {
             | Self::RenameConversation { command_id, .. } => Some(*command_id),
             Self::Pair { .. }
             | Self::Authenticate { .. }
-            | Self::GetSnapshot
+            | Self::GetSnapshot { .. }
             | Self::RefreshProjects { .. }
             | Self::GetConversationPage { .. }
             | Self::GetAttachment { .. } => None,
@@ -612,6 +615,8 @@ pub enum ServerMessage {
         conversation_id: ConversationId,
         items: Vec<TimelineItem>,
         next_before: Option<TimelinePageCursor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     ProviderChanged {
         capability: ProviderCapability,
@@ -782,10 +787,28 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_request_without_options_keeps_the_full_snapshot_contract() {
+        #[derive(Serialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum LegacyCommand {
+            GetSnapshot,
+        }
+        let bytes = encode(&LegacyCommand::GetSnapshot).expect("legacy request");
+        assert_eq!(
+            decode::<ClientCommand>(&bytes).expect("decode legacy request"),
+            ClientCommand::GetSnapshot {
+                metadata_only: false
+            }
+        );
+    }
+
+    #[test]
     fn unsupported_version_is_explicit() {
         let envelope = Envelope {
             protocol_version: PROTOCOL_VERSION + 1,
-            message: ClientCommand::GetSnapshot,
+            message: ClientCommand::GetSnapshot {
+                metadata_only: false,
+            },
         };
         let mut bytes = Vec::new();
         ciborium::into_writer(&envelope, &mut bytes).expect("encode envelope");

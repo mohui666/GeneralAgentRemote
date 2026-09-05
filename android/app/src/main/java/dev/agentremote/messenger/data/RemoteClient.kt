@@ -162,6 +162,8 @@ internal class RemoteClient(
         socket = (socketOpener ?: WebSocketOpener(http::newWebSocket)).open(
             request,
             object : WebSocketListener() {
+                private var serverCloseMessage: String? = null
+
                 override fun onOpen(webSocket: WebSocket, response: Response) {
                     if (!current(connectionGeneration)) {
                         webSocket.close(1000, "superseded")
@@ -194,6 +196,9 @@ internal class RemoteClient(
                         webSocket.close(1002, "invalid protocol message")
                         return
                     }
+                    if (event is ServerEvent.HostStatus && !event.online) {
+                        serverCloseMessage = event.message ?: "主机离线，请等待电脑恢复连接后重试"
+                    }
                     if (event is ServerEvent.Paired) {
                         synchronized(lock) {
                             if (generation == connectionGeneration) {
@@ -225,8 +230,14 @@ internal class RemoteClient(
                     }
                 }
 
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    // Complete the server's close handshake so onClosed can trigger reconnect.
+                    // 1005 represents an empty close frame and cannot be sent on the wire.
+                    webSocket.close(if (code == 1005) 1000 else code, reason)
+                }
+
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    handleDisconnect(connectionGeneration, reason)
+                    handleDisconnect(connectionGeneration, serverCloseMessage ?: reason.ifBlank { "服务端已关闭连接（$code）" })
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {

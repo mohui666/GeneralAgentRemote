@@ -350,7 +350,13 @@ async fn relay_websocket_runs_the_authenticated_application_flow_once() {
         ServerMessage::Authenticated { host_id, device_id }
     );
 
-    send_client(&mut client, &ClientCommand::GetSnapshot).await;
+    send_client(
+        &mut client,
+        &ClientCommand::GetSnapshot {
+            metadata_only: false,
+        },
+    )
+    .await;
     let snapshot = match receive_server(&mut client).await {
         ServerMessage::Snapshot { snapshot } => snapshot,
         other => panic!("expected Snapshot, got {other:?}"),

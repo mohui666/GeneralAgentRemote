@@ -82,6 +82,8 @@ dist\bin\agent-remote-host.exe pair --relay --base-url https://relay.example.com
 - A successful first pair immediately opens the Host snapshot and saves that Host in the connection screen.
 - Killing and reopening the app authenticates with the saved credential, restores the cached Host/Provider/project/conversation/settings/draft state, and does not reuse the pair token.
 - A dropped connection preserves the visible cached conversation, reports offline status, then reconnects with bounded backoff and fetches a fresh snapshot. The drawer can stop automatic retries or request an immediate retry.
+- Android requests `get_snapshot` with `metadata_only: true` to synchronize project and conversation metadata, then loads messages for the selected conversation through `get_conversation_page`. Omitted `metadata_only` retains the full snapshot behavior for other clients. Metadata snapshots merge with cached messages by Host, provider, project, conversation, and item revision; they do not discard previously loaded history.
+- History pages can carry an optional `error` when the provider refresh fails. Cached messages remain readable, the page is not marked exhausted, and the conversation offers a retry action. Loading, failed, offline, and successfully empty histories have distinct UI states.
 - Provider and project selection is scoped to the active Host. Switching Provider refreshes only its authorized projects and syncs the selected project's remote sessions.
 - A new conversation is created on its first send. One unacknowledged send is retained across a reconnect and replayed with the same command ID.
 - Revoking the phone from `agent-remote-host device revoke <device-id>` makes the next authentication fail and removes the invalid local credential.

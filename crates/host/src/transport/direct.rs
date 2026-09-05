@@ -543,7 +543,13 @@ mod tests {
             },
         )
         .await;
-        send_client(&mut socket, &ClientCommand::GetSnapshot).await;
+        send_client(
+            &mut socket,
+            &ClientCommand::GetSnapshot {
+                metadata_only: false,
+            },
+        )
+        .await;
         let (device_id, device_token) = match receive_server(&mut socket).await {
             ServerMessage::Paired {
                 device_id,
@@ -935,7 +941,13 @@ mod tests {
             ]
         );
 
-        send_client(&mut first_socket, &ClientCommand::GetSnapshot).await;
+        send_client(
+            &mut first_socket,
+            &ClientCommand::GetSnapshot {
+                metadata_only: false,
+            },
+        )
+        .await;
         let conversation = loop {
             if let ServerMessage::Snapshot { snapshot } = receive_server(&mut first_socket).await {
                 break snapshot

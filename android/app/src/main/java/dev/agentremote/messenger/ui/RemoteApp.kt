@@ -76,6 +76,8 @@ import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.QrCodeScanner
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Stop
+import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.PushPin
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -124,6 +126,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.text.AnnotatedString
@@ -922,7 +925,8 @@ private fun DrawerProjectRow(
                 )
             }
             IconButton(onClick = onPin, modifier = Modifier.size(44.dp)) {
-                Text(if (pinned) "★" else "☆", color = if (pinned) RemoteText else RemoteMuted)
+                RemoteIcon(RemoteGlyph.Pin, if (pinned) "取消固定项目" else "固定项目",
+                    Modifier.size(17.dp), if (pinned) RemoteAccent else RemoteMuted.copy(alpha = 0.55f))
             }
         }
     }
@@ -996,7 +1000,7 @@ private fun RemoteTopBar(
     onManageConnections: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
-    Column(Modifier.fillMaxWidth().background(RemoteBackground).statusBarsPadding()) {
+    Column(Modifier.fillMaxWidth().background(RemoteSurface).statusBarsPadding()) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -1022,9 +1026,17 @@ private fun RemoteTopBar(
                     modifier = Modifier.testTag("gar.timeline.search.open"),
                 )
             }
-            Box(Modifier.padding(8.dp).testTag("gar.connection.status").semantics {
+            Row(Modifier.clip(RoundedCornerShape(20.dp))
+                .background(if (online) RemoteSuccess.copy(alpha = 0.09f) else RemoteSurfaceRaised)
+                .padding(horizontal = 7.dp, vertical = 5.dp)
+                .testTag("gar.connection.status").semantics {
                 contentDescription = "$hostName · ${if (online) "在线" else "离线"}"
-            }) { OnlineDot(online) }
+            }, verticalAlignment = Alignment.CenterVertically) {
+                OnlineDot(online)
+                Spacer(Modifier.width(4.dp))
+                Text(if (online) "在线" else "离线", style = MaterialTheme.typography.labelSmall,
+                    color = if (online) RemoteSuccess else RemoteMuted)
+            }
             Box {
                 FloatingIconButton(RemoteGlyph.More, "更多选项", onToggleMenu)
                 RemoteOverflowMenu(menuExpanded, sortMode, online, onDismissMenu, onSort, onShowProjects, onManageConnections, onDisconnect)
@@ -1492,12 +1504,34 @@ private fun ConversationScreen(
                     modifier = Modifier.testTag("gar.timeline.approvals.open")) { Text("查看") }
             }
         }
+        if (timeline.isNotEmpty() && conversation.id in state.historyErrors) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("历史更新失败，已保留缓存", modifier = Modifier.weight(1f), color = RemoteMuted)
+                TextButton(onClick = viewModel::retryConversationHistory,
+                    enabled = state.online && conversation.id !in state.historyLoading) { Text("重试") }
+            }
+        }
         if (timeline.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     RemoteIcon(RemoteGlyph.Chat, null, Modifier.size(36.dp), RemoteMuted)
                     Spacer(Modifier.height(12.dp))
-                    Text("发送第一条消息开始", color = RemoteMuted)
+                    Text(
+                        when {
+                            conversation.id in state.historyLoading -> "正在加载消息…"
+                            conversation.id in state.historyErrors -> "消息加载失败"
+                            !state.online -> "连接后加载消息"
+                            conversation.id in state.historyExhausted -> "此会话暂无消息"
+                            else -> "消息尚未加载"
+                        },
+                        color = RemoteMuted,
+                    )
+                    state.historyErrors[conversation.id]?.let { error ->
+                        Text(error, color = RemoteMuted, modifier = Modifier.padding(16.dp))
+                    }
+                    if (state.online && conversation.id !in state.historyLoading && conversation.id !in state.historyExhausted) {
+                        TextButton(onClick = viewModel::retryConversationHistory) { Text("重新加载消息") }
+                    }
                 }
             }
         } else {
@@ -1505,13 +1539,14 @@ private fun ConversationScreen(
                 LazyColumn(
                     state = listState,
                     modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(start = 18.dp, top = 4.dp, end = 22.dp, bottom = 20.dp),
-                    verticalArrangement = Arrangement.spacedBy(20.dp),
+                    contentPadding = PaddingValues(start = 16.dp, top = 8.dp, end = 16.dp, bottom = 20.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
                     item("load-older") {
                         if (conversation.id !in state.historyExhausted) {
-                            TextButton(onClick = viewModel::loadOlder, modifier = Modifier.fillMaxWidth()) {
-                                Text("加载更早消息", color = RemoteMuted)
+                            TextButton(onClick = viewModel::loadOlder, enabled = state.online && conversation.id !in state.historyLoading,
+                                modifier = Modifier.fillMaxWidth()) {
+                                Text(if (conversation.id in state.historyLoading) "正在加载消息…" else "加载更早消息", color = RemoteMuted)
                             }
                         }
                     }
@@ -1774,7 +1809,7 @@ private fun Composer(
     val permission = effectiveOptions.find { it.id == "permission_mode" }
     val model = effectiveOptions.find { it.id == "model" || it.category == "model" }
     val effort = effectiveOptions.find { it.id == "reasoning_effort" || it.id == "thought_level" || it.category == "thought_level" }
-    val modelLabel = listOfNotNull(model?.let(::sessionOptionValueLabel), effort?.let(::sessionOptionValueLabel))
+    val modelLabel = listOfNotNull(model?.let(::sessionOptionValueLabel), effort?.let(::sessionOptionValueLabel)?.removeSuffix(" Effort"))
         .joinToString(" · ").ifEmpty { "会话设置" }
     val canSend = online && draft.isNotBlank() && sendStatus == SendStatus.IDLE
     val attachmentTypes = capability?.attachments?.allowedMimeTypes.orEmpty().toTypedArray()
@@ -1824,7 +1859,7 @@ private fun Composer(
         Surface(
             modifier = Modifier.fillMaxWidth(),
             color = RemoteSurface,
-            shape = RoundedCornerShape(12.dp),
+            shape = RoundedCornerShape(20.dp),
             border = BorderStroke(1.dp, RemoteBorder),
         ) {
             Column(Modifier.padding(if (compactInput) 3.dp else 5.dp)) {
@@ -1833,9 +1868,9 @@ private fun Composer(
                     onValueChange = onDraft,
                     enabled = inputEnabled,
                     textStyle = MaterialTheme.typography.bodyLarge.copy(color = RemoteText),
-                    cursorBrush = SolidColor(RemoteText),
-                    modifier = Modifier.fillMaxWidth().heightIn(min = if (compactInput) 36.dp else 52.dp, max = if (compactInput) 44.dp else 116.dp)
-                        .padding(horizontal = 11.dp, vertical = if (compactInput) 5.dp else 12.dp)
+                    cursorBrush = SolidColor(RemoteAccent),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = if (compactInput) 36.dp else 48.dp, max = if (compactInput) 44.dp else 116.dp)
+                        .padding(horizontal = 11.dp, vertical = if (compactInput) 5.dp else 10.dp)
                         .testTag("gar.composer.input")
                         .semantics { contentDescription = if (running) "输入追加指令" else "输入消息" },
                     maxLines = if (compactInput) 1 else 4,
@@ -1852,7 +1887,8 @@ private fun Composer(
                         }
                     },
                 )
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(3.dp)) {
                     IconButton(
                         onClick = { attachmentLauncher.launch(attachmentTypes) },
                         enabled = inputEnabled && sendStatus == SendStatus.IDLE && capability?.attachments?.supported == true &&
@@ -1869,11 +1905,13 @@ private fun Composer(
                             modifier = Modifier.weight(0.8f).testTag("gar.session.permission"),
                         )
                     }
+                    if (permission == null && effectiveOptions.isNotEmpty()) Spacer(Modifier.weight(1f))
                     if (effectiveOptions.isNotEmpty()) {
                         SessionSettingsChip(
                             label = modelLabel, enabled = online && !running,
                             onClick = { settingsOpen = true },
-                            modifier = Modifier.weight(1.4f).testTag("gar.session.settings"),
+                            modifier = (if (permission == null) Modifier.widthIn(max = 208.dp)
+                                else Modifier.weight(1.4f)).testTag("gar.session.settings"),
                         )
                     } else {
                         Spacer(Modifier.weight(1f))
@@ -1884,10 +1922,10 @@ private fun Composer(
                             enabled = canSend,
                             modifier = Modifier.size(44.dp).testTag("gar.composer.send"),
                         ) {
-                            Box(Modifier.size(34.dp).background(if (canSend) RemoteText else RemoteSurfaceRaised, RoundedCornerShape(9.dp)),
+                            Box(Modifier.size(36.dp).background(if (canSend) RemoteAccent else RemoteAccent.copy(alpha = 0.10f), CircleShape),
                                 contentAlignment = Alignment.Center) {
                                 RemoteIcon(RemoteGlyph.Send, if (running) "追加指令" else "发送", Modifier.size(20.dp),
-                                    if (canSend) RemoteBackground else RemoteMuted)
+                                    if (canSend) MaterialTheme.colorScheme.onPrimary else RemoteAccent.copy(alpha = 0.5f))
                             }
                         }
                     }
@@ -2009,18 +2047,18 @@ private fun SessionSettingsChip(
     modifier: Modifier = Modifier,
 ) {
     Surface(
-        modifier = modifier.height(44.dp).clip(RoundedCornerShape(8.dp)).clickable(enabled = enabled, onClick = onClick).semantics { contentDescription = label },
-        color = Color.Transparent,
-        shape = RoundedCornerShape(8.dp),
+        modifier = modifier.height(44.dp).clip(RoundedCornerShape(12.dp)).clickable(enabled = enabled, onClick = onClick).semantics { contentDescription = label },
+        color = RemoteSurfaceRaised,
+        shape = RoundedCornerShape(12.dp),
     ) {
         Row(
-            Modifier.fillMaxSize().padding(horizontal = 4.dp),
+            Modifier.padding(horizontal = 9.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center,
         ) {
             Text(
                 label,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f, fill = false),
                 color = if (enabled) RemoteText else RemoteMuted,
                 style = MaterialTheme.typography.labelSmall,
                 maxLines = 1,
@@ -2400,17 +2438,12 @@ private fun TimelineCard(
     ) {
         when (val content = item.content) {
             is TimelineContent.UserMessage -> MessageBubble(content.text, user = true, messageId = item.id, createdAtMs = item.createdAtMs)
-            is TimelineContent.AgentMessage -> MessageBubble(
-                text = content.text,
-                user = false,
-                messageId = item.id,
-                createdAtMs = item.createdAtMs,
-                label = when (content.phase) {
-                    "final" -> providerLabel
-                    "reasoning_summary" -> "推理摘要"
-                    else -> providerLabel
-                },
-            )
+            is TimelineContent.AgentMessage -> if (content.phase == "reasoning_summary") {
+                ReasoningSummary(content.text, item.id, highlighted)
+            } else {
+                MessageBubble(content.text, user = false, messageId = item.id,
+                    createdAtMs = item.createdAtMs, label = providerLabel)
+            }
             is TimelineContent.Progress -> GenericTimelineCard(
                 title = "${content.kind} · ${content.label}",
                 status = content.status,
@@ -2498,14 +2531,70 @@ private fun meaningfulToolSummary(value: String?): String? {
 }
 
 @Composable
+private fun ReasoningSummary(text: String, messageId: UUID, highlighted: Boolean) {
+    var expanded by rememberSaveable(messageId) { mutableStateOf(false) }
+    val clipboard = LocalClipboardManager.current
+    LaunchedEffect(highlighted) {
+        if (highlighted) expanded = true
+    }
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = RemoteSurfaceRaised,
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        Column {
+            Row(
+                Modifier.fillMaxWidth().heightIn(min = 44.dp)
+                    .testTag("gar.reasoning.$messageId")
+                    .semantics { stateDescription = if (expanded) "已展开" else "已收起" }
+                    .clickable { expanded = !expanded }
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RemoteIcon(RemoteGlyph.Reasoning, null, Modifier.size(17.dp), RemoteAccent)
+                Spacer(Modifier.width(8.dp))
+                Text("推理摘要", modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.labelMedium, color = RemoteMuted)
+                Text(if (expanded) "收起" else "展开", color = RemoteMuted,
+                    style = MaterialTheme.typography.labelSmall)
+                Spacer(Modifier.width(4.dp))
+                RemoteIcon(if (expanded) RemoteGlyph.ChevronDown else RemoteGlyph.ChevronRight,
+                    null, Modifier.size(16.dp), RemoteMuted)
+            }
+            if (expanded) {
+                Column(Modifier.padding(horizontal = 14.dp).testTag("gar.reasoning.$messageId.content")) {
+                    MarkdownText(text, contentKey = messageId.toString())
+                    TextButton(
+                        onClick = { clipboard.setText(AnnotatedString(text)) },
+                        modifier = Modifier.align(Alignment.End).testTag("gar.message.$messageId.copy"),
+                    ) {
+                        RemoteIcon(RemoteGlyph.Copy, null, Modifier.size(16.dp))
+                        Spacer(Modifier.width(5.dp))
+                        Text("复制摘要", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun MessageBubble(text: String, user: Boolean, messageId: UUID, createdAtMs: Long, label: String = "你") {
     val clipboard = LocalClipboardManager.current
     val time = remember(createdAtMs) { SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(createdAtMs)) }
     var copied by remember(text) { mutableStateOf(false) }
     val content: @Composable () -> Unit = {
-        Column(Modifier.fillMaxWidth().padding(horizontal = if (user) 14.dp else 0.dp, vertical = if (user) 6.dp else 0.dp)) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 5.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text(label, color = RemoteText, style = MaterialTheme.typography.labelMedium)
+                if (!user) {
+                    Box(Modifier.size(24.dp).background(RemoteAccent.copy(alpha = 0.09f), RoundedCornerShape(7.dp)),
+                        contentAlignment = Alignment.Center) {
+                        RemoteIcon(RemoteGlyph.Chat, null, Modifier.size(14.dp), RemoteAccent)
+                    }
+                    Spacer(Modifier.width(7.dp))
+                }
+                Text(label, color = if (user) RemoteMuted else RemoteText,
+                    style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
                 Text(time, color = RemoteMuted, style = MaterialTheme.typography.labelSmall, modifier = Modifier.weight(1f).padding(start = 8.dp))
                 IconButton(
                     onClick = { clipboard.setText(AnnotatedString(text)); copied = true },
@@ -2515,15 +2604,17 @@ private fun MessageBubble(text: String, user: Boolean, messageId: UUID, createdA
                         if (copied) "已复制" else "复制消息", Modifier.size(16.dp), RemoteMuted)
                 }
             }
-            MarkdownText(text, modifier = Modifier.padding(bottom = if (user) 10.dp else 0.dp), contentKey = messageId.toString())
+            MarkdownText(text, modifier = Modifier.padding(bottom = 10.dp), contentKey = messageId.toString())
         }
     }
     if (user) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-            Surface(Modifier.fillMaxWidth(0.92f), color = RemoteSurfaceRaised, shape = RoundedCornerShape(10.dp)) { content() }
+            Surface(Modifier.fillMaxWidth(0.9f), color = MaterialTheme.colorScheme.primaryContainer,
+                shape = RoundedCornerShape(topStart = 18.dp, topEnd = 6.dp, bottomEnd = 18.dp, bottomStart = 18.dp)) { content() }
         }
     } else {
-        content()
+        Surface(Modifier.fillMaxWidth(), color = RemoteSurface,
+            shape = RoundedCornerShape(18.dp), border = BorderStroke(1.dp, RemoteBorder.copy(alpha = 0.65f))) { content() }
     }
 }
 
@@ -2710,6 +2801,8 @@ private enum class RemoteGlyph(val imageVector: ImageVector) {
     Copy(Icons.Rounded.ContentCopy),
     Scan(Icons.Rounded.QrCodeScanner),
     Paste(Icons.Rounded.ContentPaste),
+    Reasoning(Icons.Rounded.AutoAwesome),
+    Pin(Icons.Rounded.PushPin),
 }
 
 @Composable

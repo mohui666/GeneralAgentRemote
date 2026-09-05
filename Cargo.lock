@@ -77,6 +77,7 @@ dependencies = [
  "qrcode",
  "rand 0.9.5",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
